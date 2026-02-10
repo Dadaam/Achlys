@@ -1,0 +1,40 @@
+# ------------------------------------------------------------------------------
+# Rust & Cargo Defaults
+# ------------------------------------------------------------------------------
+/target
+/debug
+**/*.rs.bk
+*.pdb
+**/mutants.out*/
+
+# ------------------------------------------------------------------------------
+# Fuzzing Artifacts (Achlys Specific)
+# ------------------------------------------------------------------------------
+# Root level crash artifacts
+/crashes
+
+# Runtime working directory (corpus, logs, queues, hangs)
+/runtime
+
+# ------------------------------------------------------------------------------
+# ML / Cortex Data
+# ------------------------------------------------------------------------------
+# Ignore large model binaries or training checkpoints
+# We use .gitkeep patterns to track the folder structure but not the large files
+src/cortex/models/*
+!src/cortex/models/.gitkeep
+
+src/cortex/training/*
+!src/cortex/training/.gitkeep
+
+# Root level models folder
+/models/*
+!/models/.gitkeep
+
+# ------------------------------------------------------------------------------
+# IDE & System
+# ------------------------------------------------------------------------------
+.idea/
+.vscode/
+.DS_Store
+*.swp

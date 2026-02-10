@@ -1,0 +1,12 @@
+[package]
+name = "achlys-bridge"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+libafl.workspace = true
+libafl_bolts.workspace = true
+
+[build-dependencies]
+cc = "1.0"

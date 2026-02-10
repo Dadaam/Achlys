@@ -1,0 +1,10 @@
+[package]
+name = "achlys-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+
+[dependencies]
+libafl.workspace = true
+libafl_bolts.workspace = true

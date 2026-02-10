@@ -1,0 +1,18 @@
+[package]
+name = "achlys"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "achlys"
+path = "src/main.rs"
+
+[dependencies]
+achlys-core = { path = "../core" }
+achlys-cortex = { path = "../cortex" }
+achlys-bridge = { path = "../bridge" }
+libafl.workspace = true
+libafl_bolts.workspace = true
+clap.workspace = true
+anyhow.workspace = true
