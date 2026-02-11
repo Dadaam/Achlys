@@ -75,6 +75,7 @@ No seeds? No problem — the AI will figure out the format. It just takes longer
 6. **Crash (SIGSEGV)?** → Input saved to `crashes/`. Ready for GDB and exploit development.
 
 **Result**: A crashing input file, found without hand-crafting seeds or reversing the binary first.
+
 ---
 
 ## 🛠 Installation & Build
