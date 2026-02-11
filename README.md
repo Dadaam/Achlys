@@ -2,7 +2,7 @@
 
 <div>
 
-**A 4-stage adaptive fuzzer (Seeds → Havoc → AI → Symbolic) that hunts Zero-Days in any binary. Written in Rust, powered by LibAFL and AI.**
+**A 4-stage adaptive fuzzer that hunts Zero-Days in any binary. Written in Rust, powered by LibAFL and AI.**
 
 *"The death-mist of Achlys settled upon his sight."*
 
