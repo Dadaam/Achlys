@@ -1,7 +1,7 @@
 // les imports ils sont looooongs y'en a des choses
 use libafl::{
     corpus::{InMemoryCorpus, OnDiskCorpus},
-    feedbacks::{CrashFeedback, ConstFeedback},
+    feedbacks::{CrashFeedback, MaxMapFeedback},
     inputs::{HasTargetBytes, BytesInput},
     observers::StdMapObserver,
     state::StdState,
@@ -27,25 +27,30 @@ use std::ptr::addr_of_mut;
 use std::num::NonZero;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
+use std::slice::from_raw_parts_mut;
 
-static mut DUMMY_MAP: [u8; 16] = [0;16]; // blackbox
+const MAX_EDGES: usize = 65536;
 
-#[link(name="cjson")]
+#[link(name = "cjson_graybox")]
 unsafe extern "C" {
     fn cJSON_Parse(value: *const c_char) -> *mut c_void;
-    
     fn cJSON_Delete(c: *mut c_void);
+
+    static mut EDGES_MAP: [u8; MAX_EDGES]; 
+    static mut EDGES_COUNT: std::ffi::c_ulong;
 }
+
 
 
 fn main() {
     let observer = unsafe { // collecte de données, unsafe car manipulation de mémoire directe
-        let ptr = addr_of_mut!(DUMMY_MAP) as *mut u8;
-        let slice = std::slice::from_raw_parts_mut(ptr, 16);  // convertir en slice
-        StdMapObserver::new("dummy_map", slice) 
+        let count = if EDGES_COUNT > 0 {EDGES_COUNT as usize} else { MAX_EDGES };
+        let ptr = addr_of_mut!(EDGES_MAP) as *mut u8;
+        let slice = from_raw_parts_mut(ptr, count);
+        StdMapObserver::new("edges_map", slice) 
     };
     
-    let mut feedback = ConstFeedback::new(true); // on MEEEEEEENT vu qu'on est en blackbox
+    let mut feedback = MaxMapFeedback::new(&observer); 
     let mut objective = CrashFeedback::new(); // détecter le crash 
 
     let mut state = StdState::new(

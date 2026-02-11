@@ -14,8 +14,12 @@ anyhow = { workspace = true }
 cc = { workspace = true }
 
 [[example]]
-name = "cjson_fuzzer"
-path = "examples/fuzzers/cjson_fuzzer.rs"
+name = "cjson_blackbox"
+path = "examples/fuzzers/cjson_blackbox_fuzzer.rs"
+
+[[example]]
+name = "cjson_graybox"
+path = "examples/fuzzers/cjson_graybox_fuzzer.rs"
 
 [workspace]
 members = [
