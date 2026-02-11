@@ -23,7 +23,7 @@ Achlys bridges this gap with a **4-stage escalation model**: seed corpus for ins
 ## Why Achlys?
 | Feature | Classic Fuzzers (AFL++) | Symbolic (KLEE/angr) | Achlys |
 |---------|------------------------|----------------------|--------|
-| **Speed** | 🟢 10k+ exec/s | 🔴 Minutes per path | 🟢 Fast by default, slow only when needed |
+| **Speed** | 🟢 at least 20k+ exec/s | 🔴 Minutes per path | 🟢 Fast by default, slow only when needed |
 | **Hard branches** | 🔴 Blind guessing | 🟢 Constraint solving | 🟢 AI first, symbolic as last resort |
 | **Setup required** | 🟡 Needs seed corpus, otherwise very dumb | 🔴 Needs source / IR | 🟢 Point at a binary and go |
 | **Adaptiveness** | 🔴 Same strategy forever | 🔴 Same strategy forever | 🟢 Escalates on plateau, de-escalates when unstuck |
