@@ -78,7 +78,7 @@ No seeds? No problem — the AI will figure out the format. It just takes longer
 
 ---
 
-## 🛠 Installation & Build
+## Installation & Build
 
 ### Prerequisites
 
@@ -101,7 +101,7 @@ python train.py --dataset ./json_samples --output ../models/brain.onnx
 
 ---
 
-## 🚀 Usage
+## Usage
 ```bash
 # Run Achlys on a target
 ./target/release/achlys \
@@ -114,7 +114,7 @@ python train.py --dataset ./json_samples --output ../models/brain.onnx
 
 ## Roadmap
 
-- [x] **Phase 1 (MVP)**: Functional fuzzer on cJSON with random mutations (Pure LibAFL) ✅
+- [x] **Phase 1 (MVP)**: Functional fuzzer on cJSON with random mutations (Pure LibAFL)
 - [ ] **Phase 2 (Engine)**: `FuzzerBuilder` abstraction, seed corpus support, plateau detection, CLI
 - [ ] **Phase 3 (AI Hybrid)**: ONNX integration via `ort`, AI-guided mutations on plateau, de-escalation
 - [ ] **Phase 4 (Symbolic)**: Constraint solving for hard branches at 90%+ coverage
