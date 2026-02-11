@@ -56,7 +56,7 @@ Achlys bridges this gap with a **4-stage escalation model**: seed corpus for ins
 
 ---
 
-## 🔄 The "Search & Destroy" Workflow
+## The "Search & Destroy" Workflow
 
 Achlys doesn't just look for bugs, **it tries to force them**.
 
@@ -124,7 +124,7 @@ python train.py --dataset ./json_samples --output ../models/brain.onnx
 
 ## Disclaimer
 
-*Achlys is an offensive security research tool.**
+**Achlys is an offensive security research tool.**
 
 It is designed for code auditing, CTFs (Capture The Flag), and vulnerability research within legal boundaries. The author is not responsible for any misuse of this tool on unauthorized systems.
 
