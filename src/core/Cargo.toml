@@ -8,3 +8,6 @@ authors.workspace = true
 [dependencies]
 libafl.workspace = true
 libafl_bolts.workspace = true
+achlys-bridge = { path = "../bridge" }
+anyhow.workspace = true
+serde.workspace = true
