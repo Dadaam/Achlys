@@ -2,6 +2,7 @@ use std::fs;
 use std::num::NonZero;
 use std::path::PathBuf;
 use std::ptr::addr_of_mut;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -25,26 +26,40 @@ use libafl_bolts::{current_nanos, rands::StdRand, tuples::tuple_list, AsSlice};
 
 use achlys_bridge::Target;
 
+use crate::ai_mutator::AiMutator;
+use crate::ai_stage::HybridStage;
 use crate::config::FuzzerConfig;
+use crate::cortex_interface::CortexInterface;
+use crate::escalation::EscalatingStage;
+use crate::feedback::PlateauAwareFeedback;
+use crate::plateau::shared_detector;
 
 /// Builder for configuring and running an Achlys fuzzer instance.
 ///
 /// Reduces the ~100 lines of LibAFL boilerplate to a fluent API.
 /// All LibAFL generics stay internal — the public API only exposes
-/// `FuzzerConfig` and `Target`.
+/// `FuzzerConfig`, `Target`, and optionally a `CortexInterface`.
 pub struct FuzzerBuilder {
     config: FuzzerConfig,
+    cortex: Option<Arc<dyn CortexInterface>>,
 }
 
 impl FuzzerBuilder {
     pub fn new() -> Self {
         Self {
             config: FuzzerConfig::default(),
+            cortex: None,
         }
     }
 
     pub fn config(mut self, config: FuzzerConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Set the AI cortex for Stage 2 mutations.
+    pub fn cortex(mut self, cortex: Option<Arc<dyn CortexInterface>>) -> Self {
+        self.cortex = cortex;
         self
     }
 
@@ -79,9 +94,6 @@ impl FuzzerBuilder {
     }
 
     /// Build and run the fuzzer with the given target.
-    ///
-    /// This method blocks until the fuzzer exits (Ctrl+C, fatal error).
-    /// All LibAFL setup happens internally.
     pub fn run(self, mut target: impl Target) -> Result<()> {
         if target.has_coverage() {
             self.run_graybox(target)
@@ -96,17 +108,18 @@ impl FuzzerBuilder {
             .context("target reported coverage but returned None")?;
         let coverage_len = coverage.len();
         let coverage_ptr = coverage.as_mut_ptr();
-        // Leak the name so it has 'static lifetime (StdMapObserver requires it)
-        let obs_name: &'static str = Box::leak(target.observer_name().to_string().into_boxed_str());
+        let obs_name: &'static str =
+            Box::leak(target.observer_name().to_string().into_boxed_str());
 
-        // SAFETY: the coverage map pointer comes from the target and remains valid
-        // for the duration of the fuzz loop. Single-threaded access.
         let observer = unsafe {
             let slice = std::slice::from_raw_parts_mut(coverage_ptr, coverage_len);
             StdMapObserver::new(obs_name, slice)
         };
 
-        let mut feedback = MaxMapFeedback::new(&observer);
+        // Wrap feedback with plateau detection (always active for monitoring)
+        let detector = shared_detector(self.config.plateau_timeout);
+        let inner_feedback = MaxMapFeedback::new(&observer);
+        let mut feedback = PlateauAwareFeedback::new(inner_feedback, detector.clone());
         let mut objective = CrashFeedback::new();
 
         let mut state = StdState::new(
@@ -141,18 +154,7 @@ impl FuzzerBuilder {
 
         // Load seed corpus or generate random inputs
         if let Some(ref corpus_dir) = self.config.corpus_dir {
-            let mut count = 0;
-            for entry in fs::read_dir(corpus_dir).context("failed to read corpus directory")? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_file() {
-                    let data = fs::read(&path)
-                        .with_context(|| format!("failed to read seed: {}", path.display()))?;
-                    let input = BytesInput::new(data);
-                    state.corpus_mut().add(Testcase::new(input))?;
-                    count += 1;
-                }
-            }
+            let count = load_seeds_from_dir(&mut state, corpus_dir)?;
             println!("[achlys] loaded {} seed files from {}", count, corpus_dir.display());
         } else {
             let mut generator = RandBytesGenerator::new(
@@ -160,26 +162,51 @@ impl FuzzerBuilder {
             );
             state
                 .generate_initial_inputs(
-                    &mut fuzzer,
-                    &mut executor,
-                    &mut generator,
-                    &mut mgr,
+                    &mut fuzzer, &mut executor, &mut generator, &mut mgr,
                     self.config.initial_inputs,
                 )
                 .context("failed to generate initial inputs")?;
         }
 
-        let mutator = HavocScheduledMutator::new(havoc_mutations());
-        let mut stages = tuple_list!(StdMutationalStage::new(mutator));
+        // Branch: with AI cortex or plain havoc
+        if let Some(cortex) = self.cortex {
+            // Full escalation pipeline
+            let havoc_stage = StdMutationalStage::new(
+                HavocScheduledMutator::new(havoc_mutations()),
+            );
 
-        println!(
-            "[achlys] fuzzing started (graybox mode, {} coverage edges)",
-            coverage_len
-        );
+            let ai_mutator = AiMutator::new(cortex, 32);
+            let ai_stage = StdMutationalStage::new(ai_mutator);
+            let hybrid_havoc = StdMutationalStage::new(
+                HavocScheduledMutator::new(havoc_mutations()),
+            );
+            let hybrid = HybridStage::new(hybrid_havoc, ai_stage, 10);
 
-        fuzzer
-            .fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)
-            .context("fatal error in fuzz loop")?;
+            let escalating = EscalatingStage::with_ai(havoc_stage, hybrid, detector);
+            let mut stages = tuple_list!(escalating);
+
+            println!(
+                "[achlys] fuzzing started (graybox + AI, {} edges, plateau: {}s)",
+                coverage_len, self.config.plateau_timeout.as_secs()
+            );
+
+            fuzzer
+                .fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)
+                .context("fatal error in fuzz loop")?;
+        } else {
+            // Plain havoc (no AI)
+            let mutator = HavocScheduledMutator::new(havoc_mutations());
+            let mut stages = tuple_list!(StdMutationalStage::new(mutator));
+
+            println!(
+                "[achlys] fuzzing started (graybox, {} edges)",
+                coverage_len
+            );
+
+            fuzzer
+                .fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)
+                .context("fatal error in fuzz loop")?;
+        }
 
         Ok(())
     }
@@ -226,20 +253,8 @@ impl FuzzerBuilder {
         )
         .context("failed to create executor")?;
 
-        // Load seed corpus or generate random inputs
         if let Some(ref corpus_dir) = self.config.corpus_dir {
-            let mut count = 0;
-            for entry in fs::read_dir(corpus_dir).context("failed to read corpus directory")? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_file() {
-                    let data = fs::read(&path)
-                        .with_context(|| format!("failed to read seed: {}", path.display()))?;
-                    let input = BytesInput::new(data);
-                    state.corpus_mut().add(Testcase::new(input))?;
-                    count += 1;
-                }
-            }
+            let count = load_seeds_from_dir(&mut state, corpus_dir)?;
             println!("[achlys] loaded {} seed files from {}", count, corpus_dir.display());
         } else {
             let mut generator = RandBytesGenerator::new(
@@ -247,10 +262,7 @@ impl FuzzerBuilder {
             );
             state
                 .generate_initial_inputs(
-                    &mut fuzzer,
-                    &mut executor,
-                    &mut generator,
-                    &mut mgr,
+                    &mut fuzzer, &mut executor, &mut generator, &mut mgr,
                     self.config.initial_inputs,
                 )
                 .context("failed to generate initial inputs")?;
@@ -267,6 +279,22 @@ impl FuzzerBuilder {
 
         Ok(())
     }
+}
+
+/// Load seed files from a directory into any corpus-bearing state.
+fn load_seeds_from_dir(state: &mut impl HasCorpus<BytesInput>, dir: &std::path::Path) -> Result<usize> {
+    let mut count = 0;
+    for entry in fs::read_dir(dir).context("failed to read corpus directory")? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            let data = fs::read(&path)
+                .with_context(|| format!("failed to read seed: {}", path.display()))?;
+            state.corpus_mut().add(Testcase::new(BytesInput::new(data)))?;
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 impl Default for FuzzerBuilder {

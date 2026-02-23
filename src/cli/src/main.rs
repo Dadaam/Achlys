@@ -1,10 +1,12 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use achlys_bridge::{AutoCompiler, ForkExecTarget};
-use achlys_core::{FuzzerBuilder, FuzzerConfig};
+use achlys_core::{CortexInterface, FuzzerBuilder, FuzzerConfig};
+use achlys_cortex::CortexModel;
 
 #[derive(Parser)]
 #[command(name = "achlys", about = "4-stage adaptive fuzzer — hunt zero-days in any binary")]
@@ -70,10 +72,20 @@ fn main() -> Result<()> {
                 initial_inputs: 8,
                 max_input_len,
                 plateau_timeout: std::time::Duration::from_secs(plateau_timeout),
-                model_path: model,
+                model_path: model.clone(),
             };
 
-            // If --source is provided, compile with SanCov first
+            // Load AI cortex if --model is provided
+            let cortex: Option<Arc<dyn CortexInterface>> = if let Some(ref model_path) = model {
+                let cortex_model = CortexModel::load(model_path, max_input_len)
+                    .context("failed to load ONNX model")?;
+                Some(Arc::new(cortex_model))
+            } else {
+                None
+            };
+
+            let builder = FuzzerBuilder::new().config(config).cortex(cortex);
+
             if !source.is_empty() {
                 println!("[achlys] compiling source files with SanCov instrumentation...");
                 let compiler = AutoCompiler::new("/tmp/achlys_build");
@@ -83,11 +95,11 @@ fn main() -> Result<()> {
 
                 println!("[achlys] fuzzing instrumented binary: {}", instrumented.display());
                 let target = ForkExecTarget::new(instrumented, args);
-                FuzzerBuilder::new().config(config).run(target)
+                builder.run(target)
             } else {
-                println!("[achlys] fuzzing binary: {} (blackbox mode)", binary.display());
+                println!("[achlys] fuzzing binary: {}", binary.display());
                 let target = ForkExecTarget::new(binary, args);
-                FuzzerBuilder::new().config(config).run(target)
+                builder.run(target)
             }
         }
     }
