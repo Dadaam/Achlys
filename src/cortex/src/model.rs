@@ -20,6 +20,10 @@ pub struct CortexModel {
 
 impl CortexModel {
     /// Load an ONNX model from a file.
+    ///
+    /// Expected model format:
+    /// - Input: `[batch_size, max_seq_len]` float32 (bytes normalized to [0, 1])
+    /// - Output: `[batch_size, max_seq_len]` float32 (predicted bytes in [0, 1])
     pub fn load(model_path: impl AsRef<Path>, max_seq_len: usize) -> Result<Self> {
         let session = Session::builder()
             .context("failed to create ONNX session builder")?
@@ -31,9 +35,34 @@ impl CortexModel {
                 )
             })?;
 
+        // Validate model inputs/outputs
+        let inputs = session.inputs();
+        let outputs = session.outputs();
+
+        if inputs.is_empty() {
+            anyhow::bail!("ONNX model has no inputs");
+        }
+        if outputs.is_empty() {
+            anyhow::bail!("ONNX model has no outputs");
+        }
+
         println!(
             "[achlys-cortex] loaded ONNX model: {}",
             model_path.as_ref().display()
+        );
+        println!(
+            "[achlys-cortex] model input: {} ({:?})",
+            inputs[0].name(),
+            inputs[0].dtype()
+        );
+        println!(
+            "[achlys-cortex] model output: {} ({:?})",
+            outputs[0].name(),
+            outputs[0].dtype()
+        );
+        println!(
+            "[achlys-cortex] max_seq_len: {}",
+            max_seq_len
         );
 
         Ok(Self {
