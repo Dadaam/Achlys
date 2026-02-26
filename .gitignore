@@ -24,8 +24,10 @@
 src/cortex/models/*
 !src/cortex/models/.gitkeep
 
-src/cortex/training/*
-!src/cortex/training/.gitkeep
+src/cortex/training/__pycache__/
+src/cortex/training/*.pt
+src/cortex/training/*.pth
+src/cortex/training/*.ckpt
 
 # Root level models folder
 /models/*
@@ -38,3 +40,4 @@ src/cortex/training/*
 .vscode/
 .DS_Store
 *.swp
+CLAUDE.md
