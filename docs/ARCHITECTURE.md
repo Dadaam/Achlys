@@ -92,10 +92,10 @@ This means Achlys spends **most of its time** in the fast lane (havoc), occasion
 
 | Crate | Path | Role |
 |-------|------|------|
-| **achlys-core** | `src/core/` | The fuzzing engine. Wraps LibAFL primitives (state, executor, scheduler, stages). Owns the escalation logic: monitors coverage growth, decides when to call cortex, when to drop back to havoc. Will expose a `FuzzerBuilder` so wiring things up isn't 100 lines of boilerplate every time. |
-| **achlys-cortex** | `src/cortex/` | The AI brain. Loads ONNX models via [`ort`](https://github.com/pykeio/ort). Receives byte sequences from the corpus, predicts promising next-byte mutations, returns them to core. Later: also hosts the symbolic execution integration. Not wired up yet — skeleton + `ort` dependency in place. |
-| **achlys-bridge** | `src/bridge/` | The target interface. Abstracts away *how* Achlys talks to whatever it's fuzzing. Today: in-process FFI for the cJSON test. Tomorrow: out-of-process execution (fork+exec), shared-memory transport, QEMU user-mode for closed-source binaries, network sockets for services. Adding a new target type = extending the bridge, not touching the engine. |
-| **achlys-cli** | `src/cli/` | Command-line interface. `achlys fuzz <target>` and it figures out the rest. Skeleton for now. |
+| **achlys-core** | `src/core/` | The fuzzing engine. `FuzzerBuilder` reduces setup to a few lines. `PlateauDetector` monitors coverage growth. `PlateauAwareFeedback` wraps `MaxMapFeedback` to track new edges. `EscalationManager` decides when to switch stages. `EscalatingStage` delegates to havoc or `HybridStage`. `AiMutator` calls `CortexInterface` for AI predictions. `CortexInterface` trait (dependency inversion — cortex implements it, core defines it). |
+| **achlys-cortex** | `src/cortex/` | The AI brain. `CortexModel` loads ONNX models via [`ort`](https://github.com/pykeio/ort), encodes bytes to float32 tensors, runs inference, decodes predictions. `PassthroughCortex` provides a test double with random mutations. Training pipeline in `training/train.py` (PyTorch LSTM). |
+| **achlys-bridge** | `src/bridge/` | The target interface. `Target` trait abstracts execution + coverage. `InProcessTarget` for FFI (graybox/blackbox). `ForkExecTarget` for spawning binaries (stdin or `@@` file replacement). `AutoCompiler` compiles C/C++ with SanCov instrumentation (`--source` flag). |
+| **achlys-cli** | `src/cli/` | `achlys fuzz <binary> [@@] --corpus --source --model --plateau-timeout`. Loads `CortexModel` if `--model` provided, creates `ForkExecTarget`, calls `FuzzerBuilder`. |
 
 ---
 
@@ -186,8 +186,8 @@ Achlys doesn't care what it's fuzzing. The `achlys-bridge` crate abstracts the t
     │          achlys-bridge          │
     │                                 │
     │  ┌───────────┐ ┌────────────┐   │
-    │  │ InProcess │ │  ForkExec  │   │   ← today: InProcess (cJSON test)
-    │  │   (FFI)   │ │  (spawn)   │   │   ← next: fork+exec any binary
+    │  │ InProcess │ │  ForkExec  │   │   ← ✅ InProcess (FFI, graybox/blackbox)
+    │  │   (FFI)   │ │(stdin/@@)  │   │   ← ✅ ForkExec (any binary)
     │  ├───────────┤ ├────────────┤   │
     │  │   QEMU    │ │  Network   │   │   ← later: closed-source, services
     │  │(user-mode)│ │ (TCP/UDP)  │   │
@@ -273,19 +273,25 @@ All shared versions in root `Cargo.toml` under `[workspace.dependencies]`:
 - Dual build system + SanCov coverage bridge
 - Proof that LibAFL can fuzz a real C library and find paths
 
-### Phase 2 — Engine Abstraction
-- Extract boilerplate into `achlys-core` (`FuzzerBuilder` pattern)
-- Target trait in `achlys-bridge` (in-process + fork-exec backends)
-- Plateau detection (coverage stall timer)
-- CLI wired up: `achlys fuzz <binary>`
-- Seed corpus support
+### Phase 2 — Engine Abstraction ✅ (done)
+- `FuzzerBuilder` reduces LibAFL boilerplate to fluent API
+- `Target` trait in `achlys-bridge` with `InProcessTarget` + `ForkExecTarget` backends
+- `ForkExecTarget` supports stdin and `@@` file placeholder (AFL++ style)
+- `AutoCompiler` compiles C/C++ with SanCov via `--source` flag
+- `PlateauDetector` + `PlateauAwareFeedback` wrapper for coverage monitoring
+- `EscalatingStage` + `EscalationManager` state machine (Havoc ↔ AI Hybrid)
+- CLI: `achlys fuzz <binary> [@@] --corpus --source --model --plateau-timeout`
+- Seed corpus loading from directory
 
-### Phase 3 — AI Hybrid (Cortex)
-- Train LSTM/GRU on corpus byte patterns → export ONNX
-- Load in `achlys-cortex` via `ort`
-- Plateau triggers AI mutation injection
-- De-escalation: AI finds new edges → drop back to havoc
-- Benchmark: AI hybrid vs pure havoc on same targets
+### Phase 3 — AI Hybrid (Cortex) ✅ (done)
+- `CortexInterface` trait in core (dependency inversion)
+- `CortexModel` loads ONNX models via `ort`, validates shapes on load
+- `AiMutator` calls cortex in batches, caches predictions in `VecDeque`
+- `HybridStage` alternates havoc (90%) and AI (10%) mutations
+- `PassthroughCortex` test double for integration testing without trained model
+- Builder wires full pipeline when `--model` provided: `PlateauAwareFeedback` → `EscalatingStage` → `HybridStage`
+- LSTM training script: `src/cortex/training/train.py` (PyTorch → ONNX export)
+- Test model generator: `src/cortex/training/generate_test_model.py`
 
 ### Phase 4 — Symbolic Execution
 - Integrate symbolic engine for hard branches

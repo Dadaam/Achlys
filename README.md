@@ -84,30 +84,49 @@ No seeds? No problem — the AI will figure out the format. It just takes longer
 
 - Rust (Nightly toolchain recommended)
 - Clang / LLVM (for target instrumentation)
-- Python 3.10+ (for your own model training)
+- Python 3.10+ with PyTorch (for model training, optional)
 ```bash
 # 1. Clone the repo
 git clone https://github.com/dadaam/achlys.git
 cd achlys
 
 # 2. Build the Fuzzer and Harness
-# (The build.rs script will compile the target lib automatically)
 cargo build --release
 
-# 3. Train a model (Optional, pre-trained models provided)
-cd cortex/training
-python train.py --dataset ./json_samples --output ../models/brain.onnx
+# 3. (Optional) Train an AI model on a corpus
+python3 src/cortex/training/train.py \
+    --corpus runtime/corpus/json/ \
+    --output models/brain.onnx \
+    --max-seq-len 256 --epochs 50
+
+# Or generate a test model without training data
+python3 src/cortex/training/generate_test_model.py --output models/test_brain.onnx
 ```
 
 ---
 
 ## Usage
 ```bash
-# Run Achlys on a target
-./target/release/achlys \
-    --target ./targets/vulnerable_parser \
-    --corpus ./corpus/seeds \
-    --model ./models/json_brain.onnx
+# Blackbox: fuzz any binary via stdin
+achlys fuzz ./vulnerable_parser --corpus seeds/
+
+# Blackbox with file input: @@ is replaced by a temp file (like AFL++)
+achlys fuzz ./pdf_reader @@ --corpus seeds/
+
+# Graybox: compile C/C++ sources with SanCov instrumentation
+achlys fuzz ./parser --source src/parser.c --corpus seeds/
+
+# AI-guided: load an ONNX model for Stage 2 mutations
+achlys fuzz ./parser @@ --model models/brain.onnx --corpus seeds/
+
+# Full options
+achlys fuzz <binary> [args...] \
+    --corpus <seed_dir> \
+    --output <crash_dir> \
+    --model <onnx_model> \
+    --source <c_files...> \
+    --plateau-timeout 600 \
+    --max-input-len 4096
 ```
 
 ---
@@ -115,10 +134,10 @@ python train.py --dataset ./json_samples --output ../models/brain.onnx
 ## Roadmap
 
 - [x] **Phase 1 (MVP)**: Functional fuzzer on cJSON with random mutations (Pure LibAFL)
-- [ ] **Phase 2 (Engine)**: `FuzzerBuilder` abstraction, seed corpus support, plateau detection, CLI
-- [ ] **Phase 3 (AI Hybrid)**: ONNX integration via `ort`, AI-guided mutations on plateau, de-escalation
+- [x] **Phase 2 (Engine)**: `FuzzerBuilder`, `Target` trait, `InProcess`/`ForkExec` backends, plateau detection, `EscalatingStage`, CLI with `--source`/`--model`/`@@`
+- [x] **Phase 3 (AI Hybrid)**: ONNX integration via `ort`, `AiMutator`, `HybridStage`, `PlateauAwareFeedback`, LSTM training pipeline, `PassthroughCortex` for testing
 - [ ] **Phase 4 (Symbolic)**: Constraint solving for hard branches at 90%+ coverage
-- [ ] **Phase 5 (Universal)**: QEMU backend, network targets, distributed fuzzingns)
+- [ ] **Phase 5 (Universal)**: QEMU backend, network targets, distributed fuzzing
 
 ---
 
