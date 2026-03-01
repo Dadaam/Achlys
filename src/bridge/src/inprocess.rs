@@ -35,12 +35,15 @@ impl CoverageMap {
 unsafe impl Send for CoverageMap {}
 unsafe impl Sync for CoverageMap {}
 
+/// Harness function type: takes input bytes, returns execution result.
+type HarnessFn = Box<dyn FnMut(&[u8]) -> ExitKind>;
+
 /// In-process target that calls a function (typically FFI) within the same process.
 ///
 /// This is the fastest execution mode — no process spawn overhead.
 /// Used for fuzzing libraries linked into the fuzzer binary.
 pub struct InProcessTarget {
-    harness: Box<dyn FnMut(&[u8]) -> ExitKind>,
+    harness: HarnessFn,
     coverage: Option<CoverageMap>,
     observer_name: String,
 }

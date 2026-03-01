@@ -140,7 +140,7 @@ impl CortexInterface for CortexModel {
             .context("failed to extract output tensor")?;
 
         let (_shape, data) = output_tensor;
-        let output_data: Vec<f32> = data.iter().copied().collect();
+        let output_data: Vec<f32> = data.to_vec();
         let predictions = self.decode_predictions(&output_data, count);
 
         Ok(predictions)

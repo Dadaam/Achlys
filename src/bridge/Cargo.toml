@@ -8,6 +8,3 @@ authors.workspace = true
 libafl.workspace = true
 libafl_bolts.workspace = true
 anyhow.workspace = true
-
-[build-dependencies]
-cc = "1.0"

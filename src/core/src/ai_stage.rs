@@ -42,7 +42,7 @@ where
     ) -> Result<(), Error> {
         self.counter += 1;
 
-        if self.counter % self.ai_ratio == 0 {
+        if self.counter.is_multiple_of(self.ai_ratio) {
             self.ai.perform(fuzzer, executor, state, manager)
         } else {
             self.havoc.perform(fuzzer, executor, state, manager)
@@ -56,7 +56,7 @@ where
     A: Restartable<S>,
 {
     fn should_restart(&mut self, state: &mut S) -> Result<bool, Error> {
-        if self.counter % self.ai_ratio == 0 {
+        if self.counter.is_multiple_of(self.ai_ratio) {
             self.ai.should_restart(state)
         } else {
             self.havoc.should_restart(state)
@@ -64,7 +64,7 @@ where
     }
 
     fn clear_progress(&mut self, state: &mut S) -> Result<(), Error> {
-        if self.counter % self.ai_ratio == 0 {
+        if self.counter.is_multiple_of(self.ai_ratio) {
             self.ai.clear_progress(state)
         } else {
             self.havoc.clear_progress(state)

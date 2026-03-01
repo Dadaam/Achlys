@@ -88,7 +88,7 @@ fn main() -> Result<()> {
 
             if !source.is_empty() {
                 println!("[achlys] compiling source files with SanCov instrumentation...");
-                let compiler = AutoCompiler::new("/tmp/achlys_build");
+                let compiler = AutoCompiler::new(std::env::temp_dir().join("achlys_build"));
                 let instrumented = compiler
                     .compile_binary(&source, "target_instrumented")
                     .context("source compilation failed")?;

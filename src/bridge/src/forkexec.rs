@@ -137,9 +137,14 @@ impl Target for ForkExecTarget {
                 {
                     use std::os::unix::process::ExitStatusExt;
                     if let Some(signal) = status.signal() {
-                        // SIGSEGV=11, SIGABRT=6, SIGBUS=7, SIGFPE=8, SIGILL=4
+                        const SIGILL: i32 = 4;
+                        const SIGABRT: i32 = 6;
+                        const SIGBUS: i32 = 7;
+                        const SIGFPE: i32 = 8;
+                        const SIGSEGV: i32 = 11;
+
                         match signal {
-                            4 | 6 | 7 | 8 | 11 => ExitKind::Crash,
+                            SIGILL | SIGABRT | SIGBUS | SIGFPE | SIGSEGV => ExitKind::Crash,
                             _ => ExitKind::Ok,
                         }
                     } else {

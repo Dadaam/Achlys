@@ -153,7 +153,7 @@ where
     ) -> Result<(), Error> {
         // Check escalation periodically
         self.exec_count += 1;
-        if self.exec_count % self.check_interval == 0 {
+        if self.exec_count.is_multiple_of(self.check_interval) {
             self.manager.tick();
         }
 

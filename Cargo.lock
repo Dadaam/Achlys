@@ -17,7 +17,7 @@ dependencies = [
 name = "achlys-bridge"
 version = "0.1.0"
 dependencies = [
- "cc",
+ "anyhow",
  "libafl",
  "libafl_bolts",
 ]
@@ -39,14 +39,18 @@ dependencies = [
 name = "achlys-core"
 version = "0.1.0"
 dependencies = [
+ "achlys-bridge",
+ "anyhow",
  "libafl",
  "libafl_bolts",
+ "serde",
 ]
 
 [[package]]
 name = "achlys-cortex"
 version = "0.1.0"
 dependencies = [
+ "achlys-core",
  "anyhow",
  "ort",
 ]

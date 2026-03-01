@@ -108,6 +108,8 @@ impl FuzzerBuilder {
             .context("target reported coverage but returned None")?;
         let coverage_len = coverage.len();
         let coverage_ptr = coverage.as_mut_ptr();
+        // Intentional leak: StdMapObserver requires a &'static str for the name.
+        // The fuzzer runs until process exit, so this is effectively static.
         let obs_name: &'static str =
             Box::leak(target.observer_name().to_string().into_boxed_str());
 
