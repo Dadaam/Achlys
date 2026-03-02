@@ -27,7 +27,7 @@ impl CoverageMap {
     /// # Safety
     /// Caller must ensure no concurrent access to the underlying memory.
     pub unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
-        std::slice::from_raw_parts_mut(self.ptr, self.len)
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 }
 

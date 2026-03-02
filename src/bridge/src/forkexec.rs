@@ -123,11 +123,11 @@ impl Target for ForkExecTarget {
         };
 
         // Write input to stdin if needed
-        if matches!(self.input_method, InputMethod::Stdin) {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(input);
-                // Drop stdin to close pipe and let the process proceed
-            }
+        if matches!(self.input_method, InputMethod::Stdin)
+            && let Some(mut stdin) = child.stdin.take()
+        {
+            let _ = stdin.write_all(input);
+            // Drop stdin to close pipe and let the process proceed
         }
 
         // Wait with timeout
