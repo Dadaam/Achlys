@@ -270,14 +270,43 @@ impl FuzzerBuilder {
                 .context("failed to generate initial inputs")?;
         }
 
-        let mutator = HavocScheduledMutator::new(havoc_mutations());
-        let mut stages = tuple_list!(StdMutationalStage::new(mutator));
+        // In blackbox mode, the plateau detector triggers on time alone
+        // (on_new_coverage is never called → fires after plateau_timeout)
+        if let Some(cortex) = self.cortex {
+            let detector = shared_detector(self.config.plateau_timeout);
 
-        println!("[achlys] fuzzing started (blackbox mode)");
+            let havoc_stage = StdMutationalStage::new(
+                HavocScheduledMutator::new(havoc_mutations()),
+            );
 
-        fuzzer
-            .fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)
-            .context("fatal error in fuzz loop")?;
+            let ai_mutator = AiMutator::new(cortex, 32);
+            let ai_stage = StdMutationalStage::new(ai_mutator);
+            let hybrid_havoc = StdMutationalStage::new(
+                HavocScheduledMutator::new(havoc_mutations()),
+            );
+            let hybrid = HybridStage::new(hybrid_havoc, ai_stage, 10);
+
+            let escalating = EscalatingStage::with_ai(havoc_stage, hybrid, detector);
+            let mut stages = tuple_list!(escalating);
+
+            println!(
+                "[achlys] fuzzing started (blackbox + AI, plateau: {}s)",
+                self.config.plateau_timeout.as_secs()
+            );
+
+            fuzzer
+                .fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)
+                .context("fatal error in fuzz loop")?;
+        } else {
+            let mutator = HavocScheduledMutator::new(havoc_mutations());
+            let mut stages = tuple_list!(StdMutationalStage::new(mutator));
+
+            println!("[achlys] fuzzing started (blackbox mode)");
+
+            fuzzer
+                .fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)
+                .context("fatal error in fuzz loop")?;
+        }
 
         Ok(())
     }
