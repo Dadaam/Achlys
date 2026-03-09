@@ -68,26 +68,31 @@ impl AutoTrainer {
         }
     }
 
+    #[must_use]
     pub fn with_initial_delay(mut self, delay: Duration) -> Self {
         self.initial_delay = delay;
         self
     }
 
+    #[must_use]
     pub fn with_retrain_interval(mut self, interval: Duration) -> Self {
         self.retrain_interval = interval;
         self
     }
 
+    #[must_use]
     pub fn with_epochs(mut self, epochs: usize) -> Self {
         self.epochs = epochs;
         self
     }
 
+    #[must_use]
     pub fn with_min_corpus_size(mut self, size: usize) -> Self {
         self.min_corpus_size = size;
         self
     }
 
+    #[must_use]
     pub fn with_training_script(mut self, path: impl Into<PathBuf>) -> Self {
         self.training_script = path.into();
         self
@@ -104,7 +109,10 @@ impl AutoTrainer {
     }
 
     /// Called periodically from the fuzz loop (or a monitoring thread).
-    /// Checks if training should start, if it's complete, etc.
+    ///
+    /// Checks if a running training process has finished, and if so, sets the
+    /// `model_ready` flag. If no training is running, determines whether it is
+    /// time to start a new training cycle based on elapsed time and corpus size.
     pub fn tick(&mut self) -> Result<()> {
         // Check if a running training process has finished
         if let Some(ref mut child) = self.child {
@@ -165,10 +173,20 @@ impl AutoTrainer {
         self.launch_training()
     }
 
+    /// Spawn the Python training script as a child process.
+    ///
+    /// Creates the output directory if needed, then launches `python3 train.py`
+    /// with the current corpus directory, model output path, and hyperparameters.
     fn launch_training(&mut self) -> Result<()> {
         // Ensure output directory exists
-        if let Some(parent) = self.model_output.parent() {
-            fs::create_dir_all(parent).ok();
+        if let Some(parent) = self.model_output.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "[achlys-trainer] failed to create output directory {}: {}",
+                parent.display(),
+                e
+            );
         }
 
         println!(

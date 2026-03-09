@@ -39,10 +39,12 @@ impl CortexInterface for PassthroughCortex {
 
         let mut results = Vec::with_capacity(count);
 
-        // Simple LCG for deterministic-ish random without pulling in rand
-        let mut rng_state: u64 = 0xdeadbeef;
+        // Simple LCG (Linear Congruential Generator) for deterministic mutations.
+        // Uses the same parameters as PCG (Permuted Congruential Generator).
+        let mut rng_state: u64 = 0xDEAD_BEEF; // arbitrary seed
         let mut next_rng = || -> u64 {
-            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            // PCG multiplier and increment
+            rng_state = rng_state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
             rng_state
         };
 

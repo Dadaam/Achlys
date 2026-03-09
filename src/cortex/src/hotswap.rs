@@ -24,6 +24,7 @@ pub struct HotSwapCortex {
 
 impl HotSwapCortex {
     /// Create an empty hot-swap cortex (no model loaded yet).
+    #[must_use]
     pub fn empty(max_seq_len: usize) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(None),
@@ -33,6 +34,7 @@ impl HotSwapCortex {
     }
 
     /// Create a hot-swap cortex with an initial model.
+    #[must_use]
     pub fn with_model(model: CortexModel, max_seq_len: usize) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Some(model)),

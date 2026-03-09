@@ -4,6 +4,9 @@ use libafl::{stages::Stage, stages::Restartable, Error};
 
 use crate::plateau::SharedPlateauDetector;
 
+/// Check escalation state every N executions (avoids mutex contention).
+const DEFAULT_CHECK_INTERVAL: usize = 1000;
+
 /// The current fuzzing strategy stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FuzzStage {
@@ -27,10 +30,9 @@ impl fmt::Display for FuzzStage {
 
 /// Manages stage transitions based on coverage plateau detection.
 ///
-/// Rules:
-/// - Havoc → AiHybrid: plateau detected AND cortex is available
+/// Transitions:
+/// - Havoc → AiHybrid: plateau detected AND cortex available
 /// - AiHybrid → Havoc: coverage resumes (de-escalation)
-/// - AiHybrid → Symbolic: plateau persists (future)
 pub struct EscalationManager {
     current_stage: FuzzStage,
     detector: SharedPlateauDetector,
@@ -103,17 +105,19 @@ pub struct EscalatingStage<H, A> {
 
 impl<H, A> EscalatingStage<H, A> {
     /// Create an escalating stage with only havoc (no AI available).
+    #[must_use]
     pub fn havoc_only(havoc_stage: H, detector: SharedPlateauDetector) -> Self {
         Self {
             havoc_stage,
             ai_stage: None,
             manager: EscalationManager::new(detector, false),
-            check_interval: 1000,
+            check_interval: DEFAULT_CHECK_INTERVAL,
             exec_count: 0,
         }
     }
 
     /// Create an escalating stage with both havoc and AI stages.
+    #[must_use]
     pub fn with_ai(
         havoc_stage: H,
         ai_stage: A,
@@ -123,12 +127,13 @@ impl<H, A> EscalatingStage<H, A> {
             havoc_stage,
             ai_stage: Some(ai_stage),
             manager: EscalationManager::new(detector, true),
-            check_interval: 1000,
+            check_interval: DEFAULT_CHECK_INTERVAL,
             exec_count: 0,
         }
     }
 
     /// Set how often to check for escalation (every N executions).
+    #[must_use]
     pub fn with_check_interval(mut self, interval: usize) -> Self {
         self.check_interval = interval;
         self

@@ -66,6 +66,7 @@ impl InProcessTarget {
     }
 
     /// Create a new in-process target without coverage (blackbox mode).
+    #[must_use]
     pub fn without_coverage(
         harness: impl FnMut(&[u8]) -> ExitKind + 'static,
         observer_name: impl Into<String>,

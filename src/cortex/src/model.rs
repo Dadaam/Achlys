@@ -71,7 +71,9 @@ impl CortexModel {
         })
     }
 
-    /// Encode byte sequences into float32 vectors normalized to [0, 1].
+    /// Encode byte sequences into a flat float32 buffer.
+    /// Each byte is normalized to [0.0, 1.0] by dividing by 255.
+    /// Sequences shorter than max_seq_len are zero-padded.
     fn encode_samples(&self, samples: &[&[u8]], batch_size: usize) -> Vec<f32> {
         let mut tensor = vec![0.0f32; batch_size * self.max_seq_len];
 
@@ -85,7 +87,8 @@ impl CortexModel {
         tensor
     }
 
-    /// Decode float32 data back to byte sequences.
+    /// Decode a flat float32 buffer back to byte sequences.
+    /// Values are clamped to [0.0, 1.0] then scaled to [0, 255].
     fn decode_predictions(&self, data: &[f32], count: usize) -> Vec<Vec<u8>> {
         let mut results = Vec::with_capacity(count);
 

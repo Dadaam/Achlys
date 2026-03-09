@@ -14,6 +14,9 @@ use std::borrow::Cow;
 
 use crate::cortex_interface::CortexInterface;
 
+/// Batch size for cortex predictions (amortizes inference overhead).
+pub const DEFAULT_PREDICTION_BATCH: usize = 32;
+
 /// A LibAFL Mutator that uses the cortex AI to predict mutations.
 ///
 /// Calls `CortexInterface::predict_mutations()` in batches and caches

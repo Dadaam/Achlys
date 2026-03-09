@@ -26,7 +26,7 @@ use libafl_bolts::{current_nanos, rands::StdRand, tuples::tuple_list, AsSlice};
 
 use achlys_bridge::Target;
 
-use crate::ai_mutator::AiMutator;
+use crate::ai_mutator::{AiMutator, DEFAULT_PREDICTION_BATCH};
 use crate::ai_stage::HybridStage;
 use crate::config::FuzzerConfig;
 use crate::cortex_interface::CortexInterface;
@@ -39,6 +39,7 @@ use crate::plateau::shared_detector;
 /// Reduces the ~100 lines of LibAFL boilerplate to a fluent API.
 /// All LibAFL generics stay internal — the public API only exposes
 /// `FuzzerConfig`, `Target`, and optionally a `CortexInterface`.
+#[must_use]
 pub struct FuzzerBuilder {
     config: FuzzerConfig,
     cortex: Option<Arc<dyn CortexInterface>>,
@@ -160,7 +161,7 @@ impl FuzzerBuilder {
             println!("[achlys] loaded {} seed files from {}", count, corpus_dir.display());
         } else {
             let mut generator = RandBytesGenerator::new(
-                NonZero::new(self.config.max_input_len).unwrap_or(NonZero::new(4096).unwrap()),
+                NonZero::new(self.config.max_input_len).unwrap_or(NonZero::new(4096).expect("4096 is non-zero")),
             );
             state
                 .generate_initial_inputs(
@@ -177,7 +178,7 @@ impl FuzzerBuilder {
                 HavocScheduledMutator::new(havoc_mutations()),
             );
 
-            let ai_mutator = AiMutator::new(cortex, 32);
+            let ai_mutator = AiMutator::new(cortex, DEFAULT_PREDICTION_BATCH);
             let ai_stage = StdMutationalStage::new(ai_mutator);
             let hybrid_havoc = StdMutationalStage::new(
                 HavocScheduledMutator::new(havoc_mutations()),
@@ -260,7 +261,7 @@ impl FuzzerBuilder {
             println!("[achlys] loaded {} seed files from {}", count, corpus_dir.display());
         } else {
             let mut generator = RandBytesGenerator::new(
-                NonZero::new(self.config.max_input_len).unwrap_or(NonZero::new(4096).unwrap()),
+                NonZero::new(self.config.max_input_len).unwrap_or(NonZero::new(4096).expect("4096 is non-zero")),
             );
             state
                 .generate_initial_inputs(
@@ -279,7 +280,7 @@ impl FuzzerBuilder {
                 HavocScheduledMutator::new(havoc_mutations()),
             );
 
-            let ai_mutator = AiMutator::new(cortex, 32);
+            let ai_mutator = AiMutator::new(cortex, DEFAULT_PREDICTION_BATCH);
             let ai_stage = StdMutationalStage::new(ai_mutator);
             let hybrid_havoc = StdMutationalStage::new(
                 HavocScheduledMutator::new(havoc_mutations()),

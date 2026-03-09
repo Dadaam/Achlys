@@ -1,3 +1,8 @@
+//! Achlys fuzzing engine.
+//!
+//! Provides the `FuzzerBuilder` for configuring and running fuzzing campaigns,
+//! with plateau detection and automatic escalation between mutation strategies.
+
 pub mod config;
 pub mod builder;
 pub mod plateau;

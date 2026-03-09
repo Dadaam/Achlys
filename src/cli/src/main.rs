@@ -87,69 +87,14 @@ fn main() -> Result<()> {
                 model_path: model.clone(),
             };
 
-            // Determine cortex mode:
-            // 1. --model provided → load pre-trained model
-            // 2. --no-ai → no cortex at all (pure havoc)
-            // 3. Default → autonomous training with HotSwapCortex
-            let cortex: Option<Arc<dyn CortexInterface>> = if no_ai {
-                println!("[achlys] AI disabled (--no-ai)");
-                None
-            } else if let Some(ref model_path) = model {
-                let cortex_model = CortexModel::load(model_path, max_input_len)
-                    .context("failed to load ONNX model")?;
-                Some(Arc::new(cortex_model))
-            } else {
-                // Autonomous mode: HotSwapCortex starts empty, AutoTrainer fills it
-                let hotswap = HotSwapCortex::empty(max_input_len);
-
-                // Determine corpus dir for training
-                let train_corpus = corpus
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from("./runtime/corpus"));
-
-                let model_output = std::env::temp_dir()
-                    .join("achlys_models")
-                    .join("auto_brain.onnx");
-
-                let training_script = find_training_script()?;
-
-                let mut trainer = AutoTrainer::new(&train_corpus, &model_output, max_input_len)
-                    .with_initial_delay(Duration::from_secs(train_delay))
-                    .with_retrain_interval(Duration::from_secs(plateau_timeout * 2))
-                    .with_epochs(30)
-                    .with_min_corpus_size(20)
-                    .with_training_script(&training_script);
-
-                let hotswap_for_thread = hotswap.clone();
-                let model_ready = trainer.model_ready_flag();
-
-                // Spawn monitoring thread for autonomous training
-                std::thread::spawn(move || {
-                    loop {
-                        std::thread::sleep(Duration::from_secs(10));
-
-                        if let Err(e) = trainer.tick() {
-                            eprintln!("[achlys-trainer] error: {}", e);
-                        }
-
-                        // Hot-load new model when ready
-                        if model_ready.load(std::sync::atomic::Ordering::Acquire) {
-                            if let Err(e) = hotswap_for_thread.load_model(&model_output) {
-                                eprintln!("[achlys-trainer] failed to hot-load model: {}", e);
-                            }
-                            trainer.acknowledge_model();
-                        }
-                    }
-                });
-
-                println!(
-                    "[achlys] autonomous training enabled (delay: {}s, corpus: {})",
-                    train_delay,
-                    train_corpus.display()
-                );
-
-                Some(hotswap as Arc<dyn CortexInterface>)
-            };
+            let cortex = setup_cortex(
+                no_ai,
+                model.as_ref(),
+                max_input_len,
+                corpus.as_ref(),
+                train_delay,
+                plateau_timeout,
+            )?;
 
             let builder = FuzzerBuilder::new().config(config).cortex(cortex);
 
@@ -170,6 +115,81 @@ fn main() -> Result<()> {
             }
         }
     }
+}
+
+/// Set up the AI cortex based on CLI flags.
+///
+/// Returns `None` for `--no-ai`, a loaded `CortexModel` for `--model`,
+/// or a `HotSwapCortex` with autonomous training for the default mode.
+fn setup_cortex(
+    no_ai: bool,
+    model: Option<&PathBuf>,
+    max_input_len: usize,
+    corpus: Option<&PathBuf>,
+    train_delay: u64,
+    plateau_timeout: u64,
+) -> Result<Option<Arc<dyn CortexInterface>>> {
+    if no_ai {
+        println!("[achlys] AI disabled (--no-ai)");
+        return Ok(None);
+    }
+
+    if let Some(model_path) = model {
+        let cortex_model = CortexModel::load(model_path, max_input_len)
+            .context("failed to load ONNX model")?;
+        return Ok(Some(Arc::new(cortex_model)));
+    }
+
+    // Autonomous mode: HotSwapCortex starts empty, AutoTrainer fills it
+    let hotswap = HotSwapCortex::empty(max_input_len);
+
+    // Determine corpus dir for training
+    let train_corpus = corpus
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("./runtime/corpus"));
+
+    let model_output = std::env::temp_dir()
+        .join("achlys_models")
+        .join("auto_brain.onnx");
+
+    let training_script = find_training_script()?;
+
+    let mut trainer = AutoTrainer::new(&train_corpus, &model_output, max_input_len)
+        .with_initial_delay(Duration::from_secs(train_delay))
+        .with_retrain_interval(Duration::from_secs(plateau_timeout * 2))
+        .with_epochs(30)
+        .with_min_corpus_size(20)
+        .with_training_script(&training_script);
+
+    let hotswap_for_thread = hotswap.clone();
+    let model_ready = trainer.model_ready_flag();
+
+    // Spawn monitoring thread for autonomous training
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(10));
+
+            if let Err(e) = trainer.tick() {
+                eprintln!("[achlys-trainer] error: {}", e);
+            }
+
+            // Hot-load new model when ready
+            if model_ready.load(std::sync::atomic::Ordering::Acquire) {
+                if let Err(e) = hotswap_for_thread.load_model(&model_output) {
+                    eprintln!("[achlys-trainer] failed to hot-load model: {}", e);
+                }
+                trainer.acknowledge_model();
+            }
+        }
+    });
+
+    println!(
+        "[achlys] autonomous training enabled (delay: {}s, corpus: {})",
+        train_delay,
+        train_corpus.display()
+    );
+
+    Ok(Some(hotswap as Arc<dyn CortexInterface>))
 }
 
 /// Find the training script relative to the binary or in known locations.

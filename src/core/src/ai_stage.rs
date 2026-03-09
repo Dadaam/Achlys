@@ -18,6 +18,7 @@ pub struct HybridStage<H, A> {
 impl<H, A> HybridStage<H, A> {
     /// Create a hybrid stage. `ai_ratio` = run AI every Nth execution.
     /// E.g., ai_ratio=10 means 1 AI mutation per 10 havoc mutations.
+    #[must_use]
     pub fn new(havoc: H, ai: A, ai_ratio: usize) -> Self {
         Self {
             havoc,

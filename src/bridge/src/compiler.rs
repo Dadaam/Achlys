@@ -44,6 +44,7 @@ pub struct AutoCompiler {
 }
 
 impl AutoCompiler {
+    /// Create a new compiler targeting the given output directory.
     pub fn new(output_dir: impl Into<PathBuf>) -> Self {
         Self {
             output_dir: output_dir.into(),

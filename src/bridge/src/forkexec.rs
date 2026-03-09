@@ -8,6 +8,21 @@ use libafl::executors::ExitKind;
 
 use crate::target::Target;
 
+/// Unix signals indicating a crash.
+#[cfg(unix)]
+mod signals {
+    pub const SIGILL: i32 = 4;
+    pub const SIGABRT: i32 = 6;
+    pub const SIGBUS: i32 = 7;
+    pub const SIGFPE: i32 = 8;
+    pub const SIGSEGV: i32 = 11;
+}
+
+/// Default per-run execution timeout (5 seconds).
+///
+/// Chosen to be generous enough for most targets while still catching hangs.
+/// The escalation module uses a coarser `check_interval` of 1 000 ms for
+/// periodic liveness checks, so this value should always be larger.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const FILE_PLACEHOLDER: &str = "@@";
 
@@ -65,7 +80,8 @@ impl ForkExecTarget {
         }
     }
 
-    /// Set the execution timeout per run.
+    /// Set the execution timeout per run (default: 5 seconds).
+    #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -137,12 +153,7 @@ impl Target for ForkExecTarget {
                 {
                     use std::os::unix::process::ExitStatusExt;
                     if let Some(signal) = status.signal() {
-                        const SIGILL: i32 = 4;
-                        const SIGABRT: i32 = 6;
-                        const SIGBUS: i32 = 7;
-                        const SIGFPE: i32 = 8;
-                        const SIGSEGV: i32 = 11;
-
+                        use signals::*;
                         match signal {
                             SIGILL | SIGABRT | SIGBUS | SIGFPE | SIGSEGV => ExitKind::Crash,
                             _ => ExitKind::Ok,
