@@ -93,9 +93,9 @@ This means Achlys spends **most of its time** in the fast lane (havoc), occasion
 | Crate | Path | Role |
 |-------|------|------|
 | **achlys-core** | `src/core/` | The fuzzing engine. `FuzzerBuilder` reduces setup to a few lines. `PlateauDetector` monitors coverage growth. `PlateauAwareFeedback` wraps `MaxMapFeedback` to track new edges. `EscalationManager` decides when to switch stages. `EscalatingStage` delegates to havoc or `HybridStage`. `AiMutator` calls `CortexInterface` for AI predictions. `CortexInterface` trait (dependency inversion — cortex implements it, core defines it). |
-| **achlys-cortex** | `src/cortex/` | The AI brain. `CortexModel` loads ONNX models via [`ort`](https://github.com/pykeio/ort), encodes bytes to float32 tensors, runs inference, decodes predictions. `PassthroughCortex` provides a test double with random mutations. Training pipeline in `training/train.py` (PyTorch LSTM). |
+| **achlys-cortex** | `src/cortex/` | The AI brain. `CortexModel` loads ONNX models via [`ort`](https://github.com/pykeio/ort). `HotSwapCortex` enables runtime model replacement. `AutoTrainer` spawns background training and hot-loads the result. `PassthroughCortex` provides a test double. Training pipeline in `training/train.py` (PyTorch LSTM). |
 | **achlys-bridge** | `src/bridge/` | The target interface. `Target` trait abstracts execution + coverage. `InProcessTarget` for FFI (graybox/blackbox). `ForkExecTarget` for spawning binaries (stdin or `@@` file replacement). `AutoCompiler` compiles C/C++ with SanCov instrumentation (`--source` flag). |
-| **achlys-cli** | `src/cli/` | `achlys fuzz <binary> [@@] --corpus --source --model --plateau-timeout`. Loads `CortexModel` if `--model` provided, creates `ForkExecTarget`, calls `FuzzerBuilder`. |
+| **achlys-cli** | `src/cli/` | `achlys fuzz <binary> [@@] --corpus --source --model --no-ai --train-delay`. Three modes: autonomous (default, `HotSwapCortex` + `AutoTrainer`), pre-trained (`--model`), or havoc-only (`--no-ai`). `setup_cortex()` helper wires the appropriate mode. |
 
 ---
 

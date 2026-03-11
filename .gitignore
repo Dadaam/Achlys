@@ -38,6 +38,7 @@ src/cortex/training/*.ckpt
 # ------------------------------------------------------------------------------
 .idea/
 .vscode/
+.serena/
 .DS_Store
 *.swp
 CLAUDE.md
