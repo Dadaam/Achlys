@@ -1,5 +1,7 @@
+mod tui;
+
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -8,6 +10,8 @@ use clap::{Parser, Subcommand};
 use achlys_bridge::{AutoCompiler, ForkExecTarget};
 use achlys_core::{CortexInterface, FuzzerBuilder, FuzzerConfig};
 use achlys_cortex::{AutoTrainer, CortexModel, HotSwapCortex};
+
+use crate::tui::{AchlysTui, create_tui_callback};
 
 #[derive(Parser)]
 #[command(name = "achlys", about = "4-stage adaptive fuzzer — hunt zero-days in any binary")]
@@ -44,6 +48,10 @@ enum Commands {
         #[arg(long)]
         no_ai: bool,
 
+        /// Disable TUI (use plain text output)
+        #[arg(long)]
+        no_tui: bool,
+
         /// C/C++ source files to compile with SanCov instrumentation (graybox mode)
         #[arg(short, long, num_args = 1..)]
         source: Vec<PathBuf>,
@@ -73,6 +81,7 @@ fn main() -> Result<()> {
             output,
             model,
             no_ai,
+            no_tui,
             source,
             plateau_timeout,
             max_input_len,
@@ -96,20 +105,48 @@ fn main() -> Result<()> {
                 plateau_timeout,
             )?;
 
-            let builder = FuzzerBuilder::new().config(config).cortex(cortex);
+            let mode = if no_ai {
+                "havoc"
+            } else if model.is_some() {
+                "blackbox + AI"
+            } else {
+                "autonomous"
+            };
+
+            let target_display = binary.display().to_string();
+
+            let mut builder = FuzzerBuilder::new().config(config).cortex(cortex);
+
+            // Set up TUI or plain text monitor
+            let _tui_guard: Option<Arc<Mutex<AchlysTui>>> = if !no_tui {
+                match AchlysTui::init(target_display.clone(), mode.to_string()) {
+                    Ok((tui_instance, tui_state)) => {
+                        let tui_arc = Arc::new(Mutex::new(tui_instance));
+                        let callback = create_tui_callback(tui_state, tui_arc.clone());
+                        builder = builder.monitor(callback);
+                        Some(tui_arc)
+                    }
+                    Err(e) => {
+                        eprintln!("[achlys] TUI init failed ({}), falling back to text", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
 
             if !source.is_empty() {
-                println!("[achlys] compiling source files with SanCov instrumentation...");
+                if no_tui {
+                    println!("[achlys] compiling source files with SanCov instrumentation...");
+                }
                 let compiler = AutoCompiler::new(std::env::temp_dir().join("achlys_build"));
                 let instrumented = compiler
                     .compile_binary(&source, "target_instrumented")
                     .context("source compilation failed")?;
 
-                println!("[achlys] fuzzing instrumented binary: {}", instrumented.display());
                 let target = ForkExecTarget::new(instrumented, args);
                 builder.run(target)
             } else {
-                println!("[achlys] fuzzing binary: {}", binary.display());
                 let target = ForkExecTarget::new(binary, args);
                 builder.run(target)
             }
@@ -118,9 +155,6 @@ fn main() -> Result<()> {
 }
 
 /// Set up the AI cortex based on CLI flags.
-///
-/// Returns `None` for `--no-ai`, a loaded `CortexModel` for `--model`,
-/// or a `HotSwapCortex` with autonomous training for the default mode.
 fn setup_cortex(
     no_ai: bool,
     model: Option<&PathBuf>,
@@ -130,7 +164,6 @@ fn setup_cortex(
     plateau_timeout: u64,
 ) -> Result<Option<Arc<dyn CortexInterface>>> {
     if no_ai {
-        println!("[achlys] AI disabled (--no-ai)");
         return Ok(None);
     }
 
@@ -140,10 +173,8 @@ fn setup_cortex(
         return Ok(Some(Arc::new(cortex_model)));
     }
 
-    // Autonomous mode: HotSwapCortex starts empty, AutoTrainer fills it
     let hotswap = HotSwapCortex::empty(max_input_len);
 
-    // Determine corpus dir for training
     let train_corpus = corpus
         .cloned()
         .unwrap_or_else(|| PathBuf::from("./runtime/corpus"));
@@ -164,37 +195,25 @@ fn setup_cortex(
     let hotswap_for_thread = hotswap.clone();
     let model_ready = trainer.model_ready_flag();
 
-    // Spawn monitoring thread for autonomous training
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(Duration::from_secs(10));
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(10));
 
-            if let Err(e) = trainer.tick() {
-                eprintln!("[achlys-trainer] error: {}", e);
-            }
+        if let Err(e) = trainer.tick() {
+            eprintln!("[achlys-trainer] error: {}", e);
+        }
 
-            // Hot-load new model when ready
-            if model_ready.load(std::sync::atomic::Ordering::Acquire) {
-                if let Err(e) = hotswap_for_thread.load_model(&model_output) {
-                    eprintln!("[achlys-trainer] failed to hot-load model: {}", e);
-                }
-                trainer.acknowledge_model();
+        if model_ready.load(std::sync::atomic::Ordering::Acquire) {
+            if let Err(e) = hotswap_for_thread.load_model(&model_output) {
+                eprintln!("[achlys-trainer] failed to hot-load model: {}", e);
             }
+            trainer.acknowledge_model();
         }
     });
-
-    println!(
-        "[achlys] autonomous training enabled (delay: {}s, corpus: {})",
-        train_delay,
-        train_corpus.display()
-    );
 
     Ok(Some(hotswap as Arc<dyn CortexInterface>))
 }
 
-/// Find the training script relative to the binary or in known locations.
 fn find_training_script() -> Result<PathBuf> {
-    // Try relative to current dir
     let candidates = [
         PathBuf::from("src/cortex/training/train.py"),
         PathBuf::from("cortex/training/train.py"),
@@ -206,7 +225,6 @@ fn find_training_script() -> Result<PathBuf> {
         }
     }
 
-    // Try relative to the executable
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {

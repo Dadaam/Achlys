@@ -16,3 +16,5 @@ libafl.workspace = true
 libafl_bolts.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+ratatui = "0.29"
+crossterm = "0.28"

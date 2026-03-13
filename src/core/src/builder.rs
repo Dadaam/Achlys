@@ -26,6 +26,9 @@ use libafl_bolts::{current_nanos, rands::StdRand, tuples::tuple_list, AsSlice};
 
 use achlys_bridge::Target;
 
+/// Callback type for custom monitor output (TUI, logging, etc.).
+type MonitorCallback = Box<dyn FnMut(&str)>;
+
 use crate::ai_mutator::{AiMutator, DEFAULT_PREDICTION_BATCH};
 use crate::ai_stage::HybridStage;
 use crate::config::FuzzerConfig;
@@ -43,6 +46,7 @@ use crate::plateau::shared_detector;
 pub struct FuzzerBuilder {
     config: FuzzerConfig,
     cortex: Option<Arc<dyn CortexInterface>>,
+    monitor_fn: Option<MonitorCallback>,
 }
 
 impl FuzzerBuilder {
@@ -50,6 +54,7 @@ impl FuzzerBuilder {
         Self {
             config: FuzzerConfig::default(),
             cortex: None,
+            monitor_fn: None,
         }
     }
 
@@ -94,6 +99,13 @@ impl FuzzerBuilder {
         self
     }
 
+    /// Set a custom monitor callback (replaces the default println output).
+    /// Used by the TUI to intercept stats updates.
+    pub fn monitor(mut self, f: impl FnMut(&str) + 'static) -> Self {
+        self.monitor_fn = Some(Box::new(f));
+        self
+    }
+
     /// Build and run the fuzzer with the given target.
     pub fn run(self, mut target: impl Target) -> Result<()> {
         if target.has_coverage() {
@@ -103,7 +115,15 @@ impl FuzzerBuilder {
         }
     }
 
-    fn run_graybox(self, mut target: impl Target) -> Result<()> {
+    fn make_monitor(&mut self) -> SimpleMonitor<MonitorCallback> {
+        let print_fn = self
+            .monitor_fn
+            .take()
+            .unwrap_or_else(|| Box::new(|s: &str| println!("{s}")));
+        SimpleMonitor::new(print_fn)
+    }
+
+    fn run_graybox(mut self, mut target: impl Target) -> Result<()> {
         let coverage = target
             .coverage_map()
             .context("target reported coverage but returned None")?;
@@ -143,7 +163,7 @@ impl FuzzerBuilder {
             target.execute(bytes.as_slice())
         };
 
-        let mon = SimpleMonitor::new(|s| println!("{s}"));
+        let mon = self.make_monitor();
         let mut mgr = SimpleEventManager::new(mon);
 
         let mut executor = InProcessExecutor::new(
@@ -214,7 +234,7 @@ impl FuzzerBuilder {
         Ok(())
     }
 
-    fn run_blackbox(self, mut target: impl Target) -> Result<()> {
+    fn run_blackbox(mut self, mut target: impl Target) -> Result<()> {
         static mut DUMMY_MAP: [u8; 16] = [0; 16];
 
         let observer = unsafe {
@@ -244,7 +264,7 @@ impl FuzzerBuilder {
             target.execute(bytes.as_slice())
         };
 
-        let mon = SimpleMonitor::new(|s| println!("{s}"));
+        let mon = self.make_monitor();
         let mut mgr = SimpleEventManager::new(mon);
 
         let mut executor = InProcessExecutor::new(
