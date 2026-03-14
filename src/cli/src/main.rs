@@ -106,11 +106,11 @@ fn main() -> Result<()> {
             )?;
 
             let mode = if no_ai {
-                "havoc"
+                "havoc only"
             } else if model.is_some() {
-                "blackbox + AI"
+                "havoc → AI (model loaded)"
             } else {
-                "autonomous"
+                "havoc → AI (auto-training)"
             };
 
             let target_display = binary.display().to_string();

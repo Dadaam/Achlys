@@ -4,14 +4,17 @@
 //! escalation state, AI cortex status, and coverage information.
 
 use std::io::{self, Stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crossterm::{
-    event::{self, Event, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+
+/// Global flag set by the Ctrl+C handler.
+static SHOULD_QUIT: AtomicBool = AtomicBool::new(false);
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -98,6 +101,7 @@ pub struct AchlysTui {
 
 impl AchlysTui {
     /// Initialize the TUI (enters alternate screen, enables raw mode).
+    /// Installs a Ctrl+C handler that cleanly exits the TUI.
     pub fn init(target_name: String, mode: String) -> io::Result<(Self, Arc<Mutex<TuiState>>)> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -107,6 +111,9 @@ impl AchlysTui {
 
         let state = Arc::new(Mutex::new(TuiState::new(target_name, mode)));
         let state_clone = state.clone();
+
+        // Install Ctrl+C handler that restores terminal and exits
+        let _ = ctrlc_handler();
 
         Ok((Self { terminal, state }, state_clone))
     }
@@ -158,18 +165,40 @@ impl AchlysTui {
         Ok(())
     }
 
-    /// Check for quit key (q or Ctrl+C).
+    /// Check if the user requested quit (via Ctrl+C signal handler).
     #[allow(dead_code)]
     pub fn should_quit() -> bool {
-        if event::poll(std::time::Duration::from_millis(0)).unwrap_or(false)
-            && let Ok(Event::Key(key)) = event::read()
-        {
-            return key.code == KeyCode::Char('q')
-                || key.code == KeyCode::Char('c')
-                    && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
-        }
-        false
+        SHOULD_QUIT.load(Ordering::Relaxed)
     }
+}
+
+/// Install a Ctrl+C handler that restores the terminal and exits.
+fn ctrlc_handler() -> io::Result<()> {
+    // Use signal_hook via crossterm's signal-hook dependency
+    #[cfg(unix)]
+    {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            unsafe {
+                libc_signal(libc::SIGINT, sigint_handler as *const () as usize);
+            }
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+extern "C" fn sigint_handler(_sig: libc::c_int) {
+    // Restore terminal
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    std::process::exit(0);
+}
+
+#[cfg(unix)]
+unsafe fn libc_signal(sig: libc::c_int, handler: usize) {
+    unsafe { libc::signal(sig, handler) };
 }
 
 impl Drop for AchlysTui {
