@@ -183,34 +183,15 @@ where
     H: Restartable<S>,
     A: Restartable<S>,
 {
+    // Always delegate to havoc stage for restart tracking.
+    // The AI stage's StdMutationalStage doesn't have its RetryCountRestartHelper
+    // registered in the state (only the initially active stage gets init_state called).
     fn should_restart(&mut self, state: &mut S) -> Result<bool, Error> {
-        match self.manager.current_stage() {
-            FuzzStage::Havoc | FuzzStage::Symbolic => {
-                self.havoc_stage.should_restart(state)
-            }
-            FuzzStage::AiHybrid => {
-                if let Some(ref mut ai) = self.ai_stage {
-                    ai.should_restart(state)
-                } else {
-                    self.havoc_stage.should_restart(state)
-                }
-            }
-        }
+        self.havoc_stage.should_restart(state)
     }
 
     fn clear_progress(&mut self, state: &mut S) -> Result<(), Error> {
-        match self.manager.current_stage() {
-            FuzzStage::Havoc | FuzzStage::Symbolic => {
-                self.havoc_stage.clear_progress(state)
-            }
-            FuzzStage::AiHybrid => {
-                if let Some(ref mut ai) = self.ai_stage {
-                    ai.clear_progress(state)
-                } else {
-                    self.havoc_stage.clear_progress(state)
-                }
-            }
-        }
+        self.havoc_stage.clear_progress(state)
     }
 }
 
