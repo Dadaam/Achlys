@@ -37,6 +37,8 @@ pub struct EscalationManager {
     current_stage: FuzzStage,
     detector: SharedPlateauDetector,
     has_ai: bool,
+    /// Pending log message from the last stage transition (consumed by the monitor).
+    pending_log: Option<String>,
 }
 
 impl EscalationManager {
@@ -45,7 +47,13 @@ impl EscalationManager {
             current_stage: FuzzStage::Havoc,
             detector,
             has_ai,
+            pending_log: None,
         }
+    }
+
+    /// Take the pending log message (if any) from the last stage transition.
+    pub fn take_log(&mut self) -> Option<String> {
+        self.pending_log.take()
     }
 
     /// Check if escalation/de-escalation is needed. Returns the stage to use.
@@ -62,19 +70,19 @@ impl EscalationManager {
             FuzzStage::Havoc => {
                 if in_plateau && self.has_ai {
                     self.current_stage = FuzzStage::AiHybrid;
-                    println!(
+                    self.pending_log = Some(format!(
                         "[achlys] escalating: {} -> {} (coverage plateau detected)",
                         previous, self.current_stage
-                    );
+                    ));
                 }
             }
             FuzzStage::AiHybrid => {
                 if !in_plateau {
                     self.current_stage = FuzzStage::Havoc;
-                    println!(
+                    self.pending_log = Some(format!(
                         "[achlys] de-escalating: {} -> {} (coverage resumed)",
                         previous, self.current_stage
-                    );
+                    ));
                 }
             }
             FuzzStage::Symbolic => {

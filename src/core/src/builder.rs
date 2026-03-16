@@ -177,8 +177,8 @@ impl FuzzerBuilder {
 
         // Load seed corpus or generate random inputs
         if let Some(ref corpus_dir) = self.config.corpus_dir {
-            let count = load_seeds_from_dir(&mut state, corpus_dir)?;
-            println!("[achlys] loaded {} seed files from {}", count, corpus_dir.display());
+            load_seeds_from_dir(&mut state, corpus_dir)?;
+            // Seed loading info visible through TUI logs or --no-tui output
         } else {
             let mut generator = RandBytesGenerator::new(
                 NonZero::new(self.config.max_input_len).unwrap_or(NonZero::new(4096).expect("4096 is non-zero")),
@@ -208,11 +208,6 @@ impl FuzzerBuilder {
             let escalating = EscalatingStage::with_ai(havoc_stage, hybrid, detector);
             let mut stages = tuple_list!(escalating);
 
-            println!(
-                "[achlys] fuzzing started (graybox + AI, {} edges, plateau: {}s)",
-                coverage_len, self.config.plateau_timeout.as_secs()
-            );
-
             fuzzer
                 .fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)
                 .context("fatal error in fuzz loop")?;
@@ -220,11 +215,6 @@ impl FuzzerBuilder {
             // Plain havoc (no AI)
             let mutator = HavocScheduledMutator::new(havoc_mutations());
             let mut stages = tuple_list!(StdMutationalStage::new(mutator));
-
-            println!(
-                "[achlys] fuzzing started (graybox, {} edges)",
-                coverage_len
-            );
 
             fuzzer
                 .fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)
@@ -277,8 +267,8 @@ impl FuzzerBuilder {
         .context("failed to create executor")?;
 
         if let Some(ref corpus_dir) = self.config.corpus_dir {
-            let count = load_seeds_from_dir(&mut state, corpus_dir)?;
-            println!("[achlys] loaded {} seed files from {}", count, corpus_dir.display());
+            load_seeds_from_dir(&mut state, corpus_dir)?;
+            // Seed loading info visible through TUI logs or --no-tui output
         } else {
             let mut generator = RandBytesGenerator::new(
                 NonZero::new(self.config.max_input_len).unwrap_or(NonZero::new(4096).expect("4096 is non-zero")),
@@ -310,19 +300,12 @@ impl FuzzerBuilder {
             let escalating = EscalatingStage::with_ai(havoc_stage, hybrid, detector);
             let mut stages = tuple_list!(escalating);
 
-            println!(
-                "[achlys] fuzzing started (blackbox + AI, plateau: {}s)",
-                self.config.plateau_timeout.as_secs()
-            );
-
             fuzzer
                 .fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)
                 .context("fatal error in fuzz loop")?;
         } else {
             let mutator = HavocScheduledMutator::new(havoc_mutations());
             let mut stages = tuple_list!(StdMutationalStage::new(mutator));
-
-            println!("[achlys] fuzzing started (blackbox mode)");
 
             fuzzer
                 .fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)

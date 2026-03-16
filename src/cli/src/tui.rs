@@ -1,8 +1,9 @@
 //! AFL++-inspired TUI for Achlys.
 //!
 //! Renders a status screen with colored boxes showing fuzzer stats,
-//! escalation state, AI cortex status, and coverage information.
+//! escalation state, AI cortex status, and a live event log.
 
+use std::collections::VecDeque;
 use std::io::{self, Stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,9 +13,6 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-
-/// Global flag set by the Ctrl+C handler.
-static SHOULD_QUIT: AtomicBool = AtomicBool::new(false);
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -24,6 +22,11 @@ use ratatui::{
     Frame, Terminal,
 };
 
+/// Global quit flag set by the Ctrl+C handler.
+static QUIT_FLAG: AtomicBool = AtomicBool::new(false);
+
+const MAX_LOG_LINES: usize = 50;
+
 /// Stats extracted from LibAFL's monitor output.
 #[derive(Debug, Clone, Default)]
 pub struct TuiStats {
@@ -32,17 +35,16 @@ pub struct TuiStats {
     pub objective_size: u64,
     pub total_execs: u64,
     pub execs_per_sec: String,
-    pub clients: u64,
     pub last_event: String,
-    pub last_update: Option<Instant>,
 }
 
 /// Shared TUI state updated by the monitor callback.
 pub struct TuiState {
-    stats: TuiStats,
-    start_time: Instant,
-    target_name: String,
-    mode: String,
+    pub stats: TuiStats,
+    pub start_time: Instant,
+    pub target_name: String,
+    pub mode: String,
+    pub logs: VecDeque<String>,
 }
 
 impl TuiState {
@@ -52,12 +54,45 @@ impl TuiState {
             start_time: Instant::now(),
             target_name,
             mode,
+            logs: VecDeque::with_capacity(MAX_LOG_LINES),
         }
     }
 
+    /// Add a log message to the ring buffer.
+    pub fn log(&mut self, msg: String) {
+        if self.logs.len() >= MAX_LOG_LINES {
+            self.logs.pop_front();
+        }
+        self.logs.push_back(msg);
+    }
+
     /// Parse the formatted stats string from SimpleMonitor.
-    /// Format: `[EVENT #ID] run time: X, clients: N, corpus: N, objectives: N, executions: N, exec/sec: N`
     pub fn update_from_stats(&mut self, stats_str: &str) {
+        // Detect escalation/achlys messages mixed into the stats string
+        // These come from println! in builder.rs and escalation.rs
+        if stats_str.contains("[achlys") {
+            // Extract all [achlys...] messages
+            for part in stats_str.split("[achlys") {
+                if let Some(end) = part.find(')') {
+                    let msg = format!("[achlys{}", &part[..=end]);
+                    self.log(msg);
+
+                    // Detect stage changes
+                    if part.contains("escalating") && part.contains("AI Hybrid") {
+                        self.mode = "AI Hybrid".to_string();
+                    } else if part.contains("de-escalating") && part.contains("Havoc") {
+                        self.mode = "Havoc".to_string();
+                    }
+                }
+            }
+        }
+
+        // Parse the standard monitor key-value pairs
+        let pairs_str = stats_str
+            .find(']')
+            .map(|i| &stats_str[i + 2..])
+            .unwrap_or(stats_str);
+
         // Extract event name
         if let Some(bracket_end) = stats_str.find(']')
             && let Some(bracket_start) = stats_str.find('[')
@@ -68,18 +103,11 @@ impl TuiState {
             }
         }
 
-        // Parse key-value pairs after the bracket
-        let pairs_str = stats_str
-            .find(']')
-            .map(|i| &stats_str[i + 2..])
-            .unwrap_or(stats_str);
-
         for part in pairs_str.split(", ") {
             let mut kv = part.splitn(2, ": ");
             if let (Some(key), Some(val)) = (kv.next(), kv.next()) {
                 match key.trim() {
                     "run time" => self.stats.run_time = val.to_string(),
-                    "clients" => self.stats.clients = val.parse().unwrap_or(0),
                     "corpus" => self.stats.corpus_size = val.parse().unwrap_or(0),
                     "objectives" => self.stats.objective_size = val.parse().unwrap_or(0),
                     "executions" => self.stats.total_execs = val.parse().unwrap_or(0),
@@ -88,8 +116,6 @@ impl TuiState {
                 }
             }
         }
-
-        self.stats.last_update = Some(Instant::now());
     }
 }
 
@@ -100,8 +126,7 @@ pub struct AchlysTui {
 }
 
 impl AchlysTui {
-    /// Initialize the TUI (enters alternate screen, enables raw mode).
-    /// Installs a Ctrl+C handler that cleanly exits the TUI.
+    /// Initialize the TUI.
     pub fn init(target_name: String, mode: String) -> io::Result<(Self, Arc<Mutex<TuiState>>)> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -112,37 +137,46 @@ impl AchlysTui {
         let state = Arc::new(Mutex::new(TuiState::new(target_name, mode)));
         let state_clone = state.clone();
 
-        // Install Ctrl+C handler that restores terminal and exits
-        let _ = ctrlc_handler();
+        // Install Ctrl+C handler
+        ctrlc::set_handler(move || {
+            QUIT_FLAG.store(true, Ordering::SeqCst);
+            // Restore terminal immediately
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            std::process::exit(0);
+        })
+        .expect("failed to set Ctrl+C handler");
 
         Ok((Self { terminal, state }, state_clone))
     }
 
     /// Draw the TUI frame.
     pub fn draw(&mut self) -> io::Result<()> {
-        let state = self.state.lock().unwrap();
-        let stats = &state.stats;
-        let target = &state.target_name;
-        let mode = &state.mode;
-        let uptime = format_duration(state.start_time.elapsed());
+        if QUIT_FLAG.load(Ordering::Relaxed) {
+            return Ok(());
+        }
 
-        // Snapshot data for rendering
-        let run_time = stats.run_time.clone();
-        let corpus = format_number(stats.corpus_size);
-        let objectives = format_number(stats.objective_size);
-        let total_execs = format_number(stats.total_execs);
-        let execs_per_sec = stats.execs_per_sec.clone();
-        let last_event = stats.last_event.clone();
-        let mode_display = mode.clone();
-        let target_display = target.clone();
+        let state = self.state.lock().unwrap();
+
+        // Snapshot all data for rendering
+        let target = state.target_name.clone();
+        let mode = state.mode.clone();
+        let uptime = format_duration(state.start_time.elapsed());
+        let run_time = state.stats.run_time.clone();
+        let corpus = format_number(state.stats.corpus_size);
+        let objectives = format_number(state.stats.objective_size);
+        let total_execs = format_number(state.stats.total_execs);
+        let execs_per_sec = state.stats.execs_per_sec.clone();
+        let last_event = state.stats.last_event.clone();
+        let logs: Vec<String> = state.logs.iter().cloned().collect();
 
         drop(state);
 
         self.terminal.draw(|frame| {
             let area = frame.area();
-            let data = RenderData {
-                target: &target_display,
-                mode: &mode_display,
+            render_ui(frame, area, &RenderData {
+                target: &target,
+                mode: &mode,
                 uptime: &uptime,
                 run_time: &run_time,
                 corpus: &corpus,
@@ -150,8 +184,8 @@ impl AchlysTui {
                 total_execs: &total_execs,
                 execs_per_sec: &execs_per_sec,
                 last_event: &last_event,
-            };
-            render_ui(frame, area, &data);
+                logs: &logs,
+            });
         })?;
 
         Ok(())
@@ -164,41 +198,6 @@ impl AchlysTui {
         self.terminal.show_cursor()?;
         Ok(())
     }
-
-    /// Check if the user requested quit (via Ctrl+C signal handler).
-    #[allow(dead_code)]
-    pub fn should_quit() -> bool {
-        SHOULD_QUIT.load(Ordering::Relaxed)
-    }
-}
-
-/// Install a Ctrl+C handler that restores the terminal and exits.
-fn ctrlc_handler() -> io::Result<()> {
-    // Use signal_hook via crossterm's signal-hook dependency
-    #[cfg(unix)]
-    {
-        use std::sync::Once;
-        static ONCE: Once = Once::new();
-        ONCE.call_once(|| {
-            unsafe {
-                libc_signal(libc::SIGINT, sigint_handler as *const () as usize);
-            }
-        });
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-extern "C" fn sigint_handler(_sig: libc::c_int) {
-    // Restore terminal
-    let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
-    std::process::exit(0);
-}
-
-#[cfg(unix)]
-unsafe fn libc_signal(sig: libc::c_int, handler: usize) {
-    unsafe { libc::signal(sig, handler) };
 }
 
 impl Drop for AchlysTui {
@@ -217,30 +216,42 @@ struct RenderData<'a> {
     total_execs: &'a str,
     execs_per_sec: &'a str,
     last_event: &'a str,
+    logs: &'a [String],
 }
 
 fn render_ui(frame: &mut Frame, area: Rect, d: &RenderData<'_>) {
     let cyan = Style::default().fg(Color::Cyan);
     let green = Style::default().fg(Color::Green);
-    let yellow = Style::default().fg(Color::Yellow);
+    let _yellow = Style::default().fg(Color::Yellow);
     let red = Style::default().fg(Color::Red);
     let white = Style::default().fg(Color::White);
     let dim = Style::default().fg(Color::DarkGray);
+    let border = Style::default().fg(Color::DarkGray);
 
-    // Main layout: header + body
+    // Main layout: header + body + logs
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(3),  // header
+            Constraint::Min(10),   // stats grid
+            Constraint::Length(8), // logs
+        ])
         .split(area);
 
-    // Header
+    // ─── Header ───
+    let mode_color = match d.mode {
+        "AI Hybrid" => Color::Magenta,
+        "Havoc" => Color::Yellow,
+        _ => Color::Green,
+    };
+
     let header_text = vec![Line::from(vec![
         Span::styled(" target: ", dim),
         Span::styled(d.target, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         Span::styled("    uptime: ", dim),
         Span::styled(d.uptime, green),
-        Span::styled("    mode: ", dim),
-        Span::styled(d.mode, yellow),
+        Span::styled("    stage: ", dim),
+        Span::styled(d.mode, Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
     ])];
 
     let header = Paragraph::new(header_text).block(
@@ -248,15 +259,13 @@ fn render_ui(frame: &mut Frame, area: Rect, d: &RenderData<'_>) {
             .borders(Borders::ALL)
             .title(Span::styled(
                 " achlys ",
-                Style::default()
-                    .fg(Color::Red)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ))
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .border_style(border),
     );
     frame.render_widget(header, main_layout[0]);
 
-    // Body: 2x2 grid
+    // ─── Stats grid (2x2) ───
     let body_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -275,53 +284,77 @@ fn render_ui(frame: &mut Frame, area: Rect, d: &RenderData<'_>) {
     let speed_str = format!("{}/sec", d.execs_per_sec);
     let obj_style = if d.objectives == "0" { dim } else { red };
 
-    // Process Timing (top-left)
-    let timing = make_stats_block(
-        " process timing ",
-        Color::Cyan,
-        &[
+    // Process Timing
+    frame.render_widget(
+        make_stats_block(" process timing ", Color::Cyan, &[
             ("run time", d.run_time, cyan),
             ("total execs", d.total_execs, white),
             ("exec speed", &speed_str, green),
             ("last event", d.last_event, dim),
-        ],
+        ]),
+        left_rows[0],
     );
-    frame.render_widget(timing, left_rows[0]);
 
-    // Overall Results (top-right)
-    let results = make_stats_block(
-        " overall results ",
-        Color::Green,
-        &[
+    // Overall Results
+    frame.render_widget(
+        make_stats_block(" overall results ", Color::Green, &[
             ("corpus count", d.corpus, white),
             ("crashes", d.objectives, obj_style),
             ("total execs", d.total_execs, white),
-        ],
+        ]),
+        right_rows[0],
     );
-    frame.render_widget(results, right_rows[0]);
 
-    // Stage Info (bottom-left)
-    let stage_info = make_stats_block(
-        " stage info ",
-        Color::Yellow,
-        &[
-            ("current mode", d.mode, yellow),
+    // Stage Info
+    frame.render_widget(
+        make_stats_block(" stage info ", Color::Yellow, &[
+            ("current stage", d.mode, Style::default().fg(mode_color)),
             ("exec speed", &speed_str, green),
-        ],
+        ]),
+        left_rows[1],
     );
-    frame.render_widget(stage_info, left_rows[1]);
 
-    // Fuzzer Status (bottom-right)
-    let status = make_stats_block(
-        " status ",
-        Color::Magenta,
-        &[
+    // Status
+    frame.render_widget(
+        make_stats_block(" status ", Color::Magenta, &[
             ("corpus", d.corpus, white),
             ("crashes", d.objectives, obj_style),
             ("speed", &speed_str, green),
-        ],
+        ]),
+        right_rows[1],
     );
-    frame.render_widget(status, right_rows[1]);
+
+    // ─── Logs ───
+    let log_lines: Vec<Line> = d
+        .logs
+        .iter()
+        .rev()
+        .take(6)
+        .rev()
+        .map(|msg| {
+            let color = if msg.contains("escalating") {
+                Color::Magenta
+            } else if msg.contains("error") || msg.contains("failed") {
+                Color::Red
+            } else if msg.contains("loaded") || msg.contains("started") {
+                Color::Green
+            } else {
+                Color::DarkGray
+            };
+            Line::from(Span::styled(format!("  {msg}"), Style::default().fg(color)))
+        })
+        .collect();
+
+    let logs_widget = Paragraph::new(log_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                " logs ",
+                Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+            ))
+            .border_style(border),
+    );
+    frame.render_widget(logs_widget, main_layout[2]);
 }
 
 fn make_stats_block<'a>(
@@ -331,9 +364,9 @@ fn make_stats_block<'a>(
 ) -> Paragraph<'a> {
     let mut lines = Vec::new();
     for (label, value, style) in entries {
-        let dots = ".".repeat(22usize.saturating_sub(label.len()));
+        let dots = ".".repeat(20usize.saturating_sub(label.len()));
         lines.push(Line::from(vec![
-            Span::styled(format!("  {} ", label), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("  {label} "), Style::default().fg(Color::DarkGray)),
             Span::styled(dots, Style::default().fg(Color::DarkGray)),
             Span::raw(" "),
             Span::styled((*value).to_string(), *style),
@@ -355,10 +388,7 @@ fn make_stats_block<'a>(
 
 fn format_duration(d: std::time::Duration) -> String {
     let secs = d.as_secs();
-    let h = secs / 3600;
-    let m = (secs % 3600) / 60;
-    let s = secs % 60;
-    format!("{:02}:{:02}:{:02}", h, m, s)
+    format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
 }
 
 fn format_number(n: u64) -> String {
@@ -372,7 +402,6 @@ fn format_number(n: u64) -> String {
 }
 
 /// Create the monitor callback that updates the TUI.
-/// Returns a closure suitable for `SimpleMonitor::new()`.
 pub fn create_tui_callback(
     state: Arc<Mutex<TuiState>>,
     tui: Arc<Mutex<AchlysTui>>,

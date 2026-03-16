@@ -46,22 +46,11 @@ impl CortexModel {
             anyhow::bail!("ONNX model has no outputs");
         }
 
-        println!(
-            "[achlys-cortex] loaded ONNX model: {}",
-            model_path.as_ref().display()
-        );
-        println!(
-            "[achlys-cortex] model input: {} ({:?})",
-            inputs[0].name(),
-            inputs[0].dtype()
-        );
-        println!(
-            "[achlys-cortex] model output: {} ({:?})",
-            outputs[0].name(),
-            outputs[0].dtype()
-        );
-        println!(
-            "[achlys-cortex] max_seq_len: {}",
+        eprintln!(
+            "[achlys-cortex] loaded ONNX model: {} (input: {:?}, output: {:?}, seq_len: {})",
+            model_path.as_ref().display(),
+            inputs[0].dtype(),
+            outputs[0].dtype(),
             max_seq_len
         );
 
