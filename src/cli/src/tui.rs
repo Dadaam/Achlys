@@ -1,15 +1,12 @@
 //! AFL++-inspired TUI for Achlys.
-//!
-//! Renders a status screen with colored boxes showing fuzzer stats,
-//! escalation state, AI cortex status, and a live event log.
 
 use std::collections::VecDeque;
 use std::io::{self, Stdout};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::{
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -22,12 +19,8 @@ use ratatui::{
     Frame, Terminal,
 };
 
-/// Global quit flag set by the Ctrl+C handler.
-static QUIT_FLAG: AtomicBool = AtomicBool::new(false);
-
 const MAX_LOG_LINES: usize = 50;
 
-/// Stats extracted from LibAFL's monitor output.
 #[derive(Debug, Clone, Default)]
 pub struct TuiStats {
     pub run_time: String,
@@ -38,7 +31,6 @@ pub struct TuiStats {
     pub last_event: String,
 }
 
-/// Shared TUI state updated by the monitor callback.
 pub struct TuiState {
     pub stats: TuiStats,
     pub start_time: Instant,
@@ -58,7 +50,6 @@ impl TuiState {
         }
     }
 
-    /// Add a log message to the ring buffer.
     pub fn log(&mut self, msg: String) {
         if self.logs.len() >= MAX_LOG_LINES {
             self.logs.pop_front();
@@ -66,36 +57,34 @@ impl TuiState {
         self.logs.push_back(msg);
     }
 
-    /// Parse the formatted stats string from SimpleMonitor.
     pub fn update_from_stats(&mut self, stats_str: &str) {
-        // Detect escalation/achlys messages mixed into the stats string
-        // These come from println! in builder.rs and escalation.rs
+        // Detect [achlys...] messages mixed into the output
         if stats_str.contains("[achlys") {
-            // Extract all [achlys...] messages
             for part in stats_str.split("[achlys") {
-                if let Some(end) = part.find(')') {
-                    let msg = format!("[achlys{}", &part[..=end]);
+                if part.is_empty() {
+                    continue;
+                }
+                let msg = format!("[achlys{}", part.trim());
+                // Detect stage transitions
+                if part.contains("escalating") && part.contains("AI Hybrid") {
+                    self.mode = "AI Hybrid".to_string();
                     self.log(msg);
-
-                    // Detect stage changes
-                    if part.contains("escalating") && part.contains("AI Hybrid") {
-                        self.mode = "AI Hybrid".to_string();
-                    } else if part.contains("de-escalating") && part.contains("Havoc") {
-                        self.mode = "Havoc".to_string();
-                    }
+                    continue;
+                } else if part.contains("de-escalating") && part.contains("Havoc") {
+                    self.mode = "Havoc".to_string();
+                    self.log(msg);
+                    continue;
+                }
+                if msg.len() > 10 {
+                    self.log(msg);
                 }
             }
         }
 
-        // Parse the standard monitor key-value pairs
-        let pairs_str = stats_str
-            .find(']')
-            .map(|i| &stats_str[i + 2..])
-            .unwrap_or(stats_str);
-
-        // Extract event name
+        // Extract event name from [EVENT #ID]
         if let Some(bracket_end) = stats_str.find(']')
             && let Some(bracket_start) = stats_str.find('[')
+            && bracket_start < bracket_end
         {
             let event_part = &stats_str[bracket_start + 1..bracket_end];
             if let Some(space_idx) = event_part.find(" #") {
@@ -103,30 +92,32 @@ impl TuiState {
             }
         }
 
-        for part in pairs_str.split(", ") {
-            let mut kv = part.splitn(2, ": ");
-            if let (Some(key), Some(val)) = (kv.next(), kv.next()) {
-                match key.trim() {
-                    "run time" => self.stats.run_time = val.to_string(),
-                    "corpus" => self.stats.corpus_size = val.parse().unwrap_or(0),
-                    "objectives" => self.stats.objective_size = val.parse().unwrap_or(0),
-                    "executions" => self.stats.total_execs = val.parse().unwrap_or(0),
-                    "exec/sec" => self.stats.execs_per_sec = val.to_string(),
-                    _ => {}
+        // Parse key-value pairs
+        if let Some(i) = stats_str.find(']') {
+            let pairs = &stats_str[i + 2..];
+            for part in pairs.split(", ") {
+                let mut kv = part.splitn(2, ": ");
+                if let (Some(key), Some(val)) = (kv.next(), kv.next()) {
+                    match key.trim() {
+                        "run time" => self.stats.run_time = val.to_string(),
+                        "corpus" => self.stats.corpus_size = val.parse().unwrap_or(0),
+                        "objectives" => self.stats.objective_size = val.parse().unwrap_or(0),
+                        "executions" => self.stats.total_execs = val.parse().unwrap_or(0),
+                        "exec/sec" => self.stats.execs_per_sec = val.to_string(),
+                        _ => {}
+                    }
                 }
             }
         }
     }
 }
 
-/// The TUI renderer.
 pub struct AchlysTui {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     state: Arc<Mutex<TuiState>>,
 }
 
 impl AchlysTui {
-    /// Initialize the TUI.
     pub fn init(target_name: String, mode: String) -> io::Result<(Self, Arc<Mutex<TuiState>>)> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -137,28 +128,31 @@ impl AchlysTui {
         let state = Arc::new(Mutex::new(TuiState::new(target_name, mode)));
         let state_clone = state.clone();
 
-        // Install Ctrl+C handler
-        ctrlc::set_handler(move || {
-            QUIT_FLAG.store(true, Ordering::SeqCst);
-            // Restore terminal immediately
-            let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen);
-            std::process::exit(0);
-        })
-        .expect("failed to set Ctrl+C handler");
+        // Spawn key event polling thread for Ctrl+C / q quit
+        // In raw mode, Ctrl+C is a key event, not a signal
+        std::thread::spawn(|| {
+            loop {
+                if let Ok(true) = event::poll(Duration::from_millis(200))
+                    && let Ok(Event::Key(key)) = event::read()
+                {
+                    let quit = key.code == KeyCode::Char('q')
+                        || (key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL));
+                    if quit {
+                        let _ = disable_raw_mode();
+                        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                        std::process::exit(0);
+                    }
+                }
+            }
+        });
 
         Ok((Self { terminal, state }, state_clone))
     }
 
-    /// Draw the TUI frame.
     pub fn draw(&mut self) -> io::Result<()> {
-        if QUIT_FLAG.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-
         let state = self.state.lock().unwrap();
 
-        // Snapshot all data for rendering
         let target = state.target_name.clone();
         let mode = state.mode.clone();
         let uptime = format_duration(state.start_time.elapsed());
@@ -173,8 +167,7 @@ impl AchlysTui {
         drop(state);
 
         self.terminal.draw(|frame| {
-            let area = frame.area();
-            render_ui(frame, area, &RenderData {
+            render_ui(frame, frame.area(), &RenderData {
                 target: &target,
                 mode: &mode,
                 uptime: &uptime,
@@ -187,11 +180,9 @@ impl AchlysTui {
                 logs: &logs,
             });
         })?;
-
         Ok(())
     }
 
-    /// Restore the terminal to normal state.
     pub fn cleanup(&mut self) -> io::Result<()> {
         disable_raw_mode()?;
         execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -222,193 +213,165 @@ struct RenderData<'a> {
 fn render_ui(frame: &mut Frame, area: Rect, d: &RenderData<'_>) {
     let cyan = Style::default().fg(Color::Cyan);
     let green = Style::default().fg(Color::Green);
-    let _yellow = Style::default().fg(Color::Yellow);
     let red = Style::default().fg(Color::Red);
     let white = Style::default().fg(Color::White);
     let dim = Style::default().fg(Color::DarkGray);
     let border = Style::default().fg(Color::DarkGray);
 
-    // Main layout: header + body + logs
-    let main_layout = Layout::default()
+    let mode_color = if d.mode.contains("AI") {
+        Color::Magenta
+    } else if d.mode.contains("havoc") || d.mode.contains("Havoc") {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
+
+    // Layout: header + stats + logs
+    let main = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // header
-            Constraint::Min(10),   // stats grid
-            Constraint::Length(8), // logs
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(8),
         ])
         .split(area);
 
-    // ─── Header ───
-    let mode_color = match d.mode {
-        "AI Hybrid" => Color::Magenta,
-        "Havoc" => Color::Yellow,
-        _ => Color::Green,
-    };
-
-    let header_text = vec![Line::from(vec![
+    // Header
+    let header = Paragraph::new(vec![Line::from(vec![
         Span::styled(" target: ", dim),
         Span::styled(d.target, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         Span::styled("    uptime: ", dim),
         Span::styled(d.uptime, green),
         Span::styled("    stage: ", dim),
         Span::styled(d.mode, Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
-    ])];
-
-    let header = Paragraph::new(header_text).block(
+    ])])
+    .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(Span::styled(
-                " achlys ",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ))
+            .title(Span::styled(" achlys ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)))
             .border_style(border),
     );
-    frame.render_widget(header, main_layout[0]);
+    frame.render_widget(header, main[0]);
 
-    // ─── Stats grid (2x2) ───
-    let body_cols = Layout::default()
+    // Stats 2x2
+    let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(main_layout[1]);
+        .split(main[1]);
 
-    let left_rows = Layout::default()
+    let left = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(body_cols[0]);
+        .split(cols[0]);
 
-    let right_rows = Layout::default()
+    let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(body_cols[1]);
+        .split(cols[1]);
 
-    let speed_str = format!("{}/sec", d.execs_per_sec);
+    let speed = format!("{}/sec", d.execs_per_sec);
     let obj_style = if d.objectives == "0" { dim } else { red };
 
-    // Process Timing
+    frame.render_widget(stat_block(" process timing ", Color::Cyan, &[
+        ("run time", d.run_time, cyan),
+        ("total execs", d.total_execs, white),
+        ("exec speed", &speed, green),
+        ("last event", d.last_event, dim),
+    ]), left[0]);
+
+    frame.render_widget(stat_block(" overall results ", Color::Green, &[
+        ("corpus count", d.corpus, white),
+        ("crashes", d.objectives, obj_style),
+        ("total execs", d.total_execs, white),
+    ]), right[0]);
+
+    frame.render_widget(stat_block(" stage info ", Color::Yellow, &[
+        ("current stage", d.mode, Style::default().fg(mode_color)),
+        ("exec speed", &speed, green),
+    ]), left[1]);
+
+    frame.render_widget(stat_block(" status ", Color::Magenta, &[
+        ("corpus", d.corpus, white),
+        ("crashes", d.objectives, obj_style),
+        ("speed", &speed, green),
+    ]), right[1]);
+
+    // Logs
+    let log_lines: Vec<Line> = d.logs.iter().rev().take(6).rev().map(|msg| {
+        let color = if msg.contains("escalat") {
+            Color::Magenta
+        } else if msg.contains("error") || msg.contains("failed") {
+            Color::Red
+        } else if msg.contains("loaded") || msg.contains("started") || msg.contains("training") {
+            Color::Green
+        } else {
+            Color::DarkGray
+        };
+        Line::from(Span::styled(format!("  {msg}"), Style::default().fg(color)))
+    }).collect();
+
     frame.render_widget(
-        make_stats_block(" process timing ", Color::Cyan, &[
-            ("run time", d.run_time, cyan),
-            ("total execs", d.total_execs, white),
-            ("exec speed", &speed_str, green),
-            ("last event", d.last_event, dim),
-        ]),
-        left_rows[0],
+        Paragraph::new(log_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(" logs ", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)))
+                .border_style(border),
+        ),
+        main[2],
     );
-
-    // Overall Results
-    frame.render_widget(
-        make_stats_block(" overall results ", Color::Green, &[
-            ("corpus count", d.corpus, white),
-            ("crashes", d.objectives, obj_style),
-            ("total execs", d.total_execs, white),
-        ]),
-        right_rows[0],
-    );
-
-    // Stage Info
-    frame.render_widget(
-        make_stats_block(" stage info ", Color::Yellow, &[
-            ("current stage", d.mode, Style::default().fg(mode_color)),
-            ("exec speed", &speed_str, green),
-        ]),
-        left_rows[1],
-    );
-
-    // Status
-    frame.render_widget(
-        make_stats_block(" status ", Color::Magenta, &[
-            ("corpus", d.corpus, white),
-            ("crashes", d.objectives, obj_style),
-            ("speed", &speed_str, green),
-        ]),
-        right_rows[1],
-    );
-
-    // ─── Logs ───
-    let log_lines: Vec<Line> = d
-        .logs
-        .iter()
-        .rev()
-        .take(6)
-        .rev()
-        .map(|msg| {
-            let color = if msg.contains("escalating") {
-                Color::Magenta
-            } else if msg.contains("error") || msg.contains("failed") {
-                Color::Red
-            } else if msg.contains("loaded") || msg.contains("started") {
-                Color::Green
-            } else {
-                Color::DarkGray
-            };
-            Line::from(Span::styled(format!("  {msg}"), Style::default().fg(color)))
-        })
-        .collect();
-
-    let logs_widget = Paragraph::new(log_lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                " logs ",
-                Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
-            ))
-            .border_style(border),
-    );
-    frame.render_widget(logs_widget, main_layout[2]);
 }
 
-fn make_stats_block<'a>(
-    title: &'a str,
-    title_color: Color,
-    entries: &[(&'a str, &'a str, Style)],
-) -> Paragraph<'a> {
-    let mut lines = Vec::new();
-    for (label, value, style) in entries {
-        let dots = ".".repeat(20usize.saturating_sub(label.len()));
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {label} "), Style::default().fg(Color::DarkGray)),
+fn stat_block<'a>(title: &'a str, color: Color, entries: &[(&'a str, &'a str, Style)]) -> Paragraph<'a> {
+    let lines: Vec<Line> = entries.iter().map(|(k, v, s)| {
+        let dots = ".".repeat(20usize.saturating_sub(k.len()));
+        Line::from(vec![
+            Span::styled(format!("  {k} "), Style::default().fg(Color::DarkGray)),
             Span::styled(dots, Style::default().fg(Color::DarkGray)),
             Span::raw(" "),
-            Span::styled((*value).to_string(), *style),
-        ]));
-    }
+            Span::styled((*v).to_string(), *s),
+        ])
+    }).collect();
 
     Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(Span::styled(
-                title,
-                Style::default()
-                    .fg(title_color)
-                    .add_modifier(Modifier::BOLD),
-            ))
+            .title(Span::styled(title, Style::default().fg(color).add_modifier(Modifier::BOLD)))
             .border_style(Style::default().fg(Color::DarkGray)),
     )
 }
 
-fn format_duration(d: std::time::Duration) -> String {
-    let secs = d.as_secs();
-    format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+fn format_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
 }
 
 fn format_number(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
+    if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1e6) }
+    else if n >= 1_000 { format!("{:.1}K", n as f64 / 1e3) }
+    else { n.to_string() }
 }
 
-/// Create the monitor callback that updates the TUI.
 pub fn create_tui_callback(
     state: Arc<Mutex<TuiState>>,
     tui: Arc<Mutex<AchlysTui>>,
+    log_sink: achlys_core::SharedLogSink,
 ) -> impl FnMut(&str) {
     move |stats_str: &str| {
         if let Ok(mut s) = state.lock() {
             s.update_from_stats(stats_str);
+
+            // Drain escalation logs from the shared sink
+            if let Ok(mut logs) = log_sink.lock() {
+                while let Some(msg) = logs.pop_front() {
+                    // Detect stage changes
+                    if msg.contains("escalating") && msg.contains("AI Hybrid") {
+                        s.mode = "AI Hybrid".to_string();
+                    } else if msg.contains("de-escalating") && msg.contains("Havoc") {
+                        s.mode = "Havoc".to_string();
+                    }
+                    s.log(msg);
+                }
+            }
         }
         if let Ok(mut t) = tui.lock() {
             let _ = t.draw();

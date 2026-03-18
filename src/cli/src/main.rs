@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use achlys_bridge::{AutoCompiler, ForkExecTarget};
-use achlys_core::{CortexInterface, FuzzerBuilder, FuzzerConfig};
+use achlys_core::{CortexInterface, FuzzerBuilder, FuzzerConfig, shared_log_sink};
 use achlys_cortex::{AutoTrainer, CortexModel, HotSwapCortex};
 
 use crate::tui::{AchlysTui, create_tui_callback};
@@ -115,14 +115,22 @@ fn main() -> Result<()> {
 
             let target_display = binary.display().to_string();
 
-            let mut builder = FuzzerBuilder::new().config(config).cortex(cortex);
+            let log_sink = shared_log_sink();
+            let mut builder = FuzzerBuilder::new()
+                .config(config)
+                .cortex(cortex)
+                .log_sink(log_sink.clone());
 
             // Set up TUI or plain text monitor
             let _tui_guard: Option<Arc<Mutex<AchlysTui>>> = if !no_tui {
                 match AchlysTui::init(target_display.clone(), mode.to_string()) {
                     Ok((tui_instance, tui_state)) => {
                         let tui_arc = Arc::new(Mutex::new(tui_instance));
-                        let callback = create_tui_callback(tui_state, tui_arc.clone());
+                        let callback = create_tui_callback(
+                            tui_state.clone(),
+                            tui_arc.clone(),
+                            log_sink.clone(),
+                        );
                         builder = builder.monitor(callback);
                         Some(tui_arc)
                     }

@@ -16,7 +16,7 @@ pub use config::FuzzerConfig;
 pub use builder::FuzzerBuilder;
 pub use plateau::{PlateauDetector, SharedPlateauDetector, shared_detector};
 pub use feedback::PlateauAwareFeedback;
-pub use escalation::{FuzzStage, EscalationManager, EscalatingStage};
+pub use escalation::{FuzzStage, EscalationManager, EscalatingStage, SharedLogSink, shared_log_sink};
 pub use cortex_interface::CortexInterface;
 pub use ai_mutator::AiMutator;
 pub use ai_stage::HybridStage;

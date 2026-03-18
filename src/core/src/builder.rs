@@ -33,7 +33,7 @@ use crate::ai_mutator::{AiMutator, DEFAULT_PREDICTION_BATCH};
 use crate::ai_stage::HybridStage;
 use crate::config::FuzzerConfig;
 use crate::cortex_interface::CortexInterface;
-use crate::escalation::EscalatingStage;
+use crate::escalation::{EscalatingStage, SharedLogSink};
 use crate::feedback::PlateauAwareFeedback;
 use crate::plateau::shared_detector;
 
@@ -47,6 +47,7 @@ pub struct FuzzerBuilder {
     config: FuzzerConfig,
     cortex: Option<Arc<dyn CortexInterface>>,
     monitor_fn: Option<MonitorCallback>,
+    log_sink: Option<SharedLogSink>,
 }
 
 impl FuzzerBuilder {
@@ -55,6 +56,7 @@ impl FuzzerBuilder {
             config: FuzzerConfig::default(),
             cortex: None,
             monitor_fn: None,
+            log_sink: None,
         }
     }
 
@@ -99,8 +101,13 @@ impl FuzzerBuilder {
         self
     }
 
+    /// Set a shared log sink for escalation events (visible in TUI).
+    pub fn log_sink(mut self, sink: SharedLogSink) -> Self {
+        self.log_sink = Some(sink);
+        self
+    }
+
     /// Set a custom monitor callback (replaces the default println output).
-    /// Used by the TUI to intercept stats updates.
     pub fn monitor(mut self, f: impl FnMut(&str) + 'static) -> Self {
         self.monitor_fn = Some(Box::new(f));
         self
@@ -205,7 +212,10 @@ impl FuzzerBuilder {
             );
             let hybrid = HybridStage::new(hybrid_havoc, ai_stage, 10);
 
-            let escalating = EscalatingStage::with_ai(havoc_stage, hybrid, detector);
+            let mut escalating = EscalatingStage::with_ai(havoc_stage, hybrid, detector);
+            if let Some(ref sink) = self.log_sink {
+                escalating = escalating.with_log_sink(sink.clone());
+            }
             let mut stages = tuple_list!(escalating);
 
             fuzzer
@@ -297,7 +307,10 @@ impl FuzzerBuilder {
             );
             let hybrid = HybridStage::new(hybrid_havoc, ai_stage, 10);
 
-            let escalating = EscalatingStage::with_ai(havoc_stage, hybrid, detector);
+            let mut escalating = EscalatingStage::with_ai(havoc_stage, hybrid, detector);
+            if let Some(ref sink) = self.log_sink {
+                escalating = escalating.with_log_sink(sink.clone());
+            }
             let mut stages = tuple_list!(escalating);
 
             fuzzer

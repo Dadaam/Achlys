@@ -1,8 +1,18 @@
+use std::collections::VecDeque;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use libafl::{stages::Stage, stages::Restartable, Error};
 
 use crate::plateau::SharedPlateauDetector;
+
+/// Shared log sink for escalation events (readable by the TUI).
+pub type SharedLogSink = Arc<Mutex<VecDeque<String>>>;
+
+/// Create a new shared log sink.
+pub fn shared_log_sink() -> SharedLogSink {
+    Arc::new(Mutex::new(VecDeque::with_capacity(50)))
+}
 
 /// Check escalation state every N executions (avoids mutex contention).
 const DEFAULT_CHECK_INTERVAL: usize = 1000;
@@ -37,8 +47,7 @@ pub struct EscalationManager {
     current_stage: FuzzStage,
     detector: SharedPlateauDetector,
     has_ai: bool,
-    /// Pending log message from the last stage transition (consumed by the monitor).
-    pending_log: Option<String>,
+    log_sink: Option<SharedLogSink>,
 }
 
 impl EscalationManager {
@@ -47,13 +56,25 @@ impl EscalationManager {
             current_stage: FuzzStage::Havoc,
             detector,
             has_ai,
-            pending_log: None,
+            log_sink: None,
         }
     }
 
-    /// Take the pending log message (if any) from the last stage transition.
-    pub fn take_log(&mut self) -> Option<String> {
-        self.pending_log.take()
+    /// Set a shared log sink for escalation events.
+    pub fn set_log_sink(&mut self, sink: SharedLogSink) {
+        self.log_sink = Some(sink);
+    }
+
+    fn emit_log(&self, msg: String) {
+        eprintln!("{msg}");
+        if let Some(ref sink) = self.log_sink
+            && let Ok(mut logs) = sink.lock()
+        {
+            if logs.len() >= 50 {
+                logs.pop_front();
+            }
+            logs.push_back(msg);
+        }
     }
 
     /// Check if escalation/de-escalation is needed. Returns the stage to use.
@@ -70,8 +91,8 @@ impl EscalationManager {
             FuzzStage::Havoc => {
                 if in_plateau && self.has_ai {
                     self.current_stage = FuzzStage::AiHybrid;
-                    self.pending_log = Some(format!(
-                        "[achlys] escalating: {} -> {} (coverage plateau detected)",
+                    self.emit_log(format!(
+                        "[achlys] escalating: {} -> {} (plateau detected)",
                         previous, self.current_stage
                     ));
                 }
@@ -79,7 +100,7 @@ impl EscalationManager {
             FuzzStage::AiHybrid => {
                 if !in_plateau {
                     self.current_stage = FuzzStage::Havoc;
-                    self.pending_log = Some(format!(
+                    self.emit_log(format!(
                         "[achlys] de-escalating: {} -> {} (coverage resumed)",
                         previous, self.current_stage
                     ));
@@ -109,6 +130,7 @@ pub struct EscalatingStage<H, A> {
     manager: EscalationManager,
     check_interval: usize,
     exec_count: usize,
+    log_sink: Option<SharedLogSink>,
 }
 
 impl<H, A> EscalatingStage<H, A> {
@@ -121,6 +143,7 @@ impl<H, A> EscalatingStage<H, A> {
             manager: EscalationManager::new(detector, false),
             check_interval: DEFAULT_CHECK_INTERVAL,
             exec_count: 0,
+            log_sink: None,
         }
     }
 
@@ -137,7 +160,16 @@ impl<H, A> EscalatingStage<H, A> {
             manager: EscalationManager::new(detector, true),
             check_interval: DEFAULT_CHECK_INTERVAL,
             exec_count: 0,
+            log_sink: None,
         }
+    }
+
+    /// Attach a shared log sink for escalation events.
+    #[must_use]
+    pub fn with_log_sink(mut self, sink: SharedLogSink) -> Self {
+        self.manager.set_log_sink(sink.clone());
+        self.log_sink = Some(sink);
+        self
     }
 
     /// Set how often to check for escalation (every N executions).
