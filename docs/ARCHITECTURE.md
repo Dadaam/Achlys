@@ -6,7 +6,7 @@ The target architecture, hypotheses (H0–H5), non-goals, and build order live i
 
 Achlys is not a 4-stage product that escalates havoc → AI → symbolic execution. That framing is not implemented and is not the research direction.
 
-Status: **Level 0** (buildable prototype). Public positioning until evidence exists:
+Status: **Level 0** (buildable prototype). Tranche 1 baseline infrastructure is accepted; Tranche 2 is closed. Public positioning until evidence exists:
 
 > Achlys is an experimental cooperative fuzzing system built on LibAFL. It investigates whether typed cross-strategy assistance and cost-aware worker allocation can improve coverage and hard-branch discovery under equal resource budgets.
 
