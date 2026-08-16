@@ -9,3 +9,6 @@ libafl.workspace = true
 libafl_bolts.workspace = true
 anyhow.workspace = true
 achlys-protocol = { path = "../protocol" }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
