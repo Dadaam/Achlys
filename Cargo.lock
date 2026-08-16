@@ -23,6 +23,7 @@ dependencies = [
  "anyhow",
  "libafl",
  "libafl_bolts",
+ "libc",
 ]
 
 [[package]]
