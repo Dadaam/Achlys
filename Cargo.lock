@@ -13,6 +13,7 @@ dependencies = [
  "libafl",
  "libafl_bolts",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
