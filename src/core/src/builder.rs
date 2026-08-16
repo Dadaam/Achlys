@@ -430,11 +430,7 @@ impl FuzzerBuilder {
         Ok(())
     }
 
-    fn run_substrate_with_corpus<T, C>(
-        self,
-        mut target: T,
-        corpus: C,
-    ) -> Result<SubstrateReport>
+    fn run_substrate_with_corpus<T, C>(self, mut target: T, corpus: C) -> Result<SubstrateReport>
     where
         T: Target,
         C: Corpus<BytesInput> + serde::Serialize + serde::de::DeserializeOwned,
