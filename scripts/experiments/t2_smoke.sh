@@ -209,6 +209,21 @@ if [[ -d "$processing" ]] && find "$processing" -type f ! -name '.DS_Store' | gr
 fi
 echo "T2_PROCESSING=OK"
 
+if find "$out/run1/spool" -name '*.taken.json' | grep -q .; then
+  echo "T2_SPOOL=FAIL reason=taken-json-leftover" >&2
+  find "$out/run1/spool" -name '*.taken.json' | head >&2
+  exit 1
+fi
+for dir in workers left workers/processing left/processing; do
+  p="$out/run1/spool/$dir"
+  if [[ -d "$p" ]] && find "$p" -maxdepth 1 -type f -name '*.json' | grep -q .; then
+    echo "T2_SPOOL=FAIL reason=control-notices-leftover dir=$dir" >&2
+    find "$p" -maxdepth 1 -type f -name '*.json' | head >&2
+    exit 1
+  fi
+done
+echo "T2_CONTROL_SPOOL=OK"
+
 set +e
 help_out="$("$t2_bin" --help 2>&1)"
 set -e
@@ -291,8 +306,67 @@ if jkv.get("workers") != "1" or jkv.get("reports") != "1":
     raise SystemExit(f"join workers/reports {jkv}")
 if int(jkv.get("objects", "-1")) != int(jkv.get("replayed", "-2")):
     raise SystemExit(f"join objects != replayed: {jkv}")
+producers = {}
+for raw in open(events_p, encoding="utf-8"):
+    raw = raw.strip()
+    if not raw:
+        continue
+    ev = json.loads(raw)
+    if ev.get("type") != "candidate_discovered":
+        continue
+    wid = ev.get("worker_id")
+    pseq = ev.get("producer_seq")
+    if wid is None or pseq is None:
+        continue
+    producers.setdefault(wid, []).append(int(pseq))
+for wid, xs in producers.items():
+    if len(xs) != len(set(xs)):
+        raise SystemExit(f"duplicate producer_seq for {wid} after one join: {xs}")
 print("T2_JOIN=OK")
 PY
+
+  join2_log="$out/join2.log"
+  "$t2_bin" \
+    --manifest benchmarks/manifests/cjson-parse.toml \
+    --label t2-join2 \
+    --seed 4242 \
+    --iters 5 \
+    --workers 1 \
+    --join \
+    --broker-port "${T2_JOIN2_BROKER_PORT:-17371}" \
+    --corpus "$out/seeds" \
+    --out "$out/run1" | tee "$join2_log"
+  python3 - "$events" <<'PY'
+import json, sys
+events_p = sys.argv[1]
+producers = {}
+for raw in open(events_p, encoding="utf-8"):
+    raw = raw.strip()
+    if not raw:
+        continue
+    ev = json.loads(raw)
+    if ev.get("type") != "candidate_discovered":
+        continue
+    wid = ev.get("worker_id")
+    pseq = ev.get("producer_seq")
+    if wid is None or pseq is None:
+        continue
+    producers.setdefault(wid, []).append(int(pseq))
+if not producers:
+    raise SystemExit("no producer_seq after second join")
+for wid, xs in producers.items():
+    if len(xs) != len(set(xs)):
+        raise SystemExit(f"duplicate producer_seq for {wid} after two joins: {xs}")
+print("T2_PRODUCER_SEQ=OK")
+PY
+  if find "$out/run1/spool" -name '*.taken.json' | grep -q .; then
+    echo "T2_SPOOL=FAIL reason=taken-json-after-join" >&2
+    exit 1
+  fi
+  if [[ "$(find "$out/run1/spool/workers/processing" "$out/run1/spool/left/processing" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')" != "0" ]]; then
+    echo "T2_SPOOL=FAIL reason=control-processing-after-join" >&2
+    exit 1
+  fi
 fi
 
 set +e
@@ -551,7 +625,7 @@ fi
 python3 - "$qfull_out/artifacts/metrics/admission.json" "$out/qfull.log" <<'PY'
 import json, sys
 adm = json.loads(open(sys.argv[1], encoding="utf-8").read())
-for key in ("inbox", "processing", "overflow", "pending"):
+for key in ("inbox", "processing", "overflow", "pending", "control"):
     if int(adm.get(key, 1)) != 0:
         raise SystemExit(f"{key}={adm.get(key)} want 0")
 if int(adm.get("queue_full", 0)) < 1:

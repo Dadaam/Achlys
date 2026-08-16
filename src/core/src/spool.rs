@@ -18,11 +18,12 @@ pub const DEFAULT_TAKE: usize = 64;
 /// On-disk worker registration written by a worker at start.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkerRegistration {
+    pub notice_id: String,
     pub worker_id: WorkerId,
     pub slot: u32,
-    pub sender_seq: u64,
     pub restart: bool,
-    pub previous_seq: Option<u64>,
+    pub previous_event_seq: Option<u64>,
+    pub next_producer_seq: u64,
 }
 
 /// Offline continuation plan written by the launcher before spawn.
@@ -31,16 +32,17 @@ pub struct WorkerResume {
     pub worker_id: WorkerId,
     pub slot: u32,
     pub restart: bool,
-    pub previous_seq: Option<u64>,
-    pub next_seq: u64,
+    pub previous_event_seq: Option<u64>,
+    pub next_producer_seq: u64,
 }
 
 /// Worker exit notice. Admit turns this into `WorkerLeft`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkerExit {
+    pub notice_id: String,
     pub worker_id: WorkerId,
     pub slot: u32,
-    pub sender_seq: u64,
+    pub next_producer_seq: u64,
     pub reason: String,
 }
 
@@ -59,9 +61,11 @@ impl CandidateSpool {
             root.join("overflow"),
             root.join("deltas"),
             root.join("workers"),
+            root.join("workers").join("processing"),
             root.join("snapshot"),
             root.join("resume"),
             root.join("left"),
+            root.join("left").join("processing"),
         ] {
             fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         }
@@ -232,41 +236,27 @@ impl CandidateSpool {
     pub fn write_worker(&self, reg: &WorkerRegistration) -> Result<PathBuf> {
         let path = self
             .workers_dir()
-            .join(format!("{}.json", reg.worker_id.to_hex()));
+            .join(format!("{}.json", notice_file_stem(&reg.notice_id)));
         let json = serde_json::to_vec_pretty(reg).context("serialize worker registration")?;
         write_atomic(&path, &json)?;
         Ok(path)
     }
 
     pub fn take_worker_registrations(&self) -> Result<Vec<WorkerRegistration>> {
-        let dir = self.workers_dir();
-        let mut out = Vec::new();
-        if !dir.is_dir() {
-            return Ok(out);
-        }
-        for entry in fs::read_dir(&dir).with_context(|| format!("list {}", dir.display()))? {
-            let entry = entry.with_context(|| format!("read {}", dir.display()))?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            if path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.ends_with(".taken"))
-            {
-                continue;
-            }
-            let text =
-                fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-            let reg: WorkerRegistration =
-                serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-            let taken = path.with_extension("taken.json");
-            fs::rename(&path, &taken)
-                .with_context(|| format!("rename {} -> {}", path.display(), taken.display()))?;
-            out.push(reg);
-        }
-        Ok(out)
+        take_notices(&self.workers_dir(), &self.workers_processing_dir())
+    }
+
+    pub fn ack_worker_registration(&self, notice_id: &str) -> Result<()> {
+        ack_notice(&self.workers_processing_dir(), notice_id)
+    }
+
+    pub fn return_worker_registration(&self, reg: &WorkerRegistration) -> Result<()> {
+        return_notice(
+            &self.workers_processing_dir(),
+            &self.workers_dir(),
+            &reg.notice_id,
+            || self.write_worker(reg).map(|_| ()),
+        )
     }
 
     pub fn write_resume(&self, resume: &WorkerResume) -> Result<PathBuf> {
@@ -290,41 +280,36 @@ impl CandidateSpool {
     pub fn write_left(&self, exit: &WorkerExit) -> Result<PathBuf> {
         let path = self
             .left_dir()
-            .join(format!("{}.json", exit.worker_id.to_hex()));
+            .join(format!("{}.json", notice_file_stem(&exit.notice_id)));
         let json = serde_json::to_vec_pretty(exit).context("serialize worker exit")?;
         write_atomic(&path, &json)?;
         Ok(path)
     }
 
     pub fn take_worker_exits(&self) -> Result<Vec<WorkerExit>> {
-        let dir = self.left_dir();
-        let mut out = Vec::new();
-        if !dir.is_dir() {
-            return Ok(out);
-        }
-        for entry in fs::read_dir(&dir).with_context(|| format!("list {}", dir.display()))? {
-            let entry = entry.with_context(|| format!("read {}", dir.display()))?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            if path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.ends_with(".taken"))
-            {
-                continue;
-            }
-            let text =
-                fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-            let exit: WorkerExit =
-                serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-            let taken = path.with_extension("taken.json");
-            fs::rename(&path, &taken)
-                .with_context(|| format!("rename {} -> {}", path.display(), taken.display()))?;
-            out.push(exit);
-        }
-        Ok(out)
+        take_notices(&self.left_dir(), &self.left_processing_dir())
+    }
+
+    pub fn ack_worker_exit(&self, notice_id: &str) -> Result<()> {
+        ack_notice(&self.left_processing_dir(), notice_id)
+    }
+
+    pub fn return_worker_exit(&self, exit: &WorkerExit) -> Result<()> {
+        return_notice(
+            &self.left_processing_dir(),
+            &self.left_dir(),
+            &exit.notice_id,
+            || self.write_left(exit).map(|_| ()),
+        )
+    }
+
+    /// Unacked control notices still sitting in inbox or processing.
+    #[must_use]
+    pub fn leftover_control_notices(&self) -> usize {
+        count_json_files(&self.workers_dir())
+            + count_json_files(&self.workers_processing_dir())
+            + count_json_files(&self.left_dir())
+            + count_json_files(&self.left_processing_dir())
     }
 
     pub fn export_admitted_snapshot(
@@ -353,6 +338,12 @@ impl CandidateSpool {
     }
     fn workers_dir(&self) -> PathBuf {
         self.root.join("workers")
+    }
+    fn workers_processing_dir(&self) -> PathBuf {
+        self.root.join("workers").join("processing")
+    }
+    fn left_processing_dir(&self) -> PathBuf {
+        self.root.join("left").join("processing")
     }
     fn resume_dir(&self) -> PathBuf {
         self.root.join("resume")
@@ -465,6 +456,99 @@ fn take_from_dir(
         out.push((id, bytes, meta));
     }
     Ok(out)
+}
+
+fn notice_file_stem(notice_id: &str) -> String {
+    notice_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn take_notices<T>(inbox: &Path, processing: &Path) -> Result<Vec<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    fs::create_dir_all(processing).with_context(|| format!("create {}", processing.display()))?;
+    let mut out = Vec::new();
+    load_json_dir(processing, &mut out)?;
+    if !inbox.is_dir() {
+        return Ok(out);
+    }
+    for entry in fs::read_dir(inbox).with_context(|| format!("list {}", inbox.display()))? {
+        let entry = entry.with_context(|| format!("read {}", inbox.display()))?;
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let dest = processing.join(path.file_name().unwrap_or_default());
+        move_or_copy(&path, &dest)?;
+        let text = fs::read_to_string(&dest).with_context(|| format!("read {}", dest.display()))?;
+        out.push(serde_json::from_str(&text).with_context(|| format!("parse {}", dest.display()))?);
+    }
+    Ok(out)
+}
+
+fn load_json_dir<T>(dir: &Path, out: &mut Vec<T>) -> Result<()>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir).with_context(|| format!("list {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("read {}", dir.display()))?;
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        out.push(serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?);
+    }
+    Ok(())
+}
+
+fn ack_notice(processing: &Path, notice_id: &str) -> Result<()> {
+    let path = processing.join(format!("{}.json", notice_file_stem(notice_id)));
+    if path.is_file() {
+        fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn return_notice(
+    processing: &Path,
+    inbox: &Path,
+    notice_id: &str,
+    rewrite: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let name = format!("{}.json", notice_file_stem(notice_id));
+    let src = processing.join(&name);
+    let dest = inbox.join(&name);
+    if src.is_file() {
+        move_or_copy(&src, &dest)
+    } else {
+        rewrite()
+    }
+}
+
+fn count_json_files(dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            let path = entry.path();
+            path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json")
+        })
+        .count()
 }
 
 fn move_or_copy(src: &Path, dest: &Path) -> Result<()> {
@@ -607,16 +691,69 @@ mod tests {
         spool.write_stop().unwrap();
         assert!(spool.stop_requested());
         let reg = WorkerRegistration {
+            notice_id: "reg-w1-0".into(),
             worker_id: WorkerId::from_slot(1),
             slot: 1,
-            sender_seq: 0,
             restart: false,
-            previous_seq: None,
+            previous_event_seq: None,
+            next_producer_seq: 0,
         };
         spool.write_worker(&reg).unwrap();
         let taken = spool.take_worker_registrations().unwrap();
-        assert_eq!(taken, vec![reg]);
+        assert_eq!(taken, vec![reg.clone()]);
+        let again = spool.take_worker_registrations().unwrap();
+        assert_eq!(again, vec![reg.clone()], "unacked notices must be replayed");
+        spool.ack_worker_registration(&reg.notice_id).unwrap();
         assert!(spool.take_worker_registrations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn control_notice_survives_reopen_before_ack() {
+        let tmp = TempDir::new("spool_notice_crash");
+        let root = tmp.0.join("spool");
+        let spool = CandidateSpool::create(&root).unwrap();
+        let exit = WorkerExit {
+            notice_id: "left-w0-4".into(),
+            worker_id: WorkerId::from_slot(0),
+            slot: 0,
+            next_producer_seq: 4,
+            reason: "budget".into(),
+        };
+        spool.write_left(&exit).unwrap();
+        let first = spool.take_worker_exits().unwrap();
+        assert_eq!(first, vec![exit.clone()]);
+        drop(spool);
+        let reopened = CandidateSpool::open(&root).unwrap();
+        let replayed = reopened.take_worker_exits().unwrap();
+        assert_eq!(replayed, vec![exit.clone()]);
+        reopened.ack_worker_exit(&exit.notice_id).unwrap();
+        assert!(reopened.take_worker_exits().unwrap().is_empty());
+    }
+
+    #[test]
+    fn return_exit_is_rename_and_survives_reopen() {
+        let tmp = TempDir::new("spool_return_exit");
+        let root = tmp.0.join("spool");
+        let spool = CandidateSpool::create(&root).unwrap();
+        let exit = WorkerExit {
+            notice_id: "left-w0-p4-e1".into(),
+            worker_id: WorkerId::from_slot(0),
+            slot: 0,
+            next_producer_seq: 4,
+            reason: "budget".into(),
+        };
+        spool.write_left(&exit).unwrap();
+        let taken = spool.take_worker_exits().unwrap();
+        assert_eq!(taken, vec![exit.clone()]);
+        assert_eq!(spool.leftover_control_notices(), 1);
+        spool.return_worker_exit(&exit).unwrap();
+        assert_eq!(count_json_files(&spool.left_processing_dir()), 0);
+        assert_eq!(count_json_files(&spool.left_dir()), 1);
+        drop(spool);
+        let reopened = CandidateSpool::open(&root).unwrap();
+        assert_eq!(reopened.take_worker_exits().unwrap(), vec![exit.clone()]);
+        reopened.ack_worker_exit(&exit.notice_id).unwrap();
+        assert_eq!(reopened.leftover_control_notices(), 0);
     }
 
     #[test]

@@ -176,6 +176,8 @@ pub enum CampaignEvent {
     WorkerRegistered {
         #[serde(flatten)]
         envelope: WorkerEnvelope,
+        #[serde(default)]
+        notice_id: String,
         strategy: StrategyId,
         producer_build: BuildId,
         slot: u32,
@@ -184,12 +186,19 @@ pub enum CampaignEvent {
     WorkerLeft {
         #[serde(flatten)]
         envelope: WorkerEnvelope,
+        #[serde(default)]
+        notice_id: String,
+        /// Next unused worker generation number. Restored on offline join.
+        #[serde(default)]
+        next_producer_seq: u64,
         reason: String,
         unix_ms: u64,
     },
     WorkerRestarted {
         #[serde(flatten)]
         envelope: WorkerEnvelope,
+        #[serde(default)]
+        notice_id: String,
         previous_seq: u64,
         unix_ms: u64,
     },

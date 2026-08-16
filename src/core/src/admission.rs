@@ -88,6 +88,8 @@ pub struct CorpusAuthority {
     next_delta_seq: u64,
     /// Next authority-assigned event_seq per worker (journal order).
     next_event_seq: HashMap<WorkerId, u64>,
+    /// Control-notice ids already appended, mapped to their event_seq.
+    seen_notices: HashMap<String, u64>,
     queue_full: u64,
     replayed: usize,
 }
@@ -105,6 +107,7 @@ impl CorpusAuthority {
             pending_bound: pending_bound.max(1),
             next_delta_seq: 1,
             next_event_seq: HashMap::new(),
+            seen_notices: HashMap::new(),
             queue_full: 0,
             replayed: 0,
         }
@@ -121,6 +124,7 @@ impl CorpusAuthority {
         auth.seen.extend(auth.rejected.iter().copied());
         auth.replayed = auth.admitted.len().saturating_add(auth.rejected.len());
         auth.next_delta_seq = folded.last_delta_seq.saturating_add(1);
+        auth.seen_notices = folded.seen_notices.into_iter().collect();
         for (worker_id, rec) in folded.workers {
             auth.next_event_seq
                 .insert(worker_id, rec.last_seq.saturating_add(1));
@@ -299,12 +303,18 @@ impl CorpusAuthority {
 
     pub fn register_worker(
         &mut self,
+        notice_id: &str,
         worker_id: WorkerId,
         slot: u32,
         build: BuildId,
     ) -> Result<u64> {
-        let seq = self.alloc_event_seq(worker_id);
+        self.require_notice_id(notice_id)?;
+        if let Some(seq) = self.already_applied(notice_id) {
+            return Ok(seq);
+        }
+        let seq = self.peek_event_seq(worker_id);
         self.store.append_event(&CampaignEvent::WorkerRegistered {
+            notice_id: notice_id.to_string(),
             envelope: WorkerEnvelope::new(
                 self.store.campaign_id(),
                 worker_id,
@@ -317,12 +327,26 @@ impl CorpusAuthority {
             slot,
             unix_ms: now_unix_ms(),
         })?;
+        self.commit_event_seq(worker_id, seq);
+        self.remember_notice(notice_id, seq);
         Ok(seq)
     }
 
-    pub fn note_left(&mut self, worker_id: WorkerId, reason: &str) -> Result<u64> {
-        let seq = self.alloc_event_seq(worker_id);
+    pub fn note_left(
+        &mut self,
+        notice_id: &str,
+        worker_id: WorkerId,
+        next_producer_seq: u64,
+        reason: &str,
+    ) -> Result<u64> {
+        self.require_notice_id(notice_id)?;
+        if let Some(seq) = self.already_applied(notice_id) {
+            return Ok(seq);
+        }
+        let seq = self.peek_event_seq(worker_id);
         self.store.append_event(&CampaignEvent::WorkerLeft {
+            notice_id: notice_id.to_string(),
+            next_producer_seq,
             envelope: WorkerEnvelope::new(
                 self.store.campaign_id(),
                 worker_id,
@@ -333,12 +357,24 @@ impl CorpusAuthority {
             reason: reason.to_string(),
             unix_ms: now_unix_ms(),
         })?;
+        self.commit_event_seq(worker_id, seq);
+        self.remember_notice(notice_id, seq);
         Ok(seq)
     }
 
-    pub fn note_restarted(&mut self, worker_id: WorkerId, previous_seq: u64) -> Result<u64> {
-        let seq = self.alloc_event_seq(worker_id);
+    pub fn note_restarted(
+        &mut self,
+        notice_id: &str,
+        worker_id: WorkerId,
+        previous_seq: u64,
+    ) -> Result<u64> {
+        self.require_notice_id(notice_id)?;
+        if let Some(seq) = self.already_applied(notice_id) {
+            return Ok(seq);
+        }
+        let seq = self.peek_event_seq(worker_id);
         self.store.append_event(&CampaignEvent::WorkerRestarted {
+            notice_id: notice_id.to_string(),
             envelope: WorkerEnvelope::new(
                 self.store.campaign_id(),
                 worker_id,
@@ -349,6 +385,8 @@ impl CorpusAuthority {
             previous_seq,
             unix_ms: now_unix_ms(),
         })?;
+        self.commit_event_seq(worker_id, seq);
+        self.remember_notice(notice_id, seq);
         Ok(seq)
     }
 
@@ -357,7 +395,7 @@ impl CorpusAuthority {
             .worker_id
             .ok_or_else(|| anyhow!("CandidateDiscovered requires worker_id"))?;
         let producer_seq = meta.producer_seq.unwrap_or(0);
-        let seq = self.alloc_event_seq(worker_id);
+        let seq = self.peek_event_seq(worker_id);
         self.store
             .append_event(&CampaignEvent::CandidateDiscovered {
                 envelope: WorkerEnvelope::new(
@@ -378,13 +416,32 @@ impl CorpusAuthority {
                 generation_ns: 0,
                 unix_ms: now_unix_ms(),
             })?;
+        self.commit_event_seq(worker_id, seq);
         Ok(seq)
     }
 
-    fn alloc_event_seq(&mut self, worker_id: WorkerId) -> u64 {
-        let seq = self.next_event_seq.get(&worker_id).copied().unwrap_or(0);
-        self.next_event_seq.insert(worker_id, seq.saturating_add(1));
-        seq
+    fn peek_event_seq(&self, worker_id: WorkerId) -> u64 {
+        self.next_event_seq.get(&worker_id).copied().unwrap_or(0)
+    }
+
+    fn commit_event_seq(&mut self, worker_id: WorkerId, used: u64) {
+        self.next_event_seq
+            .insert(worker_id, used.saturating_add(1));
+    }
+
+    fn require_notice_id(&self, notice_id: &str) -> Result<()> {
+        if notice_id.is_empty() {
+            anyhow::bail!("control notice_id must be non-empty");
+        }
+        Ok(())
+    }
+
+    fn already_applied(&self, notice_id: &str) -> Option<u64> {
+        self.seen_notices.get(notice_id).copied()
+    }
+
+    fn remember_notice(&mut self, notice_id: &str, seq: u64) {
+        self.seen_notices.insert(notice_id.to_string(), seq);
     }
 
     fn enqueue(&mut self, id: InputId) -> bool {
@@ -573,7 +630,7 @@ mod tests {
     fn reconstruct_keeps_admitted_after_drop() {
         let (tmp, mut auth) = open_auth("adm_recon", 8);
         let mut oracle = FakeOracle::new();
-        auth.register_worker(WorkerId::from_slot(0), 0, BuildId([1; 32]))
+        auth.register_worker("reg-0", WorkerId::from_slot(0), 0, BuildId([1; 32]))
             .unwrap();
         auth.submit(cand(b"\x02zz", 0, 1)).unwrap();
         auth.note_discovered(&cand(b"\x02zz", 0, 1).meta).unwrap();
@@ -654,14 +711,15 @@ mod tests {
     fn event_seq_is_monotonic_when_producer_seq_is_shuffled() {
         let (_tmp, mut auth) = open_auth("adm_event_seq", 8);
         let w = WorkerId::from_slot(0);
-        auth.register_worker(w, 0, BuildId([1; 32])).unwrap();
+        auth.register_worker("reg-0", w, 0, BuildId([1; 32]))
+            .unwrap();
         let mut late = cand(b"\x01late", 0, 9);
         late.meta.producer_seq = Some(9);
         let mut early = cand(b"\x02early", 0, 1);
         early.meta.producer_seq = Some(1);
         auth.note_discovered(&late.meta).unwrap();
         auth.note_discovered(&early.meta).unwrap();
-        auth.note_left(w, "budget").unwrap();
+        auth.note_left("left-0", w, 10, "budget").unwrap();
         let mut seqs = Vec::new();
         for ev in auth.store().read_events().unwrap() {
             match ev {
@@ -676,5 +734,77 @@ mod tests {
             }
         }
         assert_eq!(seqs, vec![0, 1, 2, 3]);
+        assert_eq!(
+            auth.register_worker("reg-0", w, 0, BuildId([1; 32]))
+                .unwrap(),
+            0,
+            "duplicate notice_id must not append again"
+        );
+        let registered = auth
+            .store()
+            .read_events()
+            .unwrap()
+            .into_iter()
+            .filter(|ev| matches!(ev, CampaignEvent::WorkerRegistered { .. }))
+            .count();
+        assert_eq!(registered, 1);
+    }
+
+    #[test]
+    fn control_notice_survives_crash_between_take_and_append() {
+        use crate::spool::{CandidateSpool, WorkerRegistration};
+
+        let (tmp, auth) = open_auth("adm_notice_crash", 8);
+        let spool = CandidateSpool::create(tmp.0.join("spool")).unwrap();
+        let w = WorkerId::from_slot(0);
+        let reg = WorkerRegistration {
+            notice_id: "reg-w0-p0-e0".into(),
+            worker_id: w,
+            slot: 0,
+            restart: false,
+            previous_event_seq: None,
+            next_producer_seq: 0,
+        };
+        spool.write_worker(&reg).unwrap();
+        assert_eq!(
+            spool.take_worker_registrations().unwrap(),
+            vec![reg.clone()]
+        );
+
+        // Crash after take, before append: reconstruct must replay processing/.
+        let campaign = auth.store().campaign_id();
+        drop(auth);
+        let store = CampaignStore::open(&tmp.0, campaign).unwrap();
+        let mut restored = CorpusAuthority::reconstruct(store, 8).unwrap();
+        let spool = CandidateSpool::open(tmp.0.join("spool")).unwrap();
+        let replayed = spool.take_worker_registrations().unwrap();
+        assert_eq!(replayed, vec![reg.clone()]);
+        restored
+            .register_worker(&reg.notice_id, w, 0, BuildId([1; 32]))
+            .unwrap();
+
+        // Crash after append, before ack: reconstruct skips a second append.
+        drop(restored);
+        let store = CampaignStore::open(&tmp.0, campaign).unwrap();
+        let mut restored = CorpusAuthority::reconstruct(store, 8).unwrap();
+        let spool = CandidateSpool::open(tmp.0.join("spool")).unwrap();
+        let again = spool.take_worker_registrations().unwrap();
+        assert_eq!(again, vec![reg.clone()]);
+        assert_eq!(
+            restored
+                .register_worker(&reg.notice_id, w, 0, BuildId([1; 32]))
+                .unwrap(),
+            0
+        );
+        let registered = restored
+            .store()
+            .read_events()
+            .unwrap()
+            .into_iter()
+            .filter(|ev| matches!(ev, CampaignEvent::WorkerRegistered { .. }))
+            .count();
+        assert_eq!(registered, 1);
+        spool.ack_worker_registration(&reg.notice_id).unwrap();
+        assert!(spool.take_worker_registrations().unwrap().is_empty());
     }
 }

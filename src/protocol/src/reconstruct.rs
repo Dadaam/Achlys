@@ -17,6 +17,8 @@ pub struct WorkerRecord {
     pub slot: Option<u32>,
     pub left: bool,
     pub restarts: u32,
+    /// Next unused worker generation number (`producer_seq`).
+    pub next_producer_seq: u64,
 }
 
 /// Deterministic view of a campaign reconstructed from JSONL events.
@@ -28,6 +30,8 @@ pub struct ReconstructedCampaign {
     pub rejected: BTreeSet<InputId>,
     pub last_delta_seq: u64,
     pub deltas: u64,
+    /// Stable control-notice ids already in the journal, mapped to event_seq.
+    pub seen_notices: BTreeMap<String, u64>,
 }
 
 impl ReconstructedCampaign {
@@ -39,7 +43,14 @@ impl ReconstructedCampaign {
             slot: None,
             left: false,
             restarts: 0,
+            next_producer_seq: 0,
         })
+    }
+
+    fn note_notice(&mut self, notice_id: &str, sender_seq: u64) {
+        if !notice_id.is_empty() {
+            self.seen_notices.insert(notice_id.to_string(), sender_seq);
+        }
     }
 
     fn note_seq(&mut self, worker_id: WorkerId, sender_seq: u64) {
@@ -72,10 +83,12 @@ where
             }
             CampaignEvent::WorkerRegistered {
                 envelope,
+                notice_id,
                 strategy,
                 slot,
                 ..
             } => {
+                out.note_notice(&notice_id, envelope.sender_seq);
                 {
                     let rec = out.worker_mut(envelope.worker_id);
                     rec.strategy = Some(strategy);
@@ -84,15 +97,29 @@ where
                 }
                 out.note_seq(envelope.worker_id, envelope.sender_seq);
             }
-            CampaignEvent::WorkerLeft { envelope, .. } => {
-                out.worker_mut(envelope.worker_id).left = true;
+            CampaignEvent::WorkerLeft {
+                envelope,
+                notice_id,
+                next_producer_seq,
+                ..
+            } => {
+                out.note_notice(&notice_id, envelope.sender_seq);
+                {
+                    let rec = out.worker_mut(envelope.worker_id);
+                    rec.left = true;
+                    if next_producer_seq > rec.next_producer_seq {
+                        rec.next_producer_seq = next_producer_seq;
+                    }
+                }
                 out.note_seq(envelope.worker_id, envelope.sender_seq);
             }
             CampaignEvent::WorkerRestarted {
                 envelope,
+                notice_id,
                 previous_seq,
                 ..
             } => {
+                out.note_notice(&notice_id, envelope.sender_seq);
                 let already = out
                     .workers
                     .get(&envelope.worker_id)
@@ -107,8 +134,17 @@ where
                     out.note_seq(envelope.worker_id, envelope.sender_seq);
                 }
             }
-            CampaignEvent::CandidateDiscovered { envelope, .. } => {
+            CampaignEvent::CandidateDiscovered {
+                envelope,
+                producer_seq,
+                ..
+            } => {
                 out.note_seq(envelope.worker_id, envelope.sender_seq);
+                let rec = out.worker_mut(envelope.worker_id);
+                let next = producer_seq.saturating_add(1);
+                if next > rec.next_producer_seq {
+                    rec.next_producer_seq = next;
+                }
             }
             CampaignEvent::CorpusDelta { sequence, .. } => {
                 if sequence > out.last_delta_seq {
@@ -155,6 +191,7 @@ mod tests {
         let events = vec![
             CampaignEvent::WorkerRegistered {
                 envelope: wenv(w0, 0),
+                notice_id: "reg-0".into(),
                 strategy: StrategyId::Havoc,
                 producer_build: BuildId([0; 32]),
                 slot: 0,
@@ -162,6 +199,7 @@ mod tests {
             },
             CampaignEvent::WorkerRegistered {
                 envelope: wenv(w1, 0),
+                notice_id: "reg-1".into(),
                 strategy: StrategyId::Havoc,
                 producer_build: BuildId([0; 32]),
                 slot: 1,
@@ -203,6 +241,7 @@ mod tests {
             },
             CampaignEvent::WorkerRestarted {
                 envelope: wenv(w0, 4),
+                notice_id: "rst-0".into(),
                 previous_seq: 3,
                 unix_ms: 5,
             },
@@ -228,6 +267,7 @@ mod tests {
         let w0 = WorkerId::from_slot(0);
         let restart = CampaignEvent::WorkerRestarted {
             envelope: wenv(w0, 4),
+            notice_id: "rst-0".into(),
             previous_seq: 3,
             unix_ms: 5,
         };
@@ -243,6 +283,51 @@ mod tests {
         assert_eq!(twice.workers[&w0].restarts, 1);
         assert_eq!(once.deltas, 1);
         assert_eq!(twice.deltas, 1);
+    }
+
+    #[test]
+    fn worker_left_restores_next_producer_seq() {
+        let w0 = WorkerId::from_slot(0);
+        let events = vec![
+            CampaignEvent::WorkerRegistered {
+                envelope: wenv(w0, 0),
+                notice_id: "reg-0".into(),
+                strategy: StrategyId::Havoc,
+                producer_build: BuildId([0; 32]),
+                slot: 0,
+                unix_ms: 0,
+            },
+            CampaignEvent::CandidateDiscovered {
+                envelope: wenv(w0, 1),
+                input_id: InputId::from_bytes(b"x"),
+                parent_ids: vec![],
+                producing_strategy: StrategyId::Havoc,
+                producer_build: BuildId([0; 32]),
+                producer_seq: 25,
+                local_coverage: None,
+                local_delta_count: 0,
+                execution_ns: 0,
+                generation_ns: 0,
+                unix_ms: 1,
+            },
+            CampaignEvent::WorkerLeft {
+                envelope: wenv(w0, 2),
+                notice_id: "left-0-26".into(),
+                next_producer_seq: 26,
+                reason: "budget".into(),
+                unix_ms: 2,
+            },
+        ];
+        let rec = reconstruct_events(events);
+        assert_eq!(rec.workers[&w0].last_seq, 2);
+        assert_eq!(rec.workers[&w0].next_producer_seq, 26);
+        assert_ne!(
+            rec.workers[&w0].last_seq.saturating_add(1),
+            rec.workers[&w0].next_producer_seq,
+            "producer_seq must not be derived from event_seq"
+        );
+        assert!(rec.seen_notices.contains_key("reg-0"));
+        assert!(rec.seen_notices.contains_key("left-0-26"));
     }
 
     fn once_more(
@@ -271,6 +356,7 @@ mod tests {
             },
             CampaignEvent::WorkerRegistered {
                 envelope: wenv(w1, 0),
+                notice_id: "reg-1".into(),
                 strategy: StrategyId::Havoc,
                 producer_build: BuildId([0; 32]),
                 slot: 1,
@@ -278,6 +364,7 @@ mod tests {
             },
             CampaignEvent::WorkerRestarted {
                 envelope: wenv(w0, 4),
+                notice_id: "rst-0".into(),
                 previous_seq: 3,
                 unix_ms: 5,
             },

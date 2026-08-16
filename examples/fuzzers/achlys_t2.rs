@@ -399,6 +399,19 @@ fn spool_dir(out: &Path) -> PathBuf {
     out.join("spool")
 }
 
+fn control_notice_id(
+    kind: &str,
+    worker_id: WorkerId,
+    next_producer_seq: u64,
+    previous_event_seq: Option<u64>,
+) -> String {
+    format!(
+        "{kind}-{}-p{next_producer_seq}-e{}",
+        worker_id.to_hex(),
+        previous_event_seq.unwrap_or(0)
+    )
+}
+
 fn run_admit(out: &Path) -> Result<()> {
     let bound = env::var("ACHLYS_T2_PENDING_BOUND")
         .ok()
@@ -446,6 +459,7 @@ fn run_admit(out: &Path) -> Result<()> {
         let quiet = spool.inbox_len() == 0
             && spool.overflow_len() == 0
             && spool.processing_len() == 0
+            && spool.leftover_control_notices() == 0
             && auth.pending_len() == 0;
         if quiet {
             idle = idle.saturating_add(1);
@@ -465,6 +479,7 @@ fn run_admit(out: &Path) -> Result<()> {
             && spool.inbox_len() == 0
             && spool.overflow_len() == 0
             && spool.processing_len() == 0
+            && spool.leftover_control_notices() == 0
             && auth.pending_len() == 0
         {
             break;
@@ -473,14 +488,16 @@ fn run_admit(out: &Path) -> Result<()> {
     if spool.inbox_len() != 0
         || spool.processing_len() != 0
         || spool.overflow_len() != 0
+        || spool.leftover_control_notices() != 0
         || auth.pending_len() != 0
     {
         anyhow::bail!(
-            "admit shutdown incomplete: inbox={} processing={} overflow={} pending={}",
+            "admit shutdown incomplete: inbox={} processing={} overflow={} pending={} control={}",
             spool.inbox_len(),
             spool.processing_len(),
             spool.overflow_len(),
-            auth.pending_len()
+            auth.pending_len(),
+            spool.leftover_control_notices()
         );
     }
     auth.write_canonical_report(
@@ -499,6 +516,7 @@ fn run_admit(out: &Path) -> Result<()> {
         "inbox": spool.inbox_len(),
         "processing": spool.processing_len(),
         "overflow": spool.overflow_len(),
+        "control": spool.leftover_control_notices(),
     });
     let metrics_dir = artifacts_dir(out).join("metrics");
     fs::create_dir_all(&metrics_dir)?;
@@ -518,10 +536,20 @@ fn admit_once(
     let mut progress = false;
     for reg in spool.take_worker_registrations()? {
         if reg.restart {
-            auth.note_restarted(reg.worker_id, reg.previous_seq.unwrap_or(0))?;
+            auth.note_restarted(
+                &reg.notice_id,
+                reg.worker_id,
+                reg.previous_event_seq.unwrap_or(0),
+            )?;
         } else {
-            auth.register_worker(reg.worker_id, reg.slot, record.fast_build.build_id)?;
+            auth.register_worker(
+                &reg.notice_id,
+                reg.worker_id,
+                reg.slot,
+                record.fast_build.build_id,
+            )?;
         }
+        spool.ack_worker_registration(&reg.notice_id)?;
         progress = true;
     }
     let processing = spool.take_processing(64)?;
@@ -543,10 +571,16 @@ fn admit_once(
     }
     for exit in spool.take_worker_exits()? {
         if spool.has_pending_for(exit.worker_id)? {
-            spool.write_left(&exit)?;
+            spool.return_worker_exit(&exit)?;
             continue;
         }
-        auth.note_left(exit.worker_id, &exit.reason)?;
+        auth.note_left(
+            &exit.notice_id,
+            exit.worker_id,
+            exit.next_producer_seq,
+            &exit.reason,
+        )?;
+        spool.ack_worker_exit(&exit.notice_id)?;
         progress = true;
     }
     Ok(progress)
@@ -987,16 +1021,16 @@ fn run_launcher(args: Args) {
                 worker_id,
                 slot,
                 restart: true,
-                previous_seq: Some(rec.last_seq),
-                next_seq: rec.last_seq.saturating_add(1),
+                previous_event_seq: Some(rec.last_seq),
+                next_producer_seq: rec.next_producer_seq,
             }
         } else {
             WorkerResume {
                 worker_id,
                 slot,
                 restart: false,
-                previous_seq: None,
-                next_seq: 0,
+                previous_event_seq: None,
+                next_producer_seq: 0,
             }
         };
         spool
@@ -1057,8 +1091,8 @@ fn run_launcher(args: Args) {
                     worker_id,
                     slot,
                     restart: false,
-                    previous_seq: None,
-                    next_seq: 0,
+                    previous_event_seq: None,
+                    next_producer_seq: 0,
                 });
             if resume.worker_id != worker_id {
                 return Err(libafl::Error::unknown(format!(
@@ -1068,11 +1102,17 @@ fn run_launcher(args: Args) {
             }
             spool
                 .write_worker(&WorkerRegistration {
+                    notice_id: control_notice_id(
+                        if resume.restart { "rst" } else { "reg" },
+                        worker_id,
+                        resume.next_producer_seq,
+                        resume.previous_event_seq,
+                    ),
                     worker_id,
                     slot,
-                    sender_seq: resume.next_seq,
                     restart: resume.restart,
-                    previous_seq: resume.previous_seq,
+                    previous_event_seq: resume.previous_event_seq,
+                    next_producer_seq: resume.next_producer_seq,
                 })
                 .map_err(|e| libafl::Error::unknown(e.to_string()))?;
 
@@ -1097,7 +1137,7 @@ fn run_launcher(args: Args) {
             config.persist_corpus_dir = Some(persist.clone());
 
             let target = worker_target(worker_kind);
-            let mut seq = resume.next_seq.saturating_add(1);
+            let mut seq = resume.next_producer_seq;
             let mut seen = HashSet::new();
             let report = run_llmp_worker(target, &config, &mut mgr, &extra, |corpus_dir| {
                 let new = scan_new_inputs(corpus_dir, &mut seen)?;
@@ -1136,12 +1176,12 @@ fn run_launcher(args: Args) {
                     .map_err(|e| libafl::Error::unknown(e.to_string()))?,
             )
             .map_err(|e| libafl::Error::unknown(e.to_string()))?;
-            let left_seq = seq;
             spool
                 .write_left(&WorkerExit {
+                    notice_id: control_notice_id("left", worker_id, seq, resume.previous_event_seq),
                     worker_id,
                     slot,
-                    sender_seq: left_seq,
+                    next_producer_seq: seq,
                     reason: "budget".into(),
                 })
                 .map_err(|e| libafl::Error::unknown(e.to_string()))?;
