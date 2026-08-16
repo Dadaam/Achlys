@@ -216,8 +216,8 @@ impl CampaignStore {
         if !path.is_file() {
             return Ok(Vec::new());
         }
-        let text = fs::read_to_string(&path)
-            .with_context(|| format!("read events {}", path.display()))?;
+        let text =
+            fs::read_to_string(&path).with_context(|| format!("read events {}", path.display()))?;
         let mut out = Vec::new();
         for (idx, line) in text.lines().enumerate() {
             if line.is_empty() {
@@ -278,7 +278,7 @@ fn object_path(objects_root: &Path, id: &InputId) -> PathBuf {
     objects_root.join(ab).join(cd).join(id.to_hex())
 }
 
-fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;

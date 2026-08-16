@@ -20,7 +20,7 @@ pub struct WorkerRecord {
 }
 
 /// Deterministic view of a campaign reconstructed from JSONL events.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReconstructedCampaign {
     pub workers: BTreeMap<WorkerId, WorkerRecord>,
     pub stored: BTreeSet<InputId>,
@@ -28,19 +28,6 @@ pub struct ReconstructedCampaign {
     pub rejected: BTreeSet<InputId>,
     pub last_delta_seq: u64,
     pub deltas: u64,
-}
-
-impl Default for ReconstructedCampaign {
-    fn default() -> Self {
-        Self {
-            workers: BTreeMap::new(),
-            stored: BTreeSet::new(),
-            admitted: BTreeSet::new(),
-            rejected: BTreeSet::new(),
-            last_delta_seq: 0,
-            deltas: 0,
-        }
-    }
 }
 
 impl ReconstructedCampaign {
