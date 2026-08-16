@@ -38,7 +38,8 @@ Tranche 2 stays closed until a Linux multi-trial ladder is **defined and execute
 
 ## Evidence
 
-- Branch `tranche-1-baseline` through `03a2a09`, plus this accept record, merged to `main`.
+- Merge on `main`: `e266e4d` (`merge: T1 baseline infrastructure`).
+- Accept record: `b8e77a5`. Shared-oracle fix: `03a2a09`.
 - Linux CI green on the shared-oracle commit: run `31964013720`.
 - Functional smoke: [`docs/evidence/t1/`](../evidence/t1/).
 - Implementation notes and remediations: [`2026-08-16-t1-baseline.md`](2026-08-16-t1-baseline.md).
