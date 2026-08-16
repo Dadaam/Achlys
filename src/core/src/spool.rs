@@ -228,6 +228,14 @@ impl CandidateSpool {
         write_atomic(&self.root.join("STOP"), b"1\n")
     }
 
+    pub fn clear_stop(&self) -> Result<()> {
+        let path = self.root.join("STOP");
+        if path.is_file() {
+            fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn stop_requested(&self) -> bool {
         self.root.join("STOP").is_file()

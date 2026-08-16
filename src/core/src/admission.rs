@@ -15,6 +15,7 @@ use achlys_protocol::{
 };
 use anyhow::{Context, Result, anyhow};
 
+use crate::spool::CandidateSpool;
 use crate::store::{CampaignStore, CanonicalReport, now_unix_ms};
 
 /// In-memory pending replay bound. Overflow stays on the spool.
@@ -420,6 +421,135 @@ impl CorpusAuthority {
         Ok(seq)
     }
 
+    /// Replay leftover registrations. Recovery uses this before leftover exits.
+    pub fn apply_spooled_registrations(
+        &mut self,
+        spool: &CandidateSpool,
+        producer_build: BuildId,
+    ) -> Result<usize> {
+        let mut n = 0usize;
+        for reg in spool.take_worker_registrations()? {
+            if reg.restart {
+                self.note_restarted(
+                    &reg.notice_id,
+                    reg.worker_id,
+                    reg.previous_event_seq.unwrap_or(0),
+                )?;
+            } else {
+                self.register_worker(&reg.notice_id, reg.worker_id, reg.slot, producer_build)?;
+            }
+            spool.ack_worker_registration(&reg.notice_id)?;
+            n = n.saturating_add(1);
+        }
+        Ok(n)
+    }
+
+    pub fn apply_spooled_exits(&mut self, spool: &CandidateSpool) -> Result<usize> {
+        let mut n = 0usize;
+        for exit in spool.take_worker_exits()? {
+            if spool.has_pending_for(exit.worker_id)? {
+                spool.return_worker_exit(&exit)?;
+                continue;
+            }
+            self.note_left(
+                &exit.notice_id,
+                exit.worker_id,
+                exit.next_producer_seq,
+                &exit.reason,
+            )?;
+            spool.ack_worker_exit(&exit.notice_id)?;
+            n = n.saturating_add(1);
+        }
+        Ok(n)
+    }
+
+    pub fn ingest_spool(&mut self, spool: &CandidateSpool) -> Result<usize> {
+        let mut n = 0usize;
+        for batch in [
+            spool.take_processing(64)?,
+            spool.take_inbox(64)?,
+            spool.take_overflow(64)?,
+        ] {
+            n = n.saturating_add(self.ingest_batch(spool, batch)?);
+        }
+        Ok(n)
+    }
+
+    fn ingest_batch(
+        &mut self,
+        spool: &CandidateSpool,
+        batch: Vec<(InputId, Vec<u8>, InputMetadata)>,
+    ) -> Result<usize> {
+        let n = batch.len();
+        for (id, bytes, meta) in batch {
+            match self.submit(PendingCandidate {
+                bytes: bytes.clone(),
+                meta: meta.clone(),
+            })? {
+                SubmitOutcome::Queued => {
+                    if meta.worker_id.is_some() {
+                        self.note_discovered(&meta)?;
+                    }
+                    spool.ack_processed(&id)?;
+                }
+                SubmitOutcome::Duplicate => {
+                    spool.ack_processed(&id)?;
+                }
+                SubmitOutcome::QueueFull => {
+                    spool.write_overflow(&bytes, &meta)?;
+                    spool.ack_processed(&id)?;
+                }
+            }
+        }
+        Ok(n)
+    }
+
+    /// Finish leftover control notices and candidates before a new run resumes.
+    pub fn recover_from_spool<O: AdmitOracle>(
+        &mut self,
+        spool: &CandidateSpool,
+        oracle: &mut O,
+        producer_build: BuildId,
+    ) -> Result<()> {
+        let _ = self.apply_spooled_registrations(spool, producer_build)?;
+        for _ in 0..1_000_000 {
+            let mut progress = false;
+            if self.ingest_spool(spool)? > 0 {
+                progress = true;
+            }
+            let stats = self.drain(oracle, 64)?;
+            if let Some(seq) = stats.delta_seq {
+                spool.write_delta(seq, &stats.delta_admitted)?;
+                progress = true;
+            }
+            if stats.replayed > 0 {
+                progress = true;
+            }
+            if self.apply_spooled_exits(spool)? > 0 {
+                progress = true;
+            }
+            let quiet = spool.inbox_len() == 0
+                && spool.processing_len() == 0
+                && spool.overflow_len() == 0
+                && spool.leftover_control_notices() == 0
+                && self.pending_len() == 0;
+            if quiet {
+                return Ok(());
+            }
+            if !progress {
+                anyhow::bail!(
+                    "spool recovery stalled: inbox={} processing={} overflow={} pending={} control={}",
+                    spool.inbox_len(),
+                    spool.processing_len(),
+                    spool.overflow_len(),
+                    self.pending_len(),
+                    spool.leftover_control_notices()
+                );
+            }
+        }
+        anyhow::bail!("spool recovery exceeded iteration bound")
+    }
+
     fn peek_event_seq(&self, worker_id: WorkerId) -> u64 {
         self.next_event_seq.get(&worker_id).copied().unwrap_or(0)
     }
@@ -806,5 +936,100 @@ mod tests {
         assert_eq!(registered, 1);
         spool.ack_worker_registration(&reg.notice_id).unwrap();
         assert!(spool.take_worker_registrations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recover_from_spool_applies_unacked_exit_before_resume() {
+        use crate::spool::{CandidateSpool, WorkerExit, WorkerRegistration};
+
+        let (tmp, mut auth) = open_auth("adm_recover_join", 8);
+        let spool = CandidateSpool::create(tmp.0.join("spool")).unwrap();
+        let w = WorkerId::from_slot(0);
+        auth.register_worker("reg-0", w, 0, BuildId([1; 32]))
+            .unwrap();
+        let discovered = cand(b"\x01p70", 0, 70);
+        auth.submit(discovered.clone()).unwrap();
+        auth.note_discovered(&discovered.meta).unwrap();
+
+        let leftover = cand(b"\x02p99", 0, 99);
+        spool.push(&leftover.bytes, &leftover.meta).unwrap();
+        assert_eq!(spool.take_inbox(8).unwrap().len(), 1);
+
+        let exit = WorkerExit {
+            notice_id: "left-w0-p100-e1".into(),
+            worker_id: w,
+            slot: 0,
+            next_producer_seq: 100,
+            reason: "budget".into(),
+        };
+        spool.write_left(&exit).unwrap();
+        assert_eq!(spool.take_worker_exits().unwrap(), vec![exit]);
+
+        let before = reconstruct_events(auth.store().read_events().unwrap());
+        assert_eq!(before.workers[&w].next_producer_seq, 71);
+        assert!(!before.workers[&w].left);
+
+        let mut oracle = FakeOracle::new();
+        auth.recover_from_spool(&spool, &mut oracle, BuildId([1; 32]))
+            .unwrap();
+        assert_eq!(spool.leftover_control_notices(), 0);
+        assert_eq!(spool.processing_len(), 0);
+
+        let after = reconstruct_events(auth.store().read_events().unwrap());
+        assert_eq!(after.workers[&w].next_producer_seq, 100);
+        assert!(after.workers[&w].left);
+
+        let mut worker_types = Vec::new();
+        for ev in auth.store().read_events().unwrap() {
+            match ev {
+                CampaignEvent::WorkerRegistered { envelope, .. } if envelope.worker_id == w => {
+                    worker_types.push("registered");
+                }
+                CampaignEvent::CandidateDiscovered {
+                    envelope,
+                    producer_seq,
+                    ..
+                } if envelope.worker_id == w => {
+                    worker_types.push("discovered");
+                    assert!(producer_seq == 70 || producer_seq == 99);
+                }
+                CampaignEvent::WorkerLeft { envelope, .. } if envelope.worker_id == w => {
+                    worker_types.push("left");
+                }
+                CampaignEvent::WorkerRestarted { envelope, .. } if envelope.worker_id == w => {
+                    worker_types.push("restarted");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            worker_types,
+            vec!["registered", "discovered", "discovered", "left"]
+        );
+
+        let live = WorkerRegistration {
+            notice_id: "rst-w0-p100-e3".into(),
+            worker_id: w,
+            slot: 0,
+            restart: true,
+            previous_event_seq: Some(after.workers[&w].last_seq),
+            next_producer_seq: after.workers[&w].next_producer_seq,
+        };
+        spool.write_worker(&live).unwrap();
+        assert_eq!(
+            auth.apply_spooled_registrations(&spool, BuildId([1; 32]))
+                .unwrap(),
+            1
+        );
+        let folded = reconstruct_events(auth.store().read_events().unwrap());
+        assert_eq!(folded.workers[&w].next_producer_seq, 100);
+        let restarted = auth
+            .store()
+            .read_events()
+            .unwrap()
+            .into_iter()
+            .filter(|ev| matches!(ev, CampaignEvent::WorkerRestarted { .. }))
+            .count();
+        assert_eq!(restarted, 1);
     }
 }

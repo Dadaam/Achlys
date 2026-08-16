@@ -224,6 +224,150 @@ for dir in workers left workers/processing left/processing; do
 done
 echo "T2_CONTROL_SPOOL=OK"
 
+crash_out="$out/crash-join"
+rm -rf "$crash_out"
+cp -a "$out/run1" "$crash_out"
+python3 - "$crash_out" <<'PY'
+import json, os, sys
+
+root = sys.argv[1]
+events_p = os.path.join(root, "artifacts/events/events.jsonl")
+events = []
+slot0 = None
+for raw in open(events_p, encoding="utf-8"):
+    raw = raw.strip()
+    if not raw:
+        continue
+    ev = json.loads(raw)
+    events.append(ev)
+    if ev.get("type") == "worker_registered" and ev.get("slot") == 0:
+        slot0 = ev.get("worker_id")
+if not slot0:
+    raise SystemExit("crash-join plant: missing slot 0 worker_registered")
+
+seqs = []
+for ev in events:
+    if ev.get("type") == "candidate_discovered" and ev.get("worker_id") == slot0:
+        if ev.get("producer_seq") is not None:
+            seqs.append(int(ev["producer_seq"]))
+if not seqs:
+    raise SystemExit("crash-join plant: no producer_seq for slot 0")
+journal_max = max(seqs)
+cutoff = journal_max - 20 if journal_max >= 20 else journal_max
+planted = max(journal_max + 30, 100)
+
+kept = []
+for ev in events:
+    typ = ev.get("type")
+    wid = ev.get("worker_id")
+    if wid == slot0 and typ in ("worker_left", "worker_restarted"):
+        continue
+    if (
+        wid == slot0
+        and typ == "candidate_discovered"
+        and ev.get("producer_seq") is not None
+        and int(ev["producer_seq"]) > cutoff
+    ):
+        continue
+    kept.append(ev)
+
+with open(events_p, "w", encoding="utf-8") as fh:
+    for ev in kept:
+        fh.write(json.dumps(ev, separators=(",", ":")) + "\n")
+
+proc = os.path.join(root, "spool/left/processing")
+os.makedirs(proc, exist_ok=True)
+notice = f"left-{slot0}-p{planted}-e-crash"
+exit_notice = {
+    "notice_id": notice,
+    "worker_id": slot0,
+    "slot": 0,
+    "next_producer_seq": planted,
+    "reason": "budget",
+}
+with open(os.path.join(proc, f"{notice}.json"), "w", encoding="utf-8") as fh:
+    json.dump(exit_notice, fh, indent=2)
+    fh.write("\n")
+
+plant = {
+    "worker_id": slot0,
+    "journal_max": journal_max,
+    "cutoff": cutoff,
+    "planted_next": planted,
+    "notice_id": notice,
+}
+json.dump(plant, open(os.path.join(root, "planted.json"), "w", encoding="utf-8"), indent=2)
+print(f"T2_CRASH_PLANT worker={slot0} cutoff={cutoff} planted={planted}")
+PY
+crash_log="$out/crash-join.log"
+"$t2_bin" \
+  --manifest benchmarks/manifests/cjson-parse.toml \
+  --label t2-crash-join \
+  --seed 4242 \
+  --iters 8 \
+  --workers 1 \
+  --join \
+  --broker-port "${T2_CRASH_JOIN_BROKER_PORT:-17372}" \
+  --corpus "$out/seeds" \
+  --out "$crash_out" | tee "$crash_log"
+python3 - "$crash_out" "$crash_log" <<'PY'
+import json, os, sys
+
+root, log_p = sys.argv[1:]
+plant = json.loads(open(os.path.join(root, "planted.json"), encoding="utf-8").read())
+wid = plant["worker_id"]
+planted = int(plant["planted_next"])
+notice = plant["notice_id"]
+
+resume = json.loads(open(os.path.join(root, "spool/resume/0.json"), encoding="utf-8").read())
+if int(resume.get("next_producer_seq", -1)) < planted:
+    raise SystemExit(
+        f"resume next_producer_seq={resume.get('next_producer_seq')} < planted {planted}"
+    )
+
+events = []
+for raw in open(os.path.join(root, "artifacts/events/events.jsonl"), encoding="utf-8"):
+    raw = raw.strip()
+    if not raw:
+        continue
+    events.append(json.loads(raw))
+
+idx_left = None
+idx_rst = None
+idx_new_left = None
+producers = []
+for i, ev in enumerate(events):
+    if ev.get("worker_id") != wid:
+        continue
+    typ = ev.get("type")
+    if typ == "worker_left" and ev.get("notice_id") == notice:
+        idx_left = i
+    elif typ == "worker_left" and idx_left is not None and idx_new_left is None:
+        idx_new_left = i
+    if typ == "worker_restarted" and idx_rst is None:
+        idx_rst = i
+    if typ == "candidate_discovered" and ev.get("producer_seq") is not None:
+        producers.append(int(ev["producer_seq"]))
+if idx_left is None:
+    raise SystemExit("recovered WorkerLeft missing from journal")
+if idx_rst is None:
+    raise SystemExit("WorkerRestarted missing after crash-join")
+if idx_left > idx_rst:
+    raise SystemExit(
+        f"WorkerRestarted at {idx_rst} preceded recovered WorkerLeft at {idx_left}"
+    )
+if idx_new_left is not None and idx_rst > idx_new_left:
+    raise SystemExit(
+        f"new WorkerLeft at {idx_new_left} preceded WorkerRestarted at {idx_rst}"
+    )
+if len(producers) != len(set(producers)):
+    raise SystemExit(f"duplicate producer_seq after crash-join: {producers}")
+newer = [p for p in producers if p >= planted]
+if newer and min(newer) < planted:
+    raise SystemExit(f"post-join producer_seq below planted: {newer}")
+print("T2_CRASH_JOIN=OK")
+PY
+
 set +e
 help_out="$("$t2_bin" --help 2>&1)"
 set -e

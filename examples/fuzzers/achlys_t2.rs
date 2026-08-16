@@ -19,8 +19,8 @@ use achlys_bridge::{
     CoverageMap, DumpOracle, InProcessTarget, Target, WorkerTarget, compile_canonical,
 };
 use achlys_core::{
-    CampaignSession, CandidateSpool, CorpusAuthority, FuzzerConfig, PendingCandidate,
-    SubmitOutcome, WorkerExit, WorkerRegistration, WorkerResume, scan_new_inputs,
+    CampaignSession, CandidateSpool, CorpusAuthority, FuzzerConfig, WorkerExit, WorkerRegistration,
+    WorkerResume, scan_new_inputs,
 };
 use achlys_protocol::{
     BuildIdentity, BuildKind, CampaignEvent, CampaignId, CampaignRecord, InputId, InputMetadata,
@@ -534,33 +534,12 @@ fn admit_once(
     oracle: &mut DumpOracle,
 ) -> Result<bool> {
     let mut progress = false;
-    for reg in spool.take_worker_registrations()? {
-        if reg.restart {
-            auth.note_restarted(
-                &reg.notice_id,
-                reg.worker_id,
-                reg.previous_event_seq.unwrap_or(0),
-            )?;
-        } else {
-            auth.register_worker(
-                &reg.notice_id,
-                reg.worker_id,
-                reg.slot,
-                record.fast_build.build_id,
-            )?;
-        }
-        spool.ack_worker_registration(&reg.notice_id)?;
+    if auth.apply_spooled_registrations(spool, record.fast_build.build_id)? > 0 {
         progress = true;
     }
-    let processing = spool.take_processing(64)?;
-    let inbox = spool.take_inbox(64)?;
-    let overflow = spool.take_overflow(64)?;
-    if !processing.is_empty() || !inbox.is_empty() || !overflow.is_empty() {
+    if auth.ingest_spool(spool)? > 0 {
         progress = true;
     }
-    ingest_batch(auth, spool, processing)?;
-    ingest_batch(auth, spool, inbox)?;
-    ingest_batch(auth, spool, overflow)?;
     let stats = auth.drain(oracle, 64)?;
     if let Some(seq) = stats.delta_seq {
         spool.write_delta(seq, &stats.delta_admitted)?;
@@ -569,49 +548,10 @@ fn admit_once(
     if stats.replayed > 0 {
         progress = true;
     }
-    for exit in spool.take_worker_exits()? {
-        if spool.has_pending_for(exit.worker_id)? {
-            spool.return_worker_exit(&exit)?;
-            continue;
-        }
-        auth.note_left(
-            &exit.notice_id,
-            exit.worker_id,
-            exit.next_producer_seq,
-            &exit.reason,
-        )?;
-        spool.ack_worker_exit(&exit.notice_id)?;
+    if auth.apply_spooled_exits(spool)? > 0 {
         progress = true;
     }
     Ok(progress)
-}
-
-fn ingest_batch(
-    auth: &mut CorpusAuthority,
-    spool: &CandidateSpool,
-    batch: Vec<(InputId, Vec<u8>, InputMetadata)>,
-) -> Result<()> {
-    for (id, bytes, meta) in batch {
-        match auth.submit(PendingCandidate {
-            bytes: bytes.clone(),
-            meta: meta.clone(),
-        })? {
-            SubmitOutcome::Queued => {
-                if meta.worker_id.is_some() {
-                    auth.note_discovered(&meta)?;
-                }
-                spool.ack_processed(&id)?;
-            }
-            SubmitOutcome::Duplicate => {
-                spool.ack_processed(&id)?;
-            }
-            SubmitOutcome::QueueFull => {
-                spool.write_overflow(&bytes, &meta)?;
-                spool.ack_processed(&id)?;
-            }
-        }
-    }
-    Ok(())
 }
 
 fn read_campaign_id(out: &Path) -> Result<CampaignId> {
@@ -972,19 +912,9 @@ fn run_launcher(args: Args) {
         CandidateSpool::create(spool_dir(&args.out))
     }
     .unwrap_or_else(|e| die(&format!("spool: {e:#}")));
-
-    if args.join {
-        let store = achlys_core::CampaignStore::open(artifacts_dir(&args.out), campaign_id)
-            .unwrap_or_else(|e| die(&format!("open store: {e:#}")));
-        let auth = CorpusAuthority::reconstruct(store, achlys_core::DEFAULT_PENDING_BOUND)
-            .unwrap_or_else(|e| die(&format!("reconstruct: {e:#}")));
-        let snap = auth
-            .snapshot_admitted_bytes()
-            .unwrap_or_else(|e| die(&format!("snapshot: {e:#}")));
-        spool
-            .export_admitted_snapshot(&spool.root().join("snapshot"), &snap)
-            .unwrap_or_else(|e| die(&format!("export snapshot: {e:#}")));
-    }
+    spool
+        .clear_stop()
+        .unwrap_or_else(|e| die(&format!("clear STOP: {e:#}")));
 
     if canonical.path != default_bin {
         fs::create_dir_all(&canonical_dir)
@@ -1007,8 +937,24 @@ fn run_launcher(args: Args) {
     let folded = {
         let store = achlys_core::CampaignStore::open(artifacts_dir(&args.out), campaign_id)
             .unwrap_or_else(|e| die(&format!("open store: {e:#}")));
+        let mut auth = CorpusAuthority::reconstruct(store, args.pending_bound)
+            .unwrap_or_else(|e| die(&format!("reconstruct: {e:#}")));
+        let mut oracle = DumpOracle::new(&default_bin, canonical.identity.build_id)
+            .unwrap_or_else(|e| die(&format!("recovery oracle: {e:#}")));
+        auth.warm_oracle(&mut oracle)
+            .unwrap_or_else(|e| die(&format!("warm recovery oracle: {e:#}")));
+        auth.recover_from_spool(&spool, &mut oracle, fast.build_id)
+            .unwrap_or_else(|e| die(&format!("recover spool: {e:#}")));
+        if args.join {
+            let snap = auth
+                .snapshot_admitted_bytes()
+                .unwrap_or_else(|e| die(&format!("snapshot: {e:#}")));
+            spool
+                .export_admitted_snapshot(&spool.root().join("snapshot"), &snap)
+                .unwrap_or_else(|e| die(&format!("export snapshot: {e:#}")));
+        }
         reconstruct_events(
-            store
+            auth.store()
                 .read_events()
                 .unwrap_or_else(|e| die(&format!("read events: {e:#}"))),
         )
