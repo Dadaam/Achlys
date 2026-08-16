@@ -66,17 +66,18 @@ impl CandidateSpool {
             bail!("refusing to spool empty input");
         }
         let id = InputId::from_bytes(bytes);
-        let bin = self.inbox_dir().join(id.to_hex());
-        if !bin.is_file() {
-            write_atomic(&bin, bytes)?;
-        }
         let mut meta = meta.clone();
         meta.input_id = id;
         let json = serde_json::to_vec_pretty(&meta).context("serialize spool metadata")?;
+        // Metadata first so a visible object file is never unpaired.
         write_atomic(
             &self.inbox_dir().join(format!("{}.json", id.to_hex())),
             &json,
         )?;
+        let bin = self.inbox_dir().join(id.to_hex());
+        if !bin.is_file() {
+            write_atomic(&bin, bytes)?;
+        }
         Ok(id)
     }
 
@@ -289,14 +290,15 @@ fn take_from_dir(
         if !src_bin.is_file() {
             continue;
         }
+        if !src_meta.is_file() {
+            // Writer has not finished the pair yet.
+            continue;
+        }
         let bytes = fs::read(&src_bin).with_context(|| format!("read {}", src_bin.display()))?;
-        let meta = if src_meta.is_file() {
-            let text = fs::read_to_string(&src_meta)
-                .with_context(|| format!("read {}", src_meta.display()))?;
-            serde_json::from_str(&text).with_context(|| format!("parse {}", src_meta.display()))?
-        } else {
-            bail!("missing metadata for spool object {hex}");
-        };
+        let text = fs::read_to_string(&src_meta)
+            .with_context(|| format!("read {}", src_meta.display()))?;
+        let meta =
+            serde_json::from_str(&text).with_context(|| format!("parse {}", src_meta.display()))?;
         if src != dest {
             let dest_bin = dest.join(&hex);
             let dest_meta = dest.join(format!("{hex}.json"));

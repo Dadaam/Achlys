@@ -21,6 +21,9 @@ campaigns/
 # Runtime working directory (corpus, logs, queues, hangs)
 /runtime
 
+# LibAFL macOS shared-memory server socket (cwd-relative).
+/libafl_unix_shmem_server
+
 # ONNX runtime / model artifacts (do not ignore vendored C sources)
 *.onnx
 

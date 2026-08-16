@@ -99,7 +99,7 @@ impl WorkerTarget {
             "micro-nonzero-exit" => Ok(Self::MicroNonzeroExit),
             "micro-coverage-stable" => Ok(Self::MicroCoverageStable),
             other => {
-                bail!("unsupported T1 worker target {other:?}; refusing to run a different harness")
+                bail!("unsupported worker target {other:?}; refusing to run a different harness")
             }
         }
     }

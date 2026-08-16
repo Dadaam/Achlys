@@ -213,3 +213,14 @@ A 2-worker campaign can share local novelty over LLMP, persist a
 content-addressed corpus with worker provenance, admit through one
 canonical dump, survive authority restart, and reconstruct its
 totals from JSONL. Scaling remains unclaimed.
+
+## Implementation status (not an accept)
+
+On this branch, `achlys_t2` + `CorpusAuthority` + `CandidateSpool` exist.
+`T2_FUNCTIONAL=1 ./scripts/experiments/t2_smoke.sh` is green on macOS
+aarch64 (2 workers, 40 iters, reconstruct, `--join` union restore,
+occupied-root reject). H0 functional (150 identical hashes) and T1
+semantic smoke still pass.
+
+That is mechanism evidence. It is not the Linux 1/2/4/8 multi-trial
+ladder and does not close T2.

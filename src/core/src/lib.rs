@@ -15,6 +15,7 @@ pub mod feedback;
 pub mod plateau;
 pub mod spool;
 pub mod store;
+pub mod worker;
 
 pub use admission::{
     AdmitOracle, CorpusAuthority, DEFAULT_PENDING_BOUND, DrainStats, PendingCandidate,
@@ -33,3 +34,4 @@ pub use feedback::PlateauAwareFeedback;
 pub use plateau::{PlateauDetector, SharedPlateauDetector, shared_detector};
 pub use spool::{CandidateSpool, WorkerRegistration};
 pub use store::{CampaignStore, CanonicalReport};
+pub use worker::{list_corpus_files, run_homogeneous_simple, scan_new_inputs};

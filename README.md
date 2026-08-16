@@ -13,6 +13,7 @@ The design source of truth is [`docs/MASTER_PLAN.md`](docs/MASTER_PLAN.md). If t
 - **Seeds and crashes.** `--corpus` loads seed files into an in-memory queue. Crash-triggering inputs are written to `--output` (default `./crashes`). The working corpus is **not** written back to disk.
 - **TUI.** A ratatui monitor is the default display. Use `--no-tui` for plain text.
 - **In-process graybox exists for H0/T1, not for the CLI.** `FuzzerBuilder::run_substrate` plus `examples/fuzzers/achlys_h0.rs` and `examples/fuzzers/libafl_baseline.rs` run the same LibAFL havoc loop on vendored cJSON. `examples/fuzzers/achlys_t1.rs` loads a target manifest, persists a content-addressed campaign, and replays coverage with `achlys_oracle`. `achlys fuzz` remains blackbox fork+exec.
+- **T2 homogeneous multi-worker is implementation-open, not accepted.** Decision: [`docs/decisions/2026-08-16-t2-homogeneous.md`](docs/decisions/2026-08-16-t2-homogeneous.md). `scripts/experiments/t2_smoke.sh` is a functional gate. `scripts/experiments/t2_scale.sh` defines the Linux ladder; it does not print a pass token and does not claim LLMP scaling. macOS is smoke. Evidence slot: [`docs/evidence/t2/`](docs/evidence/t2/) (no measured results yet).
 
 ## What does not work
 
@@ -70,12 +71,12 @@ cargo run -p achlys-cli --release -- fuzz ./parser @@ --corpus seeds/ --no-ai
 
 ## Limitations
 
-- Success ladder **Level 0**. T1 is accepted as **baseline infrastructure**, not as a public AFL++ comparison: [`docs/decisions/2026-08-16-t1-baseline-accepted.md`](docs/decisions/2026-08-16-t1-baseline-accepted.md), smoke artifacts in [`docs/evidence/t1/`](docs/evidence/t1/). H0 development evidence: [`docs/decisions/2026-08-16-h0-substrate.md`](docs/decisions/2026-08-16-h0-substrate.md), [`docs/evidence/h0/`](docs/evidence/h0/). Re-run on Linux x86-64 before quoting a number. `t1_compare.sh` is pipeline smoke; its AFL++/LibAFL/Achlys figures are not publishable. Tranche 2 (LLMP, multi-worker) is closed until a Linux multi-trial ladder is defined and executed. No “hard branch” claims.
+- Success ladder **Level 0**. T1 is accepted as **baseline infrastructure**, not as a public AFL++ comparison: [`docs/decisions/2026-08-16-t1-baseline-accepted.md`](docs/decisions/2026-08-16-t1-baseline-accepted.md), smoke artifacts in [`docs/evidence/t1/`](docs/evidence/t1/). H0 development evidence: [`docs/decisions/2026-08-16-h0-substrate.md`](docs/decisions/2026-08-16-h0-substrate.md), [`docs/evidence/h0/`](docs/evidence/h0/). Re-run on Linux x86-64 before quoting a number. `t1_compare.sh` is pipeline smoke; its AFL++/LibAFL/Achlys figures are not publishable. Tranche 2 implementation is **open** ([`docs/decisions/2026-08-16-t2-homogeneous.md`](docs/decisions/2026-08-16-t2-homogeneous.md)); T2 is **not accepted**. There is no LLMP scaling claim. The Linux 1/2/4/8 ladder is defined by `scripts/experiments/t2_scale.sh` and is not executed on macOS. No “hard branch” claims.
 - CLI campaigns have no coverage map. Blackbox admission uses `ConstFeedback(false)` (seeds + crashes only).
 - Spawn, write, and wait failures are `InfraError` and abort the campaign. They are not target crashes.
 - Sanitizer replay and crash dedup exist **off** the hot path (`SanitizerReplayer`). They are not wired into `achlys fuzz`.
 - Micro-target workers in `achlys_t1` use a **synthetic** local coverage map. Canonical edges come from a separately compiled SanCov dump. Do not treat those worker maps as real SanCov.
-- No forkserver, LLMP, multi-worker campaign, or adaptive allocation.
+- No forkserver. Homogeneous LLMP multi-worker (`achlys_t2`) is implementation-open, not accepted; do not claim scaling. No adaptive allocation. AFL++ remains smoke-only.
 - ML crates (`achlys-cortex`, `AiMutator`, `HybridStage`, `AutoTrainer`) are experimental leftovers, not the research baseline.
 
 ## Design

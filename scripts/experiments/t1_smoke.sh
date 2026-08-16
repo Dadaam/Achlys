@@ -35,7 +35,7 @@ if [[ "$unsupported_rc" -eq 0 ]]; then
   echo "T1_TARGET=FAIL reason=unsupported-manifest-ran" >&2
   exit 1
 fi
-if ! grep -q "unsupported T1 worker target" "$out/unsupported.log"; then
+if ! grep -q "unsupported worker target" "$out/unsupported.log"; then
   echo "T1_TARGET=FAIL reason=missing-unsupported-error" >&2
   cat "$out/unsupported.log" >&2
   exit 1

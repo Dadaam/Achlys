@@ -43,6 +43,10 @@ path = "examples/fuzzers/achlys_oracle.rs"
 name = "achlys_t1"
 path = "examples/fuzzers/achlys_t1.rs"
 
+[[example]]
+name = "achlys_t2"
+path = "examples/fuzzers/achlys_t2.rs"
+
 [workspace]
 members = [
     "src/protocol",

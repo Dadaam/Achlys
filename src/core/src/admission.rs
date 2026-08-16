@@ -111,6 +111,7 @@ impl CorpusAuthority {
         auth.rejected = folded.rejected.iter().copied().collect();
         auth.seen.extend(auth.admitted.iter().copied());
         auth.seen.extend(auth.rejected.iter().copied());
+        auth.replayed = auth.admitted.len().saturating_add(auth.rejected.len());
         auth.next_delta_seq = folded.last_delta_seq.saturating_add(1);
         for id in auth.store.list_inputs()? {
             auth.seen.insert(id);
@@ -147,6 +148,16 @@ impl CorpusAuthority {
         let mut ids: Vec<_> = self.admitted.iter().copied().collect();
         ids.sort_unstable();
         ids
+    }
+
+    /// Replay already-admitted objects into `oracle` so a restarted
+    /// authority keeps the same union. Does not write events.
+    pub fn warm_oracle<O: AdmitOracle>(&self, oracle: &mut O) -> Result<()> {
+        for id in self.admitted_ids() {
+            let bytes = self.store.get_input(&id)?;
+            let _ = oracle.replay(&bytes)?;
+        }
+        Ok(())
     }
 
     pub fn snapshot_admitted_bytes(&self) -> Result<Vec<(InputId, Vec<u8>)>> {
@@ -244,7 +255,11 @@ impl CorpusAuthority {
         Ok(stats)
     }
 
-    pub fn write_canonical_report<O: AdmitOracle>(&self, oracle: &O) -> Result<CanonicalReport> {
+    pub fn write_canonical_report<O: AdmitOracle>(
+        &self,
+        oracle: &O,
+        artifact_hash: Option<String>,
+    ) -> Result<CanonicalReport> {
         let report = CanonicalReport {
             digest: oracle.digest(),
             edge_count: oracle.edge_count(),
@@ -252,7 +267,7 @@ impl CorpusAuthority {
             rejected: self.rejected.len(),
             replayed: self.replayed,
             canonical_build: oracle.build_id(),
-            artifact_hash: None,
+            artifact_hash,
         };
         self.store.write_canonical_report(&report)?;
         Ok(report)
@@ -535,6 +550,9 @@ mod tests {
         assert_eq!(restored.admitted_ids(), admitted);
         assert_eq!(restored.pending_len(), 0);
         assert_eq!(auth_worker_count(&restored), 1);
+        let mut oracle2 = FakeOracle::new();
+        restored.warm_oracle(&mut oracle2).unwrap();
+        assert_eq!(oracle2.edge_count(), oracle.edge_count());
     }
 
     fn auth_worker_count(auth: &CorpusAuthority) -> usize {

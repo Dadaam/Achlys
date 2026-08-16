@@ -33,3 +33,6 @@ jobs:
 
       - name: T1 manifest campaign smoke
         run: T1_FUNCTIONAL=1 ./scripts/experiments/t1_smoke.sh
+
+      - name: T2 homogeneous smoke
+        run: T2_FUNCTIONAL=1 ./scripts/experiments/t2_smoke.sh

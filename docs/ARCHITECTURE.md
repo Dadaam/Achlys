@@ -6,7 +6,7 @@ The target architecture, hypotheses (H0–H5), non-goals, and build order live i
 
 Achlys is not a 4-stage product that escalates havoc → AI → symbolic execution. That framing is not implemented and is not the research direction.
 
-Status: **Level 0** (buildable prototype). Tranche 1 baseline infrastructure is accepted; Tranche 2 is closed. Public positioning until evidence exists:
+Status: **Level 0** (buildable prototype). Tranche 1 baseline infrastructure is accepted. Tranche 2 homogeneous implementation is **open** ([`decisions/2026-08-16-t2-homogeneous.md`](decisions/2026-08-16-t2-homogeneous.md)) and is **not accepted**. There is no LLMP scaling claim. AFL++ remains smoke-only (`t1_compare.sh`). Public positioning until evidence exists:
 
 > Achlys is an experimental cooperative fuzzing system built on LibAFL. It investigates whether typed cross-strategy assistance and cost-aware worker allocation can improve coverage and hard-branch discovery under equal resource budgets.
 
@@ -31,11 +31,11 @@ Achlys/
 |---|---|
 | **achlys-protocol** | Target manifests, `BuildIdentity`, content-addressed `InputId`, campaign JSONL events. No LibAFL. |
 | **achlys-cli** | Parses flags, always constructs `ForkExecTarget`, runs `FuzzerBuilder`, optional ratatui TUI. `--source` is rejected. |
-| **achlys-core** | `FuzzerBuilder` wraps LibAFL havoc. `run()` is the CLI path (blackbox). `run_substrate()` is the H0/T1 in-process graybox worker. `CampaignStore` / `CampaignSession` write post-campaign artifacts. |
+| **achlys-core** | `FuzzerBuilder` wraps LibAFL havoc. `run()` is the CLI path (blackbox). `run_substrate()` is the H0/T1 in-process graybox worker. `CorpusAuthority` / `CandidateSpool` are the T2 control plane (not on the hot path). `CampaignStore` / `CampaignSession` write campaign artifacts. |
 | **achlys-bridge** | `ForkExecTarget` (CLI): spawn binary, stdin or `@@`. `InProcessTarget` used by H0/T1. `DumpOracle` replays a separately compiled canonical dump binary. `SanitizerReplayer` verifies crashes off the hot path. |
 | **achlys-cortex** | ONNX load, `AutoTrainer`, `HotSwapCortex`. Experimental. Not on the H0/T1 path. |
 
-There is no QEMU backend, no network target, no symbolic engine, no orchestrator, and no multi-worker control plane. Canonical replay and sanitizer verification run **after** a worker campaign, not once per execution.
+There is no QEMU backend, no network target, no symbolic engine, and no adaptive orchestrator. Homogeneous multi-worker / LLMP (`achlys_t2`) is implementation-open and not accepted; published scaling is not claimed. Canonical replay and sanitizer verification are not on the per-execution hot path.
 
 Micro-target **worker** coverage in `achlys_t1` is a synthetic local map (first input byte + nonzero return). Published edges come only from the compiled SanCov dump. That is an infrastructure test, not a representative SanCov worker.
 
@@ -94,6 +94,7 @@ These types exist. They are not a working product surface:
 | `libafl_baseline` / `achlys_h0` | H0 paired workers. Same LibAFL loop; Achlys adds `Target`. |
 | `achlys_oracle` | Independent canonical replay of a corpus directory. Does not fuzz. |
 | `achlys_t1` | Manifest → substrate → content-addressed store → canonical replay → optional sanitizer verify. |
+| `achlys_t2` | Homogeneous multi-worker example. Implementation open; not a T2 accept; no scaling claim. |
 
 Root `build.rs` compiles vendored `cJSON.c` twice (plain and SanCov) plus `benchmarks/micro/crash_if_magic.c`. A clean clone builds.
 
