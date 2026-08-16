@@ -15,7 +15,7 @@ pub mod plateau;
 pub use ai_mutator::AiMutator;
 pub use ai_stage::HybridStage;
 pub use builder::FuzzerBuilder;
-pub use config::FuzzerConfig;
+pub use config::{FuzzerConfig, SubstrateReport};
 pub use cortex_interface::CortexInterface;
 pub use escalation::{
     EscalatingStage, EscalationManager, FuzzStage, SharedLogSink, shared_log_sink,

@@ -10,6 +10,10 @@ libafl_bolts = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
 
+[dev-dependencies]
+achlys-core = { path = "src/core" }
+achlys-bridge = { path = "src/bridge" }
+
 [build-dependencies]
 cc = { workspace = true }
 
@@ -20,6 +24,14 @@ path = "examples/fuzzers/cjson_blackbox_fuzzer.rs"
 [[example]]
 name = "cjson_graybox"
 path = "examples/fuzzers/cjson_graybox_fuzzer.rs"
+
+[[example]]
+name = "libafl_baseline"
+path = "examples/fuzzers/libafl_baseline.rs"
+
+[[example]]
+name = "achlys_h0"
+path = "examples/fuzzers/achlys_h0.rs"
 
 [workspace]
 members = [
