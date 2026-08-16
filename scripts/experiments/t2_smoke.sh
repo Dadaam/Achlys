@@ -162,6 +162,21 @@ if len(set(object_hashes)) != len(set(stored)):
         f"unique corpus objects {len(set(object_hashes))} != distinct InputStored {len(set(stored))}"
     )
 
+worker_seqs = {}
+for raw in open(events_p, encoding="utf-8"):
+    raw = raw.strip()
+    if not raw:
+        continue
+    ev = json.loads(raw)
+    wid = ev.get("worker_id")
+    seq = ev.get("sender_seq")
+    if wid is None or seq is None:
+        continue
+    worker_seqs.setdefault(wid, []).append(int(seq))
+for wid, seqs in worker_seqs.items():
+    if len(seqs) != len(set(seqs)):
+        raise SystemExit(f"reused sender_seq for worker {wid}: {seqs}")
+
 admitted_set = {i for i in admitted_ids if i}
 canon_admitted = as_int(canon, "admitted")
 if canon_admitted is None:
@@ -238,6 +253,7 @@ for raw in open(events_p, encoding="utf-8"):
         seq_by_worker.setdefault(ev.get("worker_id"), []).append(ev.get("sender_seq"))
     elif typ == "candidate_discovered":
         worker_keys.append((typ, ev.get("worker_id"), ev.get("sender_seq")))
+        seq_by_worker.setdefault(ev.get("worker_id"), []).append(ev.get("sender_seq"))
     elif typ == "input_stored":
         stored.append(ev.get("input_id"))
     elif typ == "canonical_admitted":
@@ -251,9 +267,9 @@ if left < 1:
 if len(worker_keys) != len(set(worker_keys)):
     raise SystemExit("duplicate (type, worker_id, sender_seq) after --join")
 for wid, seqs in seq_by_worker.items():
-    nums = [s for s in seqs if isinstance(s, int)]
-    if nums != sorted(nums):
-        raise SystemExit(f"sender_seq not nondecreasing for {wid}: {nums}")
+    nums = [int(s) for s in seqs if s is not None]
+    if len(nums) != len(set(nums)):
+        raise SystemExit(f"reused sender_seq for worker {wid}: {nums}")
 if len(stored) != len(set(stored)):
     raise SystemExit("post-join InputStored ids are not unique")
 if "admitted" not in canon:
@@ -378,5 +394,127 @@ if [[ -f "$tamper" ]]; then
   fi
   echo "T2_CANONICAL_HASH=OK"
 fi
+
+micro_dir="$out/micro-canonical"
+rm -rf "$micro_dir"
+./target/release/examples/achlys_oracle \
+  --manifest benchmarks/manifests/micro-nonzero-exit.toml \
+  --compile-out "$micro_dir" \
+  >"$out/micro-compile.log" 2>&1
+set +e
+"$t2_bin" \
+  --manifest benchmarks/manifests/cjson-parse.toml \
+  --label t2-wrong-oracle \
+  --seed 1 \
+  --iters 2 \
+  --workers 1 \
+  --broker-port 17365 \
+  --corpus "$out/seeds" \
+  --canonical-dir "$micro_dir" \
+  --out "$out/wrong-oracle" \
+  >"$out/wrong-oracle.log" 2>&1
+wrong_rc=$?
+set -e
+if [[ "$wrong_rc" -eq 0 ]]; then
+  echo "T2_CANONICAL_TARGET=FAIL reason=micro-dump-accepted-as-cjson" >&2
+  cat "$out/wrong-oracle.log" >&2
+  exit 1
+fi
+if ! grep -Eiq 'target_id|identity|canonical identity' "$out/wrong-oracle.log"; then
+  echo "T2_CANONICAL_TARGET=FAIL reason=missing-target-identity-error" >&2
+  cat "$out/wrong-oracle.log" >&2
+  exit 1
+fi
+echo "T2_CANONICAL_TARGET=OK"
+
+set +e
+"$t2_bin" \
+  --manifest benchmarks/manifests/cjson-parse.toml \
+  --label t2-naked-bin \
+  --seed 1 \
+  --iters 2 \
+  --workers 1 \
+  --broker-port 17366 \
+  --corpus "$out/seeds" \
+  --canonical-bin "$micro_dir/canonical" \
+  --out "$out/naked-bin" \
+  >"$out/naked-bin.log" 2>&1
+naked_rc=$?
+set -e
+# sibling identity.json exists for the micro dump, so this must still fail on target_id
+if [[ "$naked_rc" -eq 0 ]]; then
+  echo "T2_CANONICAL_NAKED=FAIL reason=micro-identity-accepted-as-cjson" >&2
+  cat "$out/naked-bin.log" >&2
+  exit 1
+fi
+echo "T2_CANONICAL_NAKED=OK"
+
+orphan="$out/orphan-dump"
+mkdir -p "$orphan"
+cp "$micro_dir/canonical" "$orphan/canonical"
+set +e
+"$t2_bin" \
+  --manifest benchmarks/manifests/cjson-parse.toml \
+  --label t2-orphan \
+  --seed 1 \
+  --iters 2 \
+  --workers 1 \
+  --broker-port 17368 \
+  --corpus "$out/seeds" \
+  --canonical-bin "$orphan/canonical" \
+  --out "$out/orphan" \
+  >"$out/orphan.log" 2>&1
+orphan_rc=$?
+set -e
+if [[ "$orphan_rc" -eq 0 ]]; then
+  echo "T2_CANONICAL_ORPHAN=FAIL reason=bin-without-identity-accepted" >&2
+  cat "$out/orphan.log" >&2
+  exit 1
+fi
+if ! grep -Eiq 'identity.json missing|refusing to invent' "$out/orphan.log"; then
+  echo "T2_CANONICAL_ORPHAN=FAIL reason=missing-identity-required-error" >&2
+  cat "$out/orphan.log" >&2
+  exit 1
+fi
+echo "T2_CANONICAL_ORPHAN=OK"
+
+qfull_out="$out/qfull"
+rm -rf "$qfull_out"
+set +e
+"$t2_bin" \
+  --manifest benchmarks/manifests/cjson-parse.toml \
+  --label t2-qfull \
+  --seed 7 \
+  --iters 40 \
+  --workers 1 \
+  --pending-bound 1 \
+  --broker-port 17367 \
+  --corpus "$out/seeds" \
+  --out "$qfull_out" \
+  >"$out/qfull.log" 2>&1
+qfull_rc=$?
+set -e
+if [[ "$qfull_rc" -ne 0 ]]; then
+  echo "T2_QUEUE_FULL=FAIL reason=pending-bound-campaign-failed" >&2
+  cat "$out/qfull.log" >&2
+  exit 1
+fi
+python3 - "$qfull_out/artifacts/metrics/admission.json" "$out/qfull.log" <<'PY'
+import json, sys
+adm = json.loads(open(sys.argv[1], encoding="utf-8").read())
+for key in ("inbox", "processing", "overflow", "pending"):
+    if int(adm.get(key, 1)) != 0:
+        raise SystemExit(f"{key}={adm.get(key)} want 0")
+if int(adm.get("queue_full", 0)) < 1:
+    raise SystemExit(f"queue_full={adm.get('queue_full')} want >= 1")
+text = open(sys.argv[2], encoding="utf-8", errors="replace").read()
+line = [ln for ln in text.splitlines() if "T2_RESULT" in ln][-1]
+kv = dict(part.split("=", 1) for part in line.split("T2_RESULT", 1)[1].split() if "=" in part)
+if int(kv.get("queue_full", "0")) < 1:
+    raise SystemExit(f"T2_RESULT queue_full={kv.get('queue_full')}")
+if int(kv["objects"]) != int(kv["replayed"]):
+    raise SystemExit("qfull objects != replayed")
+print("T2_QUEUE_FULL=OK")
+PY
 
 echo "T2_FUNCTIONAL=OK"

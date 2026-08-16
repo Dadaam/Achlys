@@ -145,7 +145,7 @@ for trial in $(seq 1 "$TRIALS"); do
       --workers "$workers" \
       --broker-port "$port" \
       --corpus "$SEED_DIR" \
-      --canonical-bin "$dump" \
+      --canonical-dir "$trial_canon" \
       --out "$cell" >"$log" 2>&1
     rc=$?
     set -e

@@ -107,6 +107,7 @@ struct Args {
     join: bool,
     role: Role,
     canonical_bin: Option<PathBuf>,
+    canonical_dir: Option<PathBuf>,
     pending_bound: usize,
 }
 
@@ -124,6 +125,7 @@ fn parse_args() -> Args {
     let mut join = false;
     let mut role = Role::Launcher;
     let mut canonical_bin = None;
+    let mut canonical_dir = None;
     let mut pending_bound = achlys_core::DEFAULT_PENDING_BOUND;
 
     let mut args = env::args().skip(1);
@@ -169,6 +171,7 @@ fn parse_args() -> Args {
             }
             "--join" => join = true,
             "--canonical-bin" => canonical_bin = Some(PathBuf::from(need("--canonical-bin"))),
+            "--canonical-dir" => canonical_dir = Some(PathBuf::from(need("--canonical-dir"))),
             "--pending-bound" => {
                 pending_bound = need("--pending-bound")
                     .parse()
@@ -201,6 +204,9 @@ fn parse_args() -> Args {
     if role == Role::Launcher && iters.is_none() && seconds.is_none() {
         seconds = Some(DEFAULT_SECONDS);
     }
+    if canonical_bin.is_some() && canonical_dir.is_some() {
+        die("--canonical-bin and --canonical-dir are mutually exclusive");
+    }
 
     Args {
         seed,
@@ -216,6 +222,7 @@ fn parse_args() -> Args {
         join,
         role,
         canonical_bin,
+        canonical_dir,
         pending_bound,
     }
 }
@@ -224,8 +231,9 @@ fn print_help() {
     eprintln!(
         "achlys_t2 --manifest PATH --out DIR --workers N [--seed N] \
          [--iters N | --seconds N] [--cores LIST] [--broker-port P] \
-         [--corpus DIR] [--label NAME] [--canonical-bin PATH] \
-         [--pending-bound N] [--join] [--role launcher|admit]\n\
+         [--corpus DIR] [--label NAME] [--canonical-dir DIR] \
+         [--canonical-bin PATH] [--pending-bound N] [--join] [--role launcher|admit]\n\
+         --canonical-dir must contain canonical + identity.json compiled for this target.\n\
          --join is offline continuation of a stopped campaign, not a live late join."
     );
 }
@@ -414,10 +422,25 @@ fn run_admit(out: &Path) -> Result<()> {
         }
         None => anyhow::bail!("campaign canonical_build missing artifact_hash"),
     }
+    let id_path = out.join("builds").join("canonical").join("identity.json");
+    if id_path.is_file() {
+        let stored = load_identity_json(&id_path)?;
+        if stored.target_id.as_str() != record.target_id {
+            anyhow::bail!(
+                "identity.json target_id {} != campaign {}",
+                stored.target_id,
+                record.target_id
+            );
+        }
+        if stored.build_id != canonical.build_id {
+            anyhow::bail!("identity.json build_id does not match campaign.json");
+        }
+    } else {
+        anyhow::bail!("canonical identity.json missing at {}", id_path.display());
+    }
     let mut oracle = DumpOracle::new(&bin, canonical.build_id)?;
 
     auth.warm_oracle(&mut oracle)?;
-    ingest_batch(&mut auth, &spool, spool.take_processing(256)?)?;
     let mut idle = 0u32;
     loop {
         admit_once(&mut auth, &spool, &record, &mut oracle)?;
@@ -448,7 +471,11 @@ fn run_admit(out: &Path) -> Result<()> {
             break;
         }
     }
-    if spool.inbox_len() != 0 || spool.processing_len() != 0 || auth.pending_len() != 0 {
+    if spool.inbox_len() != 0
+        || spool.processing_len() != 0
+        || spool.overflow_len() != 0
+        || auth.pending_len() != 0
+    {
         anyhow::bail!(
             "admit shutdown incomplete: inbox={} processing={} overflow={} pending={}",
             spool.inbox_len(),
@@ -507,11 +534,13 @@ fn admit_once(
         auth.note_left(exit.worker_id, exit.sender_seq, &exit.reason)?;
         progress = true;
     }
+    let processing = spool.take_processing(64)?;
     let inbox = spool.take_inbox(64)?;
     let overflow = spool.take_overflow(64)?;
-    if !inbox.is_empty() || !overflow.is_empty() {
+    if !processing.is_empty() || !inbox.is_empty() || !overflow.is_empty() {
         progress = true;
     }
+    ingest_batch(auth, spool, processing)?;
     ingest_batch(auth, spool, inbox)?;
     ingest_batch(auth, spool, overflow)?;
     let stats = auth.drain(oracle, 64)?;
@@ -643,36 +672,87 @@ fn verify_canonical_file(bin: &Path, identity: &BuildIdentity) {
     }
 }
 
-fn load_or_pin_canonical(
+fn load_identity_json(path: &Path) -> Result<BuildIdentity> {
+    let text =
+        fs::read_to_string(path).with_context(|| format!("read identity {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parse identity {}", path.display()))
+}
+
+fn write_identity_json(path: &Path, identity: &BuildIdentity) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(identity)?)
+        .with_context(|| format!("write {}", path.display()))
+}
+
+fn assert_identity_matches_manifest(identity: &BuildIdentity, manifest: &TargetManifest) {
+    if identity.target_id.as_str() != manifest.target_id {
+        die(&format!(
+            "canonical identity target_id {} != manifest {}",
+            identity.target_id, manifest.target_id
+        ));
+    }
+    if identity.kind != BuildKind::Canonical {
+        die(&format!(
+            "canonical identity kind is {:?}, want Canonical",
+            identity.kind
+        ));
+    }
+    if identity.flags != manifest.builds.canonical.flags {
+        die("canonical identity flags do not match the requested manifest");
+    }
+}
+
+fn resolve_canonical_bundle(
     manifest: &TargetManifest,
-    workspace: &Path,
-    bin: &Path,
     existing: Option<&CampaignRecord>,
+    dir: Option<&Path>,
+    bin_arg: Option<&Path>,
 ) -> Result<achlys_bridge::CompiledArtifact> {
+    let (bin, id_path) = if let Some(dir) = dir {
+        (dir.join("canonical"), dir.join("identity.json"))
+    } else if let Some(bin) = bin_arg {
+        let parent = bin
+            .parent()
+            .ok_or_else(|| anyhow!("--canonical-bin has no parent directory: {}", bin.display()))?;
+        (bin.to_path_buf(), parent.join("identity.json"))
+    } else {
+        anyhow::bail!("internal: no canonical bundle");
+    };
     if !bin.is_file() {
-        anyhow::bail!("--canonical-bin is not a file: {}", bin.display());
+        anyhow::bail!("canonical dump missing: {}", bin.display());
     }
+    if !id_path.is_file() {
+        anyhow::bail!(
+            "canonical identity.json missing next to {} (refusing to invent identity from the requested manifest)",
+            bin.display()
+        );
+    }
+    let identity = load_identity_json(&id_path)?;
+    verify_canonical_file(&bin, &identity);
+    assert_identity_matches_manifest(&identity, manifest);
     if let Some(record) = existing {
-        let identity = record
-            .canonical_build
-            .clone()
-            .ok_or_else(|| anyhow!("--join campaign missing canonical_build"))?;
-        verify_canonical_file(bin, &identity);
-        return Ok(achlys_bridge::CompiledArtifact {
-            path: bin.to_path_buf(),
-            identity,
-        });
+        let Some(want) = &record.canonical_build else {
+            anyhow::bail!("--join campaign missing canonical_build");
+        };
+        if want.build_id != identity.build_id {
+            anyhow::bail!(
+                "pinned canonical build_id {} != campaign {}",
+                identity.build_id.to_hex(),
+                want.build_id.to_hex()
+            );
+        }
+        if want.target_id != identity.target_id {
+            anyhow::bail!(
+                "pinned canonical target_id {} != campaign {}",
+                identity.target_id,
+                want.target_id
+            );
+        }
     }
-    let identity = BuildIdentity::from_executed(
-        manifest,
-        BuildKind::Canonical,
-        workspace,
-        EXTRA_IDENTITY,
-        Some(bin),
-    )
-    .map_err(|e| anyhow!(e))?;
     Ok(achlys_bridge::CompiledArtifact {
-        path: bin.to_path_buf(),
+        path: bin,
         identity,
     })
 }
@@ -759,23 +839,44 @@ fn run_launcher(args: Args) {
         assert_join_compatible(record, &manifest, &fast, &args.out, &root);
     }
 
-    let canonical = if let Some(bin) = &args.canonical_bin {
-        load_or_pin_canonical(&manifest, &root, bin, existing_record.as_ref())
-            .unwrap_or_else(|e| die(&format!("canonical-bin: {e:#}")))
+    let canonical = if args.canonical_dir.is_some() || args.canonical_bin.is_some() {
+        resolve_canonical_bundle(
+            &manifest,
+            existing_record.as_ref(),
+            args.canonical_dir.as_deref(),
+            args.canonical_bin.as_deref(),
+        )
+        .unwrap_or_else(|e| die(&format!("canonical artifact: {e:#}")))
     } else if args.join && default_bin.is_file() {
         let record = existing_record.as_ref().expect("join record");
         let identity = record
             .canonical_build
             .clone()
             .unwrap_or_else(|| die("--join campaign missing canonical_build"));
+        let id_path = canonical_dir.join("identity.json");
+        if id_path.is_file() {
+            let on_disk = load_identity_json(&id_path)
+                .unwrap_or_else(|e| die(&format!("join identity.json: {e:#}")));
+            if on_disk.build_id != identity.build_id
+                || on_disk.target_id.as_str() != record.target_id
+            {
+                die("join identity.json does not match campaign.json");
+            }
+        }
         verify_canonical_file(&default_bin, &identity);
+        if identity.target_id.as_str() != manifest.target_id {
+            die("join canonical target_id does not match requested manifest");
+        }
         achlys_bridge::CompiledArtifact {
             path: default_bin.clone(),
             identity,
         }
     } else {
-        compile_canonical(&root, &manifest, &canonical_dir, EXTRA_IDENTITY)
-            .unwrap_or_else(|e| die(&format!("canonical compile: {e:#}")))
+        let art = compile_canonical(&root, &manifest, &canonical_dir, EXTRA_IDENTITY)
+            .unwrap_or_else(|e| die(&format!("canonical compile: {e:#}")));
+        write_identity_json(&canonical_dir.join("identity.json"), &art.identity)
+            .unwrap_or_else(|e| die(&format!("write identity.json: {e:#}")));
+        art
     };
 
     let (git, dirty, untracked) = fingerprint_git(&root);
@@ -852,6 +953,8 @@ fn run_launcher(args: Args) {
             verify_canonical_file(&default_bin, &canonical.identity);
         }
     }
+    write_identity_json(&canonical_dir.join("identity.json"), &canonical.identity)
+        .unwrap_or_else(|e| die(&format!("write campaign identity.json: {e:#}")));
 
     let folded = {
         let store = achlys_core::CampaignStore::open(artifacts_dir(&args.out), campaign_id)
@@ -1019,12 +1122,12 @@ fn run_launcher(args: Args) {
                     .map_err(|e| libafl::Error::unknown(e.to_string()))?,
             )
             .map_err(|e| libafl::Error::unknown(e.to_string()))?;
-            let last_seq = seq.saturating_sub(1);
+            let left_seq = seq;
             spool
                 .write_left(&WorkerExit {
                     worker_id,
                     slot,
-                    sender_seq: last_seq.max(resume.next_seq),
+                    sender_seq: left_seq,
                     reason: "budget".into(),
                 })
                 .map_err(|e| libafl::Error::unknown(e.to_string()))?;
@@ -1148,9 +1251,17 @@ fn run_launcher(args: Args) {
         .get("inbox")
         .and_then(|v| v.as_u64())
         .unwrap_or(u64::MAX);
-    if processing != 0 || inbox != 0 {
+    let overflow = admission
+        .get("overflow")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(u64::MAX);
+    let pending = admission
+        .get("pending")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(u64::MAX);
+    if processing != 0 || inbox != 0 || overflow != 0 || pending != 0 {
         die(&format!(
-            "admit left work behind: inbox={inbox} processing={processing}"
+            "admit left work behind: inbox={inbox} processing={processing} overflow={overflow} pending={pending}"
         ));
     }
     if objects as u64 != replayed {

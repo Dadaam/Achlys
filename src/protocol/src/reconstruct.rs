@@ -71,54 +71,44 @@ where
                 }
             }
             CampaignEvent::WorkerRegistered {
-                worker_id,
-                sender_seq,
+                envelope,
                 strategy,
                 slot,
                 ..
             } => {
                 {
-                    let rec = out.worker_mut(worker_id);
+                    let rec = out.worker_mut(envelope.worker_id);
                     rec.strategy = Some(strategy);
                     rec.slot = Some(slot);
                     rec.left = false;
                 }
-                out.note_seq(worker_id, sender_seq);
+                out.note_seq(envelope.worker_id, envelope.sender_seq);
             }
-            CampaignEvent::WorkerLeft {
-                worker_id,
-                sender_seq,
-                ..
-            } => {
-                out.worker_mut(worker_id).left = true;
-                out.note_seq(worker_id, sender_seq);
+            CampaignEvent::WorkerLeft { envelope, .. } => {
+                out.worker_mut(envelope.worker_id).left = true;
+                out.note_seq(envelope.worker_id, envelope.sender_seq);
             }
             CampaignEvent::WorkerRestarted {
-                worker_id,
-                sender_seq,
+                envelope,
                 previous_seq,
                 ..
             } => {
                 let already = out
                     .workers
-                    .get(&worker_id)
-                    .is_some_and(|rec| sender_seq <= rec.last_seq);
+                    .get(&envelope.worker_id)
+                    .is_some_and(|rec| envelope.sender_seq <= rec.last_seq);
                 if !already {
-                    let rec = out.worker_mut(worker_id);
+                    let rec = out.worker_mut(envelope.worker_id);
                     rec.left = false;
                     rec.restarts = rec.restarts.saturating_add(1);
                     if previous_seq > rec.last_seq {
                         rec.last_seq = previous_seq;
                     }
-                    out.note_seq(worker_id, sender_seq);
+                    out.note_seq(envelope.worker_id, envelope.sender_seq);
                 }
             }
-            CampaignEvent::CandidateDiscovered {
-                worker_id,
-                sender_seq,
-                ..
-            } => {
-                out.note_seq(worker_id, sender_seq);
+            CampaignEvent::CandidateDiscovered { envelope, .. } => {
+                out.note_seq(envelope.worker_id, envelope.sender_seq);
             }
             CampaignEvent::CorpusDelta { sequence, .. } => {
                 if sequence > out.last_delta_seq {
@@ -139,8 +129,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::CampaignEvent;
+    use crate::events::{CampaignEvent, EventEnvelope, WorkerEnvelope};
     use crate::ids::{BuildId, CampaignId, CoverageDigest};
+
+    fn wenv(worker: WorkerId, seq: u64) -> WorkerEnvelope {
+        WorkerEnvelope::new(
+            campaign(),
+            worker,
+            seq,
+            seq,
+            CampaignEvent::worker_dedup_key(worker, seq),
+        )
+    }
 
     fn campaign() -> CampaignId {
         CampaignId::from_label("recon")
@@ -154,28 +154,16 @@ mod tests {
         let b = InputId::from_bytes(b"b");
         let events = vec![
             CampaignEvent::WorkerRegistered {
-                schema_version: CampaignEvent::SCHEMA_VERSION,
-                campaign_id: campaign(),
-                worker_id: w0,
-                sender_seq: 0,
-                timestamp_monotonic_ns: 0,
-                dedup_key: CampaignEvent::worker_dedup_key(w0, 0),
+                envelope: wenv(w0, 0),
                 strategy: StrategyId::Havoc,
                 producer_build: BuildId([0; 32]),
-                protocol_version: CampaignEvent::PROTOCOL_VERSION,
                 slot: 0,
                 unix_ms: 0,
             },
             CampaignEvent::WorkerRegistered {
-                schema_version: CampaignEvent::SCHEMA_VERSION,
-                campaign_id: campaign(),
-                worker_id: w1,
-                sender_seq: 0,
-                timestamp_monotonic_ns: 0,
-                dedup_key: CampaignEvent::worker_dedup_key(w1, 0),
+                envelope: wenv(w1, 0),
                 strategy: StrategyId::Havoc,
                 producer_build: BuildId([0; 32]),
-                protocol_version: CampaignEvent::PROTOCOL_VERSION,
                 slot: 1,
                 unix_ms: 0,
             },
@@ -208,17 +196,13 @@ mod tests {
                 unix_ms: 3,
             },
             CampaignEvent::CorpusDelta {
-                campaign_id: campaign(),
+                envelope: EventEnvelope::new(campaign(), "delta:1"),
                 sequence: 1,
                 admitted: vec![a],
                 unix_ms: 4,
             },
             CampaignEvent::WorkerRestarted {
-                campaign_id: campaign(),
-                worker_id: w0,
-                sender_seq: 4,
-                timestamp_monotonic_ns: 5,
-                dedup_key: CampaignEvent::worker_dedup_key(w0, 4),
+                envelope: wenv(w0, 4),
                 previous_seq: 3,
                 unix_ms: 5,
             },
@@ -243,16 +227,12 @@ mod tests {
     fn duplicate_restart_and_delta_do_not_double_count() {
         let w0 = WorkerId::from_slot(0);
         let restart = CampaignEvent::WorkerRestarted {
-            campaign_id: campaign(),
-            worker_id: w0,
-            sender_seq: 4,
-            timestamp_monotonic_ns: 5,
-            dedup_key: CampaignEvent::worker_dedup_key(w0, 4),
+            envelope: wenv(w0, 4),
             previous_seq: 3,
             unix_ms: 5,
         };
         let delta = CampaignEvent::CorpusDelta {
-            campaign_id: campaign(),
+            envelope: EventEnvelope::new(campaign(), "delta:1"),
             sequence: 1,
             admitted: vec![InputId::from_bytes(b"a")],
             unix_ms: 4,
@@ -290,24 +270,14 @@ mod tests {
                 unix_ms: 3,
             },
             CampaignEvent::WorkerRegistered {
-                schema_version: CampaignEvent::SCHEMA_VERSION,
-                campaign_id: campaign(),
-                worker_id: w1,
-                sender_seq: 0,
-                timestamp_monotonic_ns: 0,
-                dedup_key: CampaignEvent::worker_dedup_key(w1, 0),
+                envelope: wenv(w1, 0),
                 strategy: StrategyId::Havoc,
                 producer_build: BuildId([0; 32]),
-                protocol_version: CampaignEvent::PROTOCOL_VERSION,
                 slot: 1,
                 unix_ms: 0,
             },
             CampaignEvent::WorkerRestarted {
-                campaign_id: campaign(),
-                worker_id: w0,
-                sender_seq: 4,
-                timestamp_monotonic_ns: 5,
-                dedup_key: CampaignEvent::worker_dedup_key(w0, 4),
+                envelope: wenv(w0, 4),
                 previous_seq: 3,
                 unix_ms: 5,
             },

@@ -3,6 +3,61 @@ use serde::{Deserialize, Serialize};
 use crate::identity::BuildIdentity;
 use crate::ids::{BuildId, CampaignId, CoverageDigest, InputId, StrategyId, WorkerId};
 
+/// Fields every T2 control/worker message must carry (Master Plan §11).
+/// Flattened onto variants so a new event cannot omit them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub schema_version: u32,
+    pub protocol_version: u32,
+    pub campaign_id: CampaignId,
+    pub dedup_key: String,
+}
+
+/// Worker-originated envelope: EventEnvelope plus sender identity and seq.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerEnvelope {
+    pub schema_version: u32,
+    pub protocol_version: u32,
+    pub campaign_id: CampaignId,
+    pub worker_id: WorkerId,
+    pub sender_seq: u64,
+    pub timestamp_monotonic_ns: u64,
+    pub dedup_key: String,
+}
+
+impl EventEnvelope {
+    #[must_use]
+    pub fn new(campaign_id: CampaignId, dedup_key: impl Into<String>) -> Self {
+        Self {
+            schema_version: CampaignEvent::SCHEMA_VERSION,
+            protocol_version: CampaignEvent::PROTOCOL_VERSION,
+            campaign_id,
+            dedup_key: dedup_key.into(),
+        }
+    }
+}
+
+impl WorkerEnvelope {
+    #[must_use]
+    pub fn new(
+        campaign_id: CampaignId,
+        worker_id: WorkerId,
+        sender_seq: u64,
+        timestamp_monotonic_ns: u64,
+        dedup_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema_version: CampaignEvent::SCHEMA_VERSION,
+            protocol_version: CampaignEvent::PROTOCOL_VERSION,
+            campaign_id,
+            worker_id,
+            sender_seq,
+            timestamp_monotonic_ns,
+            dedup_key: dedup_key.into(),
+        }
+    }
+}
+
 /// Provenance stored next to a content-addressed input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputMetadata {
@@ -115,42 +170,28 @@ pub enum CampaignEvent {
         unix_ms: u64,
     },
     WorkerRegistered {
-        schema_version: u32,
-        campaign_id: CampaignId,
-        worker_id: WorkerId,
-        sender_seq: u64,
-        timestamp_monotonic_ns: u64,
-        dedup_key: String,
+        #[serde(flatten)]
+        envelope: WorkerEnvelope,
         strategy: StrategyId,
         producer_build: BuildId,
-        protocol_version: u32,
         slot: u32,
         unix_ms: u64,
     },
     WorkerLeft {
-        campaign_id: CampaignId,
-        worker_id: WorkerId,
-        sender_seq: u64,
-        timestamp_monotonic_ns: u64,
-        dedup_key: String,
+        #[serde(flatten)]
+        envelope: WorkerEnvelope,
         reason: String,
         unix_ms: u64,
     },
     WorkerRestarted {
-        campaign_id: CampaignId,
-        worker_id: WorkerId,
-        sender_seq: u64,
-        timestamp_monotonic_ns: u64,
-        dedup_key: String,
+        #[serde(flatten)]
+        envelope: WorkerEnvelope,
         previous_seq: u64,
         unix_ms: u64,
     },
     CandidateDiscovered {
-        campaign_id: CampaignId,
-        worker_id: WorkerId,
-        sender_seq: u64,
-        timestamp_monotonic_ns: u64,
-        dedup_key: String,
+        #[serde(flatten)]
+        envelope: WorkerEnvelope,
         input_id: InputId,
         parent_ids: Vec<InputId>,
         producing_strategy: StrategyId,
@@ -162,7 +203,8 @@ pub enum CampaignEvent {
         unix_ms: u64,
     },
     CorpusDelta {
-        campaign_id: CampaignId,
+        #[serde(flatten)]
+        envelope: EventEnvelope,
         sequence: u64,
         admitted: Vec<InputId>,
         unix_ms: u64,
@@ -280,11 +322,13 @@ mod tests {
     #[test]
     fn candidate_discovered_jsonl_roundtrip() {
         let ev = CampaignEvent::CandidateDiscovered {
-            campaign_id: CampaignId::from_label("t2"),
-            worker_id: WorkerId::from_slot(0),
-            sender_seq: 3,
-            timestamp_monotonic_ns: 9,
-            dedup_key: CampaignEvent::input_dedup_key(InputId::from_bytes(b"x")),
+            envelope: WorkerEnvelope::new(
+                CampaignId::from_label("t2"),
+                WorkerId::from_slot(0),
+                3,
+                9,
+                CampaignEvent::input_dedup_key(InputId::from_bytes(b"x")),
+            ),
             input_id: InputId::from_bytes(b"x"),
             parent_ids: vec![],
             producing_strategy: StrategyId::Havoc,
@@ -295,7 +339,10 @@ mod tests {
             generation_ns: 3,
             unix_ms: 4,
         };
-        let parsed = CampaignEvent::from_jsonl(&ev.to_jsonl().unwrap()).unwrap();
+        let line = ev.to_jsonl().unwrap();
+        assert!(line.contains("\"schema_version\":1"));
+        assert!(line.contains("\"protocol_version\":1"));
+        let parsed = CampaignEvent::from_jsonl(&line).unwrap();
         assert_eq!(parsed, ev);
     }
 

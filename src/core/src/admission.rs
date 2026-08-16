@@ -10,8 +10,8 @@ use std::time::Instant;
 
 use achlys_bridge::{Admission, DumpOracle};
 use achlys_protocol::{
-    BuildId, CampaignEvent, CoverageDigest, InputId, InputMetadata, StrategyId, WorkerId,
-    reconstruct_events,
+    BuildId, CampaignEvent, CoverageDigest, EventEnvelope, InputId, InputMetadata, StrategyId,
+    WorkerEnvelope, WorkerId, reconstruct_events,
 };
 use anyhow::{Context, Result, anyhow};
 
@@ -260,7 +260,7 @@ impl CorpusAuthority {
             let sequence = self.next_delta_seq;
             self.next_delta_seq = self.next_delta_seq.saturating_add(1);
             self.store.append_event(&CampaignEvent::CorpusDelta {
-                campaign_id: self.store.campaign_id(),
+                envelope: EventEnvelope::new(self.store.campaign_id(), format!("delta:{sequence}")),
                 sequence,
                 admitted: batch.clone(),
                 unix_ms: now_unix_ms(),
@@ -298,15 +298,15 @@ impl CorpusAuthority {
         seq: u64,
     ) -> Result<()> {
         self.store.append_event(&CampaignEvent::WorkerRegistered {
-            schema_version: CampaignEvent::SCHEMA_VERSION,
-            campaign_id: self.store.campaign_id(),
-            worker_id,
-            sender_seq: seq,
-            timestamp_monotonic_ns: monotonic_ns(),
-            dedup_key: CampaignEvent::worker_dedup_key(worker_id, seq),
+            envelope: WorkerEnvelope::new(
+                self.store.campaign_id(),
+                worker_id,
+                seq,
+                monotonic_ns(),
+                CampaignEvent::worker_dedup_key(worker_id, seq),
+            ),
             strategy: StrategyId::Havoc,
             producer_build: build,
-            protocol_version: CampaignEvent::PROTOCOL_VERSION,
             slot,
             unix_ms: now_unix_ms(),
         })
@@ -314,11 +314,13 @@ impl CorpusAuthority {
 
     pub fn note_left(&mut self, worker_id: WorkerId, seq: u64, reason: &str) -> Result<()> {
         self.store.append_event(&CampaignEvent::WorkerLeft {
-            campaign_id: self.store.campaign_id(),
-            worker_id,
-            sender_seq: seq,
-            timestamp_monotonic_ns: monotonic_ns(),
-            dedup_key: CampaignEvent::worker_dedup_key(worker_id, seq),
+            envelope: WorkerEnvelope::new(
+                self.store.campaign_id(),
+                worker_id,
+                seq,
+                monotonic_ns(),
+                CampaignEvent::worker_dedup_key(worker_id, seq),
+            ),
             reason: reason.to_string(),
             unix_ms: now_unix_ms(),
         })
@@ -331,11 +333,13 @@ impl CorpusAuthority {
         previous_seq: u64,
     ) -> Result<()> {
         self.store.append_event(&CampaignEvent::WorkerRestarted {
-            campaign_id: self.store.campaign_id(),
-            worker_id,
-            sender_seq: seq,
-            timestamp_monotonic_ns: monotonic_ns(),
-            dedup_key: CampaignEvent::worker_dedup_key(worker_id, seq),
+            envelope: WorkerEnvelope::new(
+                self.store.campaign_id(),
+                worker_id,
+                seq,
+                monotonic_ns(),
+                CampaignEvent::worker_dedup_key(worker_id, seq),
+            ),
             previous_seq,
             unix_ms: now_unix_ms(),
         })
@@ -348,11 +352,13 @@ impl CorpusAuthority {
         let sender_seq = meta.producer_seq.unwrap_or(0);
         self.store
             .append_event(&CampaignEvent::CandidateDiscovered {
-                campaign_id: self.store.campaign_id(),
-                worker_id,
-                sender_seq,
-                timestamp_monotonic_ns: monotonic_ns(),
-                dedup_key: CampaignEvent::input_dedup_key(meta.input_id),
+                envelope: WorkerEnvelope::new(
+                    self.store.campaign_id(),
+                    worker_id,
+                    sender_seq,
+                    monotonic_ns(),
+                    CampaignEvent::input_dedup_key(meta.input_id),
+                ),
                 input_id: meta.input_id,
                 parent_ids: meta.parent_ids.clone(),
                 producing_strategy: meta.strategy.unwrap_or(StrategyId::Havoc),

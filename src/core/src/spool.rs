@@ -528,6 +528,32 @@ mod tests {
     }
 
     #[test]
+    fn processing_resume_drains_more_than_one_batch() {
+        let tmp = TempDir::new("spool_300");
+        let spool = CandidateSpool::create(tmp.0.join("spool")).unwrap();
+        let n = 300usize;
+        for i in 0..n {
+            let bytes = format!("seed-{i:04}").into_bytes();
+            spool.push(&bytes, &meta(&bytes)).unwrap();
+        }
+        assert_eq!(spool.take_inbox(n).unwrap().len(), n);
+        assert_eq!(spool.processing_len(), n);
+        let mut seen = 0usize;
+        loop {
+            let batch = spool.take_processing(64).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            for (id, _, _) in batch {
+                spool.ack_processed(&id).unwrap();
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, n);
+        assert_eq!(spool.processing_len(), 0);
+    }
+
+    #[test]
     fn deltas_are_ordered_and_filtered() {
         let tmp = TempDir::new("spool_delta");
         let spool = CandidateSpool::create(tmp.0.join("spool")).unwrap();

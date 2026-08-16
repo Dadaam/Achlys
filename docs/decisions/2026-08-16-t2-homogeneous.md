@@ -122,7 +122,7 @@ Example `achlys_t2` (not the product CLI):
 achlys_t2 --manifest PATH --out DIR --workers N
           [--seed N] [--iters N | --seconds N]
           [--cores LIST] [--broker-port P] [--corpus DIR]
-          [--label NAME] [--canonical-bin PATH] [--join] [--role launcher|admit]
+          [--label NAME] [--canonical-dir DIR] [--join] [--role launcher|admit]
 ```
 
 - Default role `launcher` creates a fresh `--out` (reuse forbidden

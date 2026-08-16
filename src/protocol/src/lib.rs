@@ -10,7 +10,10 @@ pub mod ids;
 pub mod manifest;
 pub mod reconstruct;
 
-pub use events::{CampaignEvent, CampaignRecord, CrashStats, InputMetadata, MetricsSnapshot};
+pub use events::{
+    CampaignEvent, CampaignRecord, CrashStats, EventEnvelope, InputMetadata, MetricsSnapshot,
+    WorkerEnvelope,
+};
 pub use identity::{BuildIdentity, BuildIdentityParts};
 pub use ids::{BuildId, CampaignId, CoverageDigest, InputId, StrategyId, TargetId, WorkerId};
 pub use manifest::{
