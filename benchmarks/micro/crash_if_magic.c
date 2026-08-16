@@ -16,6 +16,8 @@ int parse(const uint8_t *data, size_t size) {
     return achlys_micro_crash_if_magic(data, size);
 }
 
+#ifndef ACHLYS_NO_LIBFUZZER_ENTRY
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     return parse(data, size);
 }
+#endif

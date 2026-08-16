@@ -18,6 +18,7 @@ fn main() {
         .include(cjson_dir)
         .compiler("clang")
         .flag("-fsanitize-coverage=trace-pc-guard")
+        .flag("-DACHLYS_NO_LIBFUZZER_ENTRY")
         .opt_level(3)
         .compile("cjson_graybox");
 
@@ -30,6 +31,7 @@ fn main() {
     // In-process micro-target (no SanCov here: EDGES_MAP would clash with cjson_graybox).
     cc::Build::new()
         .file("benchmarks/micro/crash_if_magic.c")
+        .flag("-DACHLYS_NO_LIBFUZZER_ENTRY")
         .opt_level(3)
         .compile("micro_crash_if_magic");
 

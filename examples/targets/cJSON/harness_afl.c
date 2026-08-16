@@ -14,9 +14,11 @@
 
 int achlys_cjson_test_one_input(const uint8_t *data, size_t size);
 
+#ifndef ACHLYS_NO_LIBFUZZER_ENTRY
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     return achlys_cjson_test_one_input(data, size);
 }
+#endif
 
 int achlys_cjson_test_one_input(const uint8_t *data, size_t size) {
     char buf[ACHLYS_AFL_HARNESS_CAP];
