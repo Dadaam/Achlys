@@ -1,0 +1,5 @@
+T1_RESULT execs=3078 corpus=67 ingested=67 crashes=0 verified=0 replayed=67 admitted=31 rejected=36 edges=88 digest=724b50003519d97371e9f4e55a13c62bfe21cdf06e391e3a5e02e1d33df20097
+T1_FUNCTIONAL=OK
+H0_FUNCTIONAL_PASS 150 corpus hashes identical (seed=4242, iters=1000)
+T1_AFLPP=SKIP reason=afl-fuzz-not-found
+note=ingested == worker corpus_count == oracle replayed after skipping LibAFL .metadata sidecars

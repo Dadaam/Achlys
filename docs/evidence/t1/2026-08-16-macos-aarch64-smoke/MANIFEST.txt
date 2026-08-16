@@ -1,0 +1,9 @@
+date=2026-08-16T16:45:00Z
+git=4cbc4921e13d91bbc286dea7bc8c2d2ec9f935c0
+host=Darwin arm64
+rustc=rustc 1.97.1
+protocol=T1_FUNCTIONAL=1 --iters 50 --seed 4242
+manifest=benchmarks/manifests/cjson-parse.toml
+example=achlys_t1
+monitor=NopMonitor (via run_substrate)
+note=mechanism smoke; not a timed ladder; AFL++ not run

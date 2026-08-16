@@ -70,7 +70,7 @@ cargo run -p achlys-cli --release -- fuzz ./parser @@ --corpus seeds/ --no-ai
 
 ## Limitations
 
-- Success ladder **Level 0**, with a Tranche 1 single-worker baseline on top of H0. H0 development evidence: [`docs/decisions/2026-08-16-h0-substrate.md`](docs/decisions/2026-08-16-h0-substrate.md) and [`docs/evidence/h0/`](docs/evidence/h0/). Re-run on Linux x86-64 before quoting a number. AFL++ compare infrastructure exists (`scripts/experiments/t1_compare.sh`) but does **not** produce numbers when `afl-fuzz` is missing. No “hard branch” claims.
+- Success ladder **Level 0**, with a Tranche 1 single-worker baseline on top of H0. H0 development evidence: [`docs/decisions/2026-08-16-h0-substrate.md`](docs/decisions/2026-08-16-h0-substrate.md) and [`docs/evidence/h0/`](docs/evidence/h0/). T1 decision and smoke: [`docs/decisions/2026-08-16-t1-baseline.md`](docs/decisions/2026-08-16-t1-baseline.md), [`docs/evidence/t1/`](docs/evidence/t1/). Re-run on Linux x86-64 before quoting a number. AFL++ compare infrastructure exists (`scripts/experiments/t1_compare.sh`) but does **not** produce numbers when `afl-fuzz` is missing. No “hard branch” claims.
 - CLI campaigns have no coverage map. Blackbox admission uses `ConstFeedback(false)` (seeds + crashes only).
 - Spawn, write, and wait failures are `InfraError` and abort the campaign. They are not target crashes.
 - Sanitizer replay and crash dedup exist **off** the hot path (`SanitizerReplayer`). They are not wired into `achlys fuzz`.
