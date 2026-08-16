@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use libafl::{stages::Stage, stages::Restartable, Error};
+use libafl::{Error, stages::Restartable, stages::Stage};
 
 use crate::plateau::SharedPlateauDetector;
 
@@ -79,11 +79,7 @@ impl EscalationManager {
 
     /// Check if escalation/de-escalation is needed. Returns the stage to use.
     pub fn tick(&mut self) -> FuzzStage {
-        let in_plateau = self
-            .detector
-            .lock()
-            .map(|mut d| d.check())
-            .unwrap_or(false);
+        let in_plateau = self.detector.lock().map(|mut d| d.check()).unwrap_or(false);
 
         let previous = self.current_stage;
 
@@ -149,11 +145,7 @@ impl<H, A> EscalatingStage<H, A> {
 
     /// Create an escalating stage with both havoc and AI stages.
     #[must_use]
-    pub fn with_ai(
-        havoc_stage: H,
-        ai_stage: A,
-        detector: SharedPlateauDetector,
-    ) -> Self {
+    pub fn with_ai(havoc_stage: H, ai_stage: A, detector: SharedPlateauDetector) -> Self {
         Self {
             havoc_stage,
             ai_stage: Some(ai_stage),

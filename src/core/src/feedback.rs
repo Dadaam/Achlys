@@ -1,9 +1,9 @@
 use std::borrow::Cow;
 
 use libafl::{
+    Error, HasNamedMetadata,
     executors::ExitKind,
     feedbacks::{Feedback, StateInitializer},
-    Error, HasNamedMetadata,
 };
 use libafl_bolts::Named;
 
@@ -72,5 +72,4 @@ where
 
         Ok(interesting)
     }
-
 }

@@ -2,13 +2,13 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use libafl::{
+    Error,
     corpus::{Corpus, CorpusId},
     inputs::{BytesInput, HasTargetBytes},
     mutators::{MutationResult, Mutator},
     state::{HasCorpus, HasRand},
-    Error,
 };
-use libafl_bolts::{rands::Rand, AsSlice, Named};
+use libafl_bolts::{AsSlice, Named, rands::Rand};
 
 use std::borrow::Cow;
 
@@ -116,11 +116,7 @@ where
         }
     }
 
-    fn post_exec(
-        &mut self,
-        _state: &mut S,
-        _new_corpus_id: Option<CorpusId>,
-    ) -> Result<(), Error> {
+    fn post_exec(&mut self, _state: &mut S, _new_corpus_id: Option<CorpusId>) -> Result<(), Error> {
         Ok(())
     }
 }

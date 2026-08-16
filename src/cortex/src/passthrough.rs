@@ -28,11 +28,7 @@ impl Default for PassthroughCortex {
 }
 
 impl CortexInterface for PassthroughCortex {
-    fn predict_mutations(
-        &self,
-        corpus_samples: &[&[u8]],
-        count: usize,
-    ) -> Result<Vec<Vec<u8>>> {
+    fn predict_mutations(&self, corpus_samples: &[&[u8]], count: usize) -> Result<Vec<Vec<u8>>> {
         if corpus_samples.is_empty() {
             return Ok(Vec::new());
         }
@@ -44,7 +40,9 @@ impl CortexInterface for PassthroughCortex {
         let mut rng_state: u64 = 0xDEAD_BEEF; // arbitrary seed
         let mut next_rng = || -> u64 {
             // PCG multiplier and increment
-            rng_state = rng_state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            rng_state = rng_state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
             rng_state
         };
 

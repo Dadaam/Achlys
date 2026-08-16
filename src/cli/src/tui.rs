@@ -8,15 +8,15 @@ use std::time::{Duration, Instant};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
-    Frame, Terminal,
 };
 
 const MAX_LOG_LINES: usize = 50;
@@ -167,18 +167,22 @@ impl AchlysTui {
         drop(state);
 
         self.terminal.draw(|frame| {
-            render_ui(frame, frame.area(), &RenderData {
-                target: &target,
-                mode: &mode,
-                uptime: &uptime,
-                run_time: &run_time,
-                corpus: &corpus,
-                objectives: &objectives,
-                total_execs: &total_execs,
-                execs_per_sec: &execs_per_sec,
-                last_event: &last_event,
-                logs: &logs,
-            });
+            render_ui(
+                frame,
+                frame.area(),
+                &RenderData {
+                    target: &target,
+                    mode: &mode,
+                    uptime: &uptime,
+                    run_time: &run_time,
+                    corpus: &corpus,
+                    objectives: &objectives,
+                    total_execs: &total_execs,
+                    execs_per_sec: &execs_per_sec,
+                    last_event: &last_event,
+                    logs: &logs,
+                },
+            );
         })?;
         Ok(())
     }
@@ -239,16 +243,27 @@ fn render_ui(frame: &mut Frame, area: Rect, d: &RenderData<'_>) {
     // Header
     let header = Paragraph::new(vec![Line::from(vec![
         Span::styled(" target: ", dim),
-        Span::styled(d.target, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            d.target,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("    uptime: ", dim),
         Span::styled(d.uptime, green),
         Span::styled("    stage: ", dim),
-        Span::styled(d.mode, Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            d.mode,
+            Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
+        ),
     ])])
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(Span::styled(" achlys ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)))
+            .title(Span::styled(
+                " achlys ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ))
             .border_style(border),
     );
     frame.render_widget(header, main[0]);
@@ -272,70 +287,121 @@ fn render_ui(frame: &mut Frame, area: Rect, d: &RenderData<'_>) {
     let speed = format!("{}/sec", d.execs_per_sec);
     let obj_style = if d.objectives == "0" { dim } else { red };
 
-    frame.render_widget(stat_block(" process timing ", Color::Cyan, &[
-        ("run time", d.run_time, cyan),
-        ("total execs", d.total_execs, white),
-        ("exec speed", &speed, green),
-        ("last event", d.last_event, dim),
-    ]), left[0]);
+    frame.render_widget(
+        stat_block(
+            " process timing ",
+            Color::Cyan,
+            &[
+                ("run time", d.run_time, cyan),
+                ("total execs", d.total_execs, white),
+                ("exec speed", &speed, green),
+                ("last event", d.last_event, dim),
+            ],
+        ),
+        left[0],
+    );
 
-    frame.render_widget(stat_block(" overall results ", Color::Green, &[
-        ("corpus count", d.corpus, white),
-        ("crashes", d.objectives, obj_style),
-        ("total execs", d.total_execs, white),
-    ]), right[0]);
+    frame.render_widget(
+        stat_block(
+            " overall results ",
+            Color::Green,
+            &[
+                ("corpus count", d.corpus, white),
+                ("crashes", d.objectives, obj_style),
+                ("total execs", d.total_execs, white),
+            ],
+        ),
+        right[0],
+    );
 
-    frame.render_widget(stat_block(" stage info ", Color::Yellow, &[
-        ("current stage", d.mode, Style::default().fg(mode_color)),
-        ("exec speed", &speed, green),
-    ]), left[1]);
+    frame.render_widget(
+        stat_block(
+            " stage info ",
+            Color::Yellow,
+            &[
+                ("current stage", d.mode, Style::default().fg(mode_color)),
+                ("exec speed", &speed, green),
+            ],
+        ),
+        left[1],
+    );
 
-    frame.render_widget(stat_block(" status ", Color::Magenta, &[
-        ("corpus", d.corpus, white),
-        ("crashes", d.objectives, obj_style),
-        ("speed", &speed, green),
-    ]), right[1]);
+    frame.render_widget(
+        stat_block(
+            " status ",
+            Color::Magenta,
+            &[
+                ("corpus", d.corpus, white),
+                ("crashes", d.objectives, obj_style),
+                ("speed", &speed, green),
+            ],
+        ),
+        right[1],
+    );
 
     // Logs
-    let log_lines: Vec<Line> = d.logs.iter().rev().take(6).rev().map(|msg| {
-        let color = if msg.contains("escalat") {
-            Color::Magenta
-        } else if msg.contains("error") || msg.contains("failed") {
-            Color::Red
-        } else if msg.contains("loaded") || msg.contains("started") || msg.contains("training") {
-            Color::Green
-        } else {
-            Color::DarkGray
-        };
-        Line::from(Span::styled(format!("  {msg}"), Style::default().fg(color)))
-    }).collect();
+    let log_lines: Vec<Line> = d
+        .logs
+        .iter()
+        .rev()
+        .take(6)
+        .rev()
+        .map(|msg| {
+            let color = if msg.contains("escalat") {
+                Color::Magenta
+            } else if msg.contains("error") || msg.contains("failed") {
+                Color::Red
+            } else if msg.contains("loaded") || msg.contains("started") || msg.contains("training")
+            {
+                Color::Green
+            } else {
+                Color::DarkGray
+            };
+            Line::from(Span::styled(format!("  {msg}"), Style::default().fg(color)))
+        })
+        .collect();
 
     frame.render_widget(
         Paragraph::new(log_lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(Span::styled(" logs ", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)))
+                .title(Span::styled(
+                    " logs ",
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ))
                 .border_style(border),
         ),
         main[2],
     );
 }
 
-fn stat_block<'a>(title: &'a str, color: Color, entries: &[(&'a str, &'a str, Style)]) -> Paragraph<'a> {
-    let lines: Vec<Line> = entries.iter().map(|(k, v, s)| {
-        let dots = ".".repeat(20usize.saturating_sub(k.len()));
-        Line::from(vec![
-            Span::styled(format!("  {k} "), Style::default().fg(Color::DarkGray)),
-            Span::styled(dots, Style::default().fg(Color::DarkGray)),
-            Span::raw(" "),
-            Span::styled((*v).to_string(), *s),
-        ])
-    }).collect();
+fn stat_block<'a>(
+    title: &'a str,
+    color: Color,
+    entries: &[(&'a str, &'a str, Style)],
+) -> Paragraph<'a> {
+    let lines: Vec<Line> = entries
+        .iter()
+        .map(|(k, v, s)| {
+            let dots = ".".repeat(20usize.saturating_sub(k.len()));
+            Line::from(vec![
+                Span::styled(format!("  {k} "), Style::default().fg(Color::DarkGray)),
+                Span::styled(dots, Style::default().fg(Color::DarkGray)),
+                Span::raw(" "),
+                Span::styled((*v).to_string(), *s),
+            ])
+        })
+        .collect();
 
     Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(Span::styled(title, Style::default().fg(color).add_modifier(Modifier::BOLD)))
+            .title(Span::styled(
+                title,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ))
             .border_style(Style::default().fg(Color::DarkGray)),
     )
 }
@@ -346,9 +412,13 @@ fn format_duration(d: Duration) -> String {
 }
 
 fn format_number(n: u64) -> String {
-    if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1e6) }
-    else if n >= 1_000 { format!("{:.1}K", n as f64 / 1e3) }
-    else { n.to_string() }
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1e3)
+    } else {
+        n.to_string()
+    }
 }
 
 pub fn create_tui_callback(

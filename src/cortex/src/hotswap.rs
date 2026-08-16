@@ -1,6 +1,6 @@
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
@@ -56,7 +56,10 @@ impl HotSwapCortex {
         *guard = Some(new_model);
         self.has_model.store(true, Ordering::Release);
 
-        println!("[achlys-cortex] hot-swapped model: {}", path.as_ref().display());
+        println!(
+            "[achlys-cortex] hot-swapped model: {}",
+            path.as_ref().display()
+        );
         Ok(())
     }
 
@@ -67,11 +70,7 @@ impl HotSwapCortex {
 }
 
 impl CortexInterface for HotSwapCortex {
-    fn predict_mutations(
-        &self,
-        corpus_samples: &[&[u8]],
-        count: usize,
-    ) -> Result<Vec<Vec<u8>>> {
+    fn predict_mutations(&self, corpus_samples: &[&[u8]], count: usize) -> Result<Vec<Vec<u8>>> {
         let guard = self
             .inner
             .lock()

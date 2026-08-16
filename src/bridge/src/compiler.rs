@@ -54,22 +54,16 @@ impl AutoCompiler {
     /// Compile source files into an instrumented static library.
     ///
     /// Returns the path to the compiled `.a` file.
-    pub fn compile_static_lib(
-        &self,
-        sources: &[PathBuf],
-        lib_name: &str,
-    ) -> Result<PathBuf> {
+    pub fn compile_static_lib(&self, sources: &[PathBuf], lib_name: &str) -> Result<PathBuf> {
         if sources.is_empty() {
             bail!("no source files provided");
         }
 
-        fs::create_dir_all(&self.output_dir)
-            .context("failed to create output directory")?;
+        fs::create_dir_all(&self.output_dir).context("failed to create output directory")?;
 
         // Write sancov callbacks to temp file
         let sancov_path = self.output_dir.join("sancov_callbacks.c");
-        fs::write(&sancov_path, SANCOV_CALLBACKS)
-            .context("failed to write sancov_callbacks.c")?;
+        fs::write(&sancov_path, SANCOV_CALLBACKS).context("failed to write sancov_callbacks.c")?;
 
         // Compile each source file to .o
         let mut objects = Vec::new();
@@ -86,12 +80,7 @@ impl AutoCompiler {
             let compiler = Self::detect_compiler(source)?;
 
             let status = Command::new(&compiler)
-                .args([
-                    "-c",
-                    "-O3",
-                    "-fsanitize-coverage=trace-pc-guard",
-                    "-o",
-                ])
+                .args(["-c", "-O3", "-fsanitize-coverage=trace-pc-guard", "-o"])
                 .arg(&obj_path)
                 .arg(source)
                 .status()
@@ -147,21 +136,15 @@ impl AutoCompiler {
     /// Compile source files into an instrumented standalone binary.
     ///
     /// Returns the path to the compiled binary.
-    pub fn compile_binary(
-        &self,
-        sources: &[PathBuf],
-        binary_name: &str,
-    ) -> Result<PathBuf> {
+    pub fn compile_binary(&self, sources: &[PathBuf], binary_name: &str) -> Result<PathBuf> {
         if sources.is_empty() {
             bail!("no source files provided");
         }
 
-        fs::create_dir_all(&self.output_dir)
-            .context("failed to create output directory")?;
+        fs::create_dir_all(&self.output_dir).context("failed to create output directory")?;
 
         let sancov_path = self.output_dir.join("sancov_callbacks.c");
-        fs::write(&sancov_path, SANCOV_CALLBACKS)
-            .context("failed to write sancov_callbacks.c")?;
+        fs::write(&sancov_path, SANCOV_CALLBACKS).context("failed to write sancov_callbacks.c")?;
 
         let binary_path = self.output_dir.join(binary_name);
         let compiler = Self::detect_compiler(&sources[0])?;
@@ -193,10 +176,7 @@ impl AutoCompiler {
 
     /// Detect whether to use clang or clang++ based on file extension.
     fn detect_compiler(source: &Path) -> Result<String> {
-        let ext = source
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("c");
+        let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("c");
 
         match ext {
             "c" => Ok("clang".to_string()),
@@ -226,5 +206,28 @@ mod tests {
     fn test_detect_compiler_cc() {
         let result = AutoCompiler::detect_compiler(Path::new("bar.cc")).unwrap();
         assert_eq!(result, "clang++");
+    }
+
+    #[test]
+    fn compile_micro_crash_if_magic() {
+        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmarks/micro/crash_if_magic.c");
+        assert!(src.is_file(), "missing {}", src.display());
+
+        let out = std::env::temp_dir().join(format!("achlys_micro_build_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out);
+        let compiler = AutoCompiler::new(&out);
+        let lib = compiler
+            .compile_static_lib(std::slice::from_ref(&src), "crash_if_magic")
+            .expect("compile micro target");
+        assert!(lib.is_file());
+
+        let artifact_count = fs::read_dir(&out).unwrap().filter_map(Result::ok).count();
+        // objects + sancov + archive — bounded, not a growing campaign dir
+        assert!(
+            artifact_count <= 16,
+            "unexpected artifact count: {artifact_count}"
+        );
+        let _ = fs::remove_dir_all(&out);
     }
 }

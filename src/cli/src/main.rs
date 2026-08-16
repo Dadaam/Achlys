@@ -14,7 +14,10 @@ use achlys_cortex::{AutoTrainer, CortexModel, HotSwapCortex};
 use crate::tui::{AchlysTui, create_tui_callback};
 
 #[derive(Parser)]
-#[command(name = "achlys", about = "4-stage adaptive fuzzer — hunt zero-days in any binary")]
+#[command(
+    name = "achlys",
+    about = "4-stage adaptive fuzzer — hunt zero-days in any binary"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -176,8 +179,8 @@ fn setup_cortex(
     }
 
     if let Some(model_path) = model {
-        let cortex_model = CortexModel::load(model_path, max_input_len)
-            .context("failed to load ONNX model")?;
+        let cortex_model =
+            CortexModel::load(model_path, max_input_len).context("failed to load ONNX model")?;
         return Ok(Some(Arc::new(cortex_model)));
     }
 
@@ -203,18 +206,20 @@ fn setup_cortex(
     let hotswap_for_thread = hotswap.clone();
     let model_ready = trainer.model_ready_flag();
 
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(10));
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(10));
 
-        if let Err(e) = trainer.tick() {
-            eprintln!("[achlys-trainer] error: {}", e);
-        }
-
-        if model_ready.load(std::sync::atomic::Ordering::Acquire) {
-            if let Err(e) = hotswap_for_thread.load_model(&model_output) {
-                eprintln!("[achlys-trainer] failed to hot-load model: {}", e);
+            if let Err(e) = trainer.tick() {
+                eprintln!("[achlys-trainer] error: {}", e);
             }
-            trainer.acknowledge_model();
+
+            if model_ready.load(std::sync::atomic::Ordering::Acquire) {
+                if let Err(e) = hotswap_for_thread.load_model(&model_output) {
+                    eprintln!("[achlys-trainer] failed to hot-load model: {}", e);
+                }
+                trainer.acknowledge_model();
+            }
         }
     });
 

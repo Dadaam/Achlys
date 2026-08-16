@@ -13,11 +13,7 @@ pub trait CortexInterface: Send + Sync {
     /// predict mutations likely to discover more coverage.
     ///
     /// Returns `count` mutated byte vectors, each a complete input candidate.
-    fn predict_mutations(
-        &self,
-        corpus_samples: &[&[u8]],
-        count: usize,
-    ) -> Result<Vec<Vec<u8>>>;
+    fn predict_mutations(&self, corpus_samples: &[&[u8]], count: usize) -> Result<Vec<Vec<u8>>>;
 
     /// Whether the model is loaded and ready for inference.
     fn is_ready(&self) -> bool;

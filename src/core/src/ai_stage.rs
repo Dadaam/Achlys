@@ -1,4 +1,4 @@
-use libafl::{stages::Stage, stages::Restartable, Error};
+use libafl::{Error, stages::Restartable, stages::Stage};
 
 /// Hybrid stage that alternates between havoc and AI mutations.
 ///
@@ -81,13 +81,23 @@ mod tests {
     fn test_hybrid_ratio_default() {
         struct FakeStage;
         impl<E, EM, S, Z> Stage<E, EM, S, Z> for FakeStage {
-            fn perform(&mut self, _: &mut Z, _: &mut E, _: &mut S, _: &mut EM) -> Result<(), Error> {
+            fn perform(
+                &mut self,
+                _: &mut Z,
+                _: &mut E,
+                _: &mut S,
+                _: &mut EM,
+            ) -> Result<(), Error> {
                 Ok(())
             }
         }
         impl<S> Restartable<S> for FakeStage {
-            fn should_restart(&mut self, _: &mut S) -> Result<bool, Error> { Ok(true) }
-            fn clear_progress(&mut self, _: &mut S) -> Result<(), Error> { Ok(()) }
+            fn should_restart(&mut self, _: &mut S) -> Result<bool, Error> {
+                Ok(true)
+            }
+            fn clear_progress(&mut self, _: &mut S) -> Result<(), Error> {
+                Ok(())
+            }
         }
 
         let hybrid = HybridStage::new(FakeStage, FakeStage, 10);
@@ -99,13 +109,23 @@ mod tests {
     fn test_hybrid_ratio_min_one() {
         struct FakeStage;
         impl<E, EM, S, Z> Stage<E, EM, S, Z> for FakeStage {
-            fn perform(&mut self, _: &mut Z, _: &mut E, _: &mut S, _: &mut EM) -> Result<(), Error> {
+            fn perform(
+                &mut self,
+                _: &mut Z,
+                _: &mut E,
+                _: &mut S,
+                _: &mut EM,
+            ) -> Result<(), Error> {
                 Ok(())
             }
         }
         impl<S> Restartable<S> for FakeStage {
-            fn should_restart(&mut self, _: &mut S) -> Result<bool, Error> { Ok(true) }
-            fn clear_progress(&mut self, _: &mut S) -> Result<(), Error> { Ok(()) }
+            fn should_restart(&mut self, _: &mut S) -> Result<bool, Error> {
+                Ok(true)
+            }
+            fn clear_progress(&mut self, _: &mut S) -> Result<(), Error> {
+                Ok(())
+            }
         }
 
         let hybrid = HybridStage::new(FakeStage, FakeStage, 0);

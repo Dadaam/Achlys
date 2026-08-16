@@ -102,11 +102,7 @@ impl CortexModel {
 }
 
 impl CortexInterface for CortexModel {
-    fn predict_mutations(
-        &self,
-        corpus_samples: &[&[u8]],
-        count: usize,
-    ) -> Result<Vec<Vec<u8>>> {
+    fn predict_mutations(&self, corpus_samples: &[&[u8]], count: usize) -> Result<Vec<Vec<u8>>> {
         if corpus_samples.is_empty() {
             return Ok(Vec::new());
         }

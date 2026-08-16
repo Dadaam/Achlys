@@ -22,7 +22,7 @@ use libafl::{
     stages::mutational::StdMutationalStage,
     state::{HasCorpus, StdState},
 };
-use libafl_bolts::{current_nanos, rands::StdRand, tuples::tuple_list, AsSlice};
+use libafl_bolts::{AsSlice, current_nanos, rands::StdRand, tuples::tuple_list};
 
 use achlys_bridge::Target;
 
@@ -138,8 +138,7 @@ impl FuzzerBuilder {
         let coverage_ptr = coverage.as_mut_ptr();
         // Intentional leak: StdMapObserver requires a &'static str for the name.
         // The fuzzer runs until process exit, so this is effectively static.
-        let obs_name: &'static str =
-            Box::leak(target.observer_name().to_string().into_boxed_str());
+        let obs_name: &'static str = Box::leak(target.observer_name().to_string().into_boxed_str());
 
         let observer = unsafe {
             let slice = std::slice::from_raw_parts_mut(coverage_ptr, coverage_len);
@@ -188,11 +187,15 @@ impl FuzzerBuilder {
             // Seed loading info visible through TUI logs or --no-tui output
         } else {
             let mut generator = RandBytesGenerator::new(
-                NonZero::new(self.config.max_input_len).unwrap_or(NonZero::new(4096).expect("4096 is non-zero")),
+                NonZero::new(self.config.max_input_len)
+                    .unwrap_or(NonZero::new(4096).expect("4096 is non-zero")),
             );
             state
                 .generate_initial_inputs(
-                    &mut fuzzer, &mut executor, &mut generator, &mut mgr,
+                    &mut fuzzer,
+                    &mut executor,
+                    &mut generator,
+                    &mut mgr,
                     self.config.initial_inputs,
                 )
                 .context("failed to generate initial inputs")?;
@@ -201,15 +204,13 @@ impl FuzzerBuilder {
         // Branch: with AI cortex or plain havoc
         if let Some(cortex) = self.cortex {
             // Full escalation pipeline
-            let havoc_stage = StdMutationalStage::new(
-                HavocScheduledMutator::new(havoc_mutations()),
-            );
+            let havoc_stage =
+                StdMutationalStage::new(HavocScheduledMutator::new(havoc_mutations()));
 
             let ai_mutator = AiMutator::new(cortex, DEFAULT_PREDICTION_BATCH);
             let ai_stage = StdMutationalStage::new(ai_mutator);
-            let hybrid_havoc = StdMutationalStage::new(
-                HavocScheduledMutator::new(havoc_mutations()),
-            );
+            let hybrid_havoc =
+                StdMutationalStage::new(HavocScheduledMutator::new(havoc_mutations()));
             let hybrid = HybridStage::new(hybrid_havoc, ai_stage, 10);
 
             let mut escalating = EscalatingStage::with_ai(havoc_stage, hybrid, detector);
@@ -281,11 +282,15 @@ impl FuzzerBuilder {
             // Seed loading info visible through TUI logs or --no-tui output
         } else {
             let mut generator = RandBytesGenerator::new(
-                NonZero::new(self.config.max_input_len).unwrap_or(NonZero::new(4096).expect("4096 is non-zero")),
+                NonZero::new(self.config.max_input_len)
+                    .unwrap_or(NonZero::new(4096).expect("4096 is non-zero")),
             );
             state
                 .generate_initial_inputs(
-                    &mut fuzzer, &mut executor, &mut generator, &mut mgr,
+                    &mut fuzzer,
+                    &mut executor,
+                    &mut generator,
+                    &mut mgr,
                     self.config.initial_inputs,
                 )
                 .context("failed to generate initial inputs")?;
@@ -296,15 +301,13 @@ impl FuzzerBuilder {
         if let Some(cortex) = self.cortex {
             let detector = shared_detector(self.config.plateau_timeout);
 
-            let havoc_stage = StdMutationalStage::new(
-                HavocScheduledMutator::new(havoc_mutations()),
-            );
+            let havoc_stage =
+                StdMutationalStage::new(HavocScheduledMutator::new(havoc_mutations()));
 
             let ai_mutator = AiMutator::new(cortex, DEFAULT_PREDICTION_BATCH);
             let ai_stage = StdMutationalStage::new(ai_mutator);
-            let hybrid_havoc = StdMutationalStage::new(
-                HavocScheduledMutator::new(havoc_mutations()),
-            );
+            let hybrid_havoc =
+                StdMutationalStage::new(HavocScheduledMutator::new(havoc_mutations()));
             let hybrid = HybridStage::new(hybrid_havoc, ai_stage, 10);
 
             let mut escalating = EscalatingStage::with_ai(havoc_stage, hybrid, detector);
@@ -330,7 +333,10 @@ impl FuzzerBuilder {
 }
 
 /// Load seed files from a directory into any corpus-bearing state.
-fn load_seeds_from_dir(state: &mut impl HasCorpus<BytesInput>, dir: &std::path::Path) -> Result<usize> {
+fn load_seeds_from_dir(
+    state: &mut impl HasCorpus<BytesInput>,
+    dir: &std::path::Path,
+) -> Result<usize> {
     let mut count = 0;
     for entry in fs::read_dir(dir).context("failed to read corpus directory")? {
         let entry = entry?;
@@ -338,7 +344,9 @@ fn load_seeds_from_dir(state: &mut impl HasCorpus<BytesInput>, dir: &std::path::
         if path.is_file() {
             let data = fs::read(&path)
                 .with_context(|| format!("failed to read seed: {}", path.display()))?;
-            state.corpus_mut().add(Testcase::new(BytesInput::new(data)))?;
+            state
+                .corpus_mut()
+                .add(Testcase::new(BytesInput::new(data)))?;
             count += 1;
         }
     }

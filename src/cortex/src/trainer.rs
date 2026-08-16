@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -126,10 +126,7 @@ impl AutoTrainer {
                         );
                         self.model_ready.store(true, Ordering::Release);
                     } else {
-                        eprintln!(
-                            "[achlys-trainer] training failed (exit: {})",
-                            status
-                        );
+                        eprintln!("[achlys-trainer] training failed (exit: {})", status);
                     }
                 }
                 Ok(None) => {
@@ -246,7 +243,12 @@ impl Drop for AutoTrainer {
 
 fn count_files(dir: &Path) -> usize {
     fs::read_dir(dir)
-        .map(|entries| entries.filter_map(|e| e.ok()).filter(|e| e.path().is_file()).count())
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_file())
+                .count()
+        })
         .unwrap_or(0)
 }
 

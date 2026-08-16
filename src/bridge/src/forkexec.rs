@@ -200,11 +200,17 @@ impl Target for ForkExecTarget {
 
 /// Extension trait for `std::process::Child` to add timeout support.
 trait ChildExt {
-    fn wait_timeout(&mut self, timeout: Duration) -> std::io::Result<Option<std::process::ExitStatus>>;
+    fn wait_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> std::io::Result<Option<std::process::ExitStatus>>;
 }
 
 impl ChildExt for std::process::Child {
-    fn wait_timeout(&mut self, timeout: Duration) -> std::io::Result<Option<std::process::ExitStatus>> {
+    fn wait_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
         let start = std::time::Instant::now();
         let poll_interval = Duration::from_millis(1);
 
@@ -236,9 +242,17 @@ mod tests {
     fn test_file_replace_detection() {
         let target = ForkExecTarget::new(
             "/usr/bin/test_binary",
-            vec!["-i".to_string(), "@@".to_string(), "-o".to_string(), "/dev/null".to_string()],
+            vec![
+                "-i".to_string(),
+                "@@".to_string(),
+                "-o".to_string(),
+                "/dev/null".to_string(),
+            ],
         );
-        assert!(matches!(target.input_method, InputMethod::FileReplace { position: 1 }));
+        assert!(matches!(
+            target.input_method,
+            InputMethod::FileReplace { position: 1 }
+        ));
     }
 
     #[test]

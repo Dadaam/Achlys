@@ -12,9 +12,17 @@
 # ------------------------------------------------------------------------------
 # Root level crash artifacts
 /crashes
+crashes/
+
+# Campaign output directories
+/campaigns
+campaigns/
 
 # Runtime working directory (corpus, logs, queues, hangs)
 /runtime
+
+# ONNX runtime / model artifacts (do not ignore vendored C sources)
+*.onnx
 
 # ------------------------------------------------------------------------------
 # ML / Cortex Data
