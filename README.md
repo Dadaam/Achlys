@@ -2,7 +2,7 @@
 
 > Achlys is an experimental cooperative fuzzing system built on LibAFL. It investigates whether typed cross-strategy assistance and cost-aware worker allocation can improve coverage and hard-branch discovery under equal resource budgets.
 
-This repository is a **Level 0** prototype: it builds some crates and can run a bounded havoc campaign. It is not a production fuzzer, not an AI fuzzer, and not a zero-day hunter. There is no evidence yet that Achlys beats a strong LibAFL or AFL++ baseline.
+This repository is a **Level 0** prototype. A development H0 run (cJSON in-process, 5 × 30 s, macOS aarch64) showed Achlys `run_substrate` within **0.56%** of a minimal LibAFL baseline. That is not a release result, not an AFL++ comparison, and not Level 1.
 
 The design source of truth is [`docs/MASTER_PLAN.md`](docs/MASTER_PLAN.md). If this README or [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) conflicts with the Master Plan, the Master Plan wins.
 
@@ -12,7 +12,7 @@ The design source of truth is [`docs/MASTER_PLAN.md`](docs/MASTER_PLAN.md). If t
 - **Mutations are LibAFL havoc.** `HavocScheduledMutator` / `havoc_mutations()` is the working mutation engine.
 - **Seeds and crashes.** `--corpus` loads seed files into an in-memory queue. Crash-triggering inputs are written to `--output` (default `./crashes`). The working corpus is **not** written back to disk.
 - **TUI.** A ratatui monitor is the default display. Use `--no-tui` for plain text.
-- **In-process graybox is an example only.** `examples/fuzzers/cjson_graybox_fuzzer.rs` links cJSON with SanCov and uses `MaxMapFeedback`. `InProcessTarget` and `FuzzerBuilder::run_graybox` exist in the crates but are unused by `achlys fuzz`. The cJSON examples require the vendored cJSON tree (see limitations).
+- **In-process graybox exists for H0, not for the CLI.** `FuzzerBuilder::run_substrate` plus `examples/fuzzers/achlys_h0.rs` and `examples/fuzzers/libafl_baseline.rs` run the same LibAFL havoc loop on vendored cJSON. `achlys fuzz` remains blackbox fork+exec.
 
 ## What does not work
 
@@ -71,7 +71,7 @@ cargo run -p achlys-cli --release -- fuzz ./parser @@ --corpus seeds/ --no-ai
 
 ## Limitations
 
-- Success ladder **Level 0** only. No H0 throughput evidence yet. No coverage or “hard branch” claims.
+- Success ladder **Level 0**. H0 development evidence: [`docs/decisions/2026-08-16-h0-substrate.md`](docs/decisions/2026-08-16-h0-substrate.md). Re-run on Linux x86-64 before quoting it. No AFL++ or “hard branch” claims.
 - CLI campaigns have no coverage map. Blackbox admission uses `ConstFeedback(false)` (seeds + crashes only).
 - Spawn, write, and wait failures are `InfraError` and abort the campaign. They are not target crashes.
 - No forkserver, persistent mode, shared-memory coverage, sanitizer replay, or multi-worker campaign.
