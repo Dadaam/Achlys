@@ -8,3 +8,4 @@ authors.workspace = true
 libafl.workspace = true
 libafl_bolts.workspace = true
 anyhow.workspace = true
+achlys-protocol = { path = "../protocol" }

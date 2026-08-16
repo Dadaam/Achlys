@@ -1,0 +1,25 @@
+schema_version = 1
+target_id = "cjson-parse"
+harness = "cJSON_Parse"
+input_mode = "inprocess"
+max_input_len = 64
+timeout_ms = 1000
+
+[[sources]]
+path = "examples/targets/cJSON/cJSON.c"
+
+[[sources]]
+path = "examples/targets/cJSON/sancov_callbacks.c"
+
+[builds.fast]
+instrumentation = "sancov-edge"
+flags = ["-O3", "-fsanitize-coverage=trace-pc-guard"]
+
+[builds.canonical]
+instrumentation = "sancov-edge"
+flags = ["-O1", "-g", "-fsanitize-coverage=trace-pc-guard"]
+
+[builds.sanitizer]
+instrumentation = "none"
+sanitizers = ["address", "undefined"]
+flags = ["-O1", "-g", "-fsanitize=address,undefined"]
