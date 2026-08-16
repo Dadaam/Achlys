@@ -4,11 +4,15 @@
 //! that add edges to a union bitmap. Published coverage must come from this
 //! replay, not from a dirty worker map. Not on the worker hot path.
 
-use std::io;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
-use achlys_protocol::{CoverageDigest, InputId};
+use achlys_protocol::{BuildId, CoverageDigest, InputId};
 use libafl::executors::ExitKind;
 
+use crate::artifacts::CANONICAL_MAP_LEN;
 use crate::target::{InfraError, Target};
 
 /// Owned coverage bitmap used for snapshots and the oracle union.
@@ -143,6 +147,166 @@ pub struct OracleReport {
     pub replayed: usize,
 }
 
+/// Canonical authority backed by a separately compiled dump binary.
+///
+/// Each replay is a fresh process, so the coverage map cannot leak from
+/// the worker or from a previous input.
+pub struct DumpOracle {
+    binary: PathBuf,
+    build_id: BuildId,
+    union: CoverageBitmap,
+    timeout: Duration,
+}
+
+impl DumpOracle {
+    pub fn new(binary: impl Into<PathBuf>, build_id: BuildId) -> Result<Self, anyhow::Error> {
+        let binary = binary.into();
+        if !binary.is_file() {
+            anyhow::bail!("canonical dump binary missing: {}", binary.display());
+        }
+        Ok(Self {
+            binary,
+            build_id,
+            union: CoverageBitmap::new(CANONICAL_MAP_LEN),
+            timeout: Duration::from_secs(5),
+        })
+    }
+
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    #[must_use]
+    pub fn build_id(&self) -> BuildId {
+        self.build_id
+    }
+
+    pub fn replay(&mut self, input: &[u8]) -> Result<Admission, InfraError> {
+        let map = run_dump(&self.binary, input, self.timeout)?;
+        let snapshot = CoverageBitmap::from_slice(&map);
+        let new_edges = self.union.union_from(snapshot.as_slice());
+        Ok(Admission {
+            input_id: InputId::from_bytes(input),
+            digest: snapshot.digest(),
+            new_edges,
+            total_edges: self.union.edge_count(),
+            admitted: new_edges > 0,
+            exit: ExitKind::Ok,
+        })
+    }
+
+    #[must_use]
+    pub fn union(&self) -> &CoverageBitmap {
+        &self.union
+    }
+
+    #[must_use]
+    pub fn report(&self, admitted: usize, rejected: usize, replayed: usize) -> OracleReport {
+        OracleReport {
+            digest: self.union.digest(),
+            edge_count: self.union.edge_count(),
+            admitted,
+            rejected,
+            replayed,
+        }
+    }
+}
+
+fn run_dump(binary: &Path, input: &[u8], timeout: Duration) -> Result<Vec<u8>, InfraError> {
+    if !binary.is_file() {
+        return Err(InfraError::MissingBinary {
+            path: binary.to_path_buf(),
+        });
+    }
+    let mut cmd = Command::new(binary);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Err(InfraError::MissingBinary {
+                path: binary.to_path_buf(),
+            });
+        }
+        Err(source) => {
+            return Err(InfraError::Spawn {
+                path: binary.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        match stdin.write_all(input) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
+            Err(source) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(InfraError::Write { source });
+            }
+        }
+    }
+    let stdout = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut out) = stdout {
+            let _ = out.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if start.elapsed() >= timeout => {
+                #[cfg(unix)]
+                {
+                    let pid = child.id();
+                    if pid > 1 {
+                        // SAFETY: child was spawned with process_group(0).
+                        unsafe {
+                            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                        }
+                    }
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(InfraError::Write {
+                    source: io::Error::new(io::ErrorKind::TimedOut, "canonical dump timed out"),
+                });
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+            Err(source) => {
+                let _ = child.kill();
+                let _ = reader.join();
+                return Err(InfraError::Wait { source });
+            }
+        }
+    }
+    let buf = reader.join().unwrap_or_default();
+    if buf.len() < CANONICAL_MAP_LEN {
+        return Err(InfraError::Write {
+            source: io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "canonical dump returned {} bytes, expected {CANONICAL_MAP_LEN}",
+                    buf.len()
+                ),
+            ),
+        });
+    }
+    Ok(buf[..CANONICAL_MAP_LEN].to_vec())
+}
+
 fn require_coverage_map(target: &mut impl Target) -> Result<&mut [u8], InfraError> {
     target.coverage_map().ok_or_else(|| InfraError::Write {
         source: io::Error::new(
@@ -240,5 +404,24 @@ mod tests {
     fn new_requires_coverage_map() {
         let target = InProcessTarget::without_coverage(|_| ExitKind::Ok, "none");
         assert!(CanonicalOracle::new(target).is_err());
+    }
+
+    #[test]
+    fn dump_oracle_resets_between_processes() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = achlys_protocol::TargetManifest::from_path(
+            root.join("benchmarks/manifests/cjson-parse.toml"),
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("achlys_dump_oracle_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let art = crate::artifacts::compile_canonical(&root, &manifest, &dir, &[]).unwrap();
+        let mut oracle = DumpOracle::new(&art.path, art.identity.build_id).unwrap();
+        let a = oracle.replay(br#"{"a":1}"#).unwrap();
+        let b = oracle.replay(br#"{"a":1}"#).unwrap();
+        assert!(a.admitted);
+        assert!(!b.admitted);
+        assert_eq!(a.digest, b.digest);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

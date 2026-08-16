@@ -1,0 +1,22 @@
+schema_version = 1
+target_id = "micro-timeout-hang"
+harness = "achlys_micro_timeout_hang"
+input_mode = "inprocess"
+max_input_len = 64
+timeout_ms = 200
+
+[[sources]]
+path = "benchmarks/micro/timeout_hang.c"
+
+[builds.fast]
+instrumentation = "sancov-edge"
+flags = ["-O0", "-g"]
+
+[builds.canonical]
+instrumentation = "sancov-edge"
+flags = ["-O0", "-g", "-fsanitize-coverage=trace-pc-guard"]
+
+[builds.sanitizer]
+instrumentation = "none"
+sanitizers = ["address", "undefined"]
+flags = ["-O0", "-g", "-fsanitize=address,undefined"]

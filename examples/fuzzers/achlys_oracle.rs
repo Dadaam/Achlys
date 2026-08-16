@@ -1,43 +1,23 @@
-//! Independent canonical coverage replay. Same cJSON / SanCov map as H0.
-//! Does not fuzz: published coverage comes from this replay only.
+//! Independent canonical replay via a separately compiled dump binary.
 
 use std::env;
-use std::ffi::CString;
 use std::fs;
-use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::ptr::addr_of_mut;
 
-use achlys_bridge::{CanonicalOracle, CoverageMap, InProcessTarget};
-use libafl::executors::ExitKind;
-
-const MAX_EDGES: usize = 65536;
-
-#[link(name = "cjson_graybox")]
-unsafe extern "C" {
-    fn cJSON_Parse(value: *const c_char) -> *mut c_void;
-    fn cJSON_Delete(c: *mut c_void);
-
-    static mut EDGES_MAP: [u8; MAX_EDGES];
-    static mut EDGES_COUNT: std::ffi::c_ulong;
-}
+use achlys_bridge::{DumpOracle, compile_canonical};
+use achlys_protocol::TargetManifest;
 
 struct Args {
     corpus: PathBuf,
     out: Option<PathBuf>,
-    target: TargetKind,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TargetKind {
-    Cjson,
+    manifest: PathBuf,
 }
 
 fn parse_args() -> Args {
     let mut corpus = None;
     let mut out = None;
-    let mut target = TargetKind::Cjson;
+    let mut manifest = PathBuf::from("benchmarks/manifests/cjson-parse.toml");
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -48,51 +28,27 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "--corpus" => corpus = Some(PathBuf::from(need("--corpus"))),
             "--out" => out = Some(PathBuf::from(need("--out"))),
-            "--target" => {
-                target = match need("--target").as_str() {
-                    "cjson" => TargetKind::Cjson,
-                    other => die(&format!("unknown --target {other} (cjson)")),
-                };
-            }
+            "--manifest" => manifest = PathBuf::from(need("--manifest")),
             "-h" | "--help" => {
-                print_help();
+                eprintln!("achlys_oracle --corpus DIR --manifest PATH [--out FILE]");
                 process::exit(0);
             }
             other => die(&format!("unknown argument: {other}")),
         }
     }
-
     let Some(corpus) = corpus else {
         die("--corpus DIR is required");
     };
-
     Args {
         corpus,
         out,
-        target,
+        manifest,
     }
-}
-
-fn print_help() {
-    eprintln!("achlys_oracle --corpus DIR [--out FILE] [--target cjson]");
 }
 
 fn die(msg: &str) -> ! {
     eprintln!("achlys_oracle: {msg}");
     process::exit(2);
-}
-
-fn coverage_ptr(kind: TargetKind) -> (*mut u8, usize) {
-    match kind {
-        TargetKind::Cjson => unsafe {
-            let count = if EDGES_COUNT > 0 {
-                EDGES_COUNT as usize
-            } else {
-                MAX_EDGES
-            };
-            (addr_of_mut!(EDGES_MAP) as *mut u8, count)
-        },
-    }
 }
 
 fn list_corpus(dir: &Path) -> Vec<PathBuf> {
@@ -118,36 +74,31 @@ fn list_corpus(dir: &Path) -> Vec<PathBuf> {
 
 fn main() {
     let args = parse_args();
-    let files = list_corpus(&args.corpus);
-
-    let (edges_ptr, edges_len) = coverage_ptr(args.target);
-    let harness = move |buf: &[u8]| {
-        if let Ok(c_str) = CString::new(buf) {
-            // SAFETY: cJSON_Parse/Delete are the in-process harness contract.
-            unsafe {
-                let p = cJSON_Parse(c_str.as_ptr());
-                if !p.is_null() {
-                    cJSON_Delete(p);
-                }
-            }
-        }
-        ExitKind::Ok
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest_path = if args.manifest.is_absolute() {
+        args.manifest.clone()
+    } else {
+        root.join(&args.manifest)
     };
-    // SAFETY: EDGES_MAP is process-static; replay is single-threaded.
-    let target = unsafe {
-        InProcessTarget::with_coverage(harness, CoverageMap::new(edges_ptr, edges_len), "edges")
-    };
+    let manifest = TargetManifest::from_path(&manifest_path)
+        .unwrap_or_else(|e| die(&format!("manifest {}: {e}", manifest_path.display())));
 
-    let mut oracle =
-        CanonicalOracle::new(target).unwrap_or_else(|e| die(&format!("oracle: {e:#}")));
+    let build_dir = std::env::temp_dir().join(format!(
+        "achlys_oracle_build_{}_{}",
+        std::process::id(),
+        manifest.target_id
+    ));
+    let art = compile_canonical(&root, &manifest, &build_dir, &[])
+        .unwrap_or_else(|e| die(&format!("canonical compile: {e:#}")));
+    let mut oracle = DumpOracle::new(&art.path, art.identity.build_id)
+        .unwrap_or_else(|e| die(&format!("oracle: {e:#}")));
 
     let mut admitted = 0usize;
     let mut rejected = 0usize;
     let mut replayed = 0usize;
-
-    for path in &files {
+    for path in list_corpus(&args.corpus) {
         let bytes =
-            fs::read(path).unwrap_or_else(|e| die(&format!("read {}: {e}", path.display())));
+            fs::read(&path).unwrap_or_else(|e| die(&format!("read {}: {e}", path.display())));
         let admission = oracle
             .replay(&bytes)
             .unwrap_or_else(|e| die(&format!("replay {}: {e}", path.display())));
@@ -162,36 +113,40 @@ fn main() {
             .and_then(|n| n.to_str())
             .unwrap_or("<unnamed>");
         println!(
-            "ORACLE_INPUT file={name} admitted={} new_edges={} total_edges={} digest={} exit={:?}",
+            "ORACLE_INPUT file={name} admitted={} new_edges={} total_edges={} digest={}",
             admission.admitted,
             admission.new_edges,
             admission.total_edges,
-            admission.digest.to_hex(),
-            admission.exit
+            admission.digest.to_hex()
         );
     }
 
     let report = oracle.report(admitted, rejected, replayed);
     println!(
-        "ORACLE_RESULT replayed={} admitted={} rejected={} edges={} digest={}",
+        "ORACLE_RESULT target={} replayed={} admitted={} rejected={} edges={} digest={} canonical_build={}",
+        manifest.target_id,
         report.replayed,
         report.admitted,
         report.rejected,
         report.edge_count,
-        report.digest.to_hex()
+        report.digest.to_hex(),
+        art.identity.build_id.to_hex()
     );
 
     if let Some(out) = args.out {
+        if let Some(parent) = out.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
         let body = serde_json::json!({
+            "target": manifest.target_id,
             "replayed": report.replayed,
             "admitted": report.admitted,
             "rejected": report.rejected,
             "edges": report.edge_count,
             "digest": report.digest.to_hex(),
+            "canonical_build": art.identity.build_id.to_hex(),
+            "artifact_hash": art.identity.artifact_hash,
         });
-        if let Some(parent) = out.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
         fs::write(&out, format!("{body}\n"))
             .unwrap_or_else(|e| die(&format!("write {}: {e}", out.display())));
     }

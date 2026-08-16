@@ -19,6 +19,19 @@ pub struct InputMetadata {
     pub stored_unix_ms: u64,
 }
 
+/// Crash-pipeline counters. Raw file count is never a verified-bug metric.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrashStats {
+    pub candidates: usize,
+    pub unique_candidates: usize,
+    pub replays_attempted: usize,
+    pub reproduced_crashes: usize,
+    pub unique_crash_signatures: usize,
+    pub clean_replays: usize,
+    pub timeouts: usize,
+    pub infra_failures: usize,
+}
+
 /// Periodic, coarse metrics. Not a per-execution hot-path message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricsSnapshot {
@@ -27,17 +40,24 @@ pub struct MetricsSnapshot {
     pub objectives: usize,
     pub canonical_edges: u32,
     pub elapsed_ms: u64,
+    #[serde(default)]
+    pub crash: CrashStats,
 }
 
 /// Append-only campaign event. Versioned for artifact replay.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum CampaignEvent {
     CampaignStarted {
         schema_version: u32,
         campaign_id: CampaignId,
         target_id: String,
-        build: BuildIdentity,
+        fast_build: BuildIdentity,
+        #[serde(default)]
+        canonical_build: Option<BuildIdentity>,
+        #[serde(default)]
+        sanitizer_build: Option<BuildIdentity>,
         unix_ms: u64,
     },
     InputStored {
@@ -52,12 +72,14 @@ pub enum CampaignEvent {
         digest: CoverageDigest,
         new_edges: u32,
         total_edges: u32,
+        canonical_build: BuildId,
         unix_ms: u64,
     },
     CanonicalRejected {
         campaign_id: CampaignId,
         input_id: InputId,
         digest: CoverageDigest,
+        canonical_build: BuildId,
         unix_ms: u64,
     },
     CrashDiscovered {
@@ -71,6 +93,8 @@ pub enum CampaignEvent {
         input_id: InputId,
         class: String,
         stack_signature: Option<String>,
+        dedup_key: String,
+        sanitizer_build: BuildId,
         reproducible: bool,
         unix_ms: u64,
     },
@@ -84,6 +108,29 @@ pub enum CampaignEvent {
         snapshot: MetricsSnapshot,
         unix_ms: u64,
     },
+}
+
+/// Immutable campaign header written once at `begin`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CampaignRecord {
+    pub schema_version: u32,
+    pub campaign_id: CampaignId,
+    pub target_id: String,
+    pub label: String,
+    pub seed: u64,
+    pub max_iters: Option<u64>,
+    pub max_seconds: Option<u64>,
+    pub max_input_len: usize,
+    pub timeout_ms: u64,
+    pub tool: String,
+    pub host: String,
+    pub rustc: String,
+    pub git: String,
+    pub git_dirty: u32,
+    pub fast_build: BuildIdentity,
+    pub canonical_build: Option<BuildIdentity>,
+    pub sanitizer_build: Option<BuildIdentity>,
+    pub started_unix_ms: u64,
 }
 
 impl CampaignEvent {
@@ -136,7 +183,9 @@ mod tests {
             schema_version: CampaignEvent::SCHEMA_VERSION,
             campaign_id: CampaignId::from_label("s"),
             target_id: "t".into(),
-            build: id,
+            fast_build: id,
+            canonical_build: None,
+            sanitizer_build: None,
             unix_ms: 0,
         };
         let parsed = CampaignEvent::from_jsonl(&ev.to_jsonl().unwrap()).unwrap();

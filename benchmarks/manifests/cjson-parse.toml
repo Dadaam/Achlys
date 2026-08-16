@@ -9,6 +9,12 @@ timeout_ms = 1000
 path = "examples/targets/cJSON/cJSON.c"
 
 [[sources]]
+path = "examples/targets/cJSON/cJSON.h"
+
+[[sources]]
+path = "examples/targets/cJSON/harness_afl.c"
+
+[[sources]]
 path = "examples/targets/cJSON/sancov_callbacks.c"
 
 [builds.fast]

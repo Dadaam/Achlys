@@ -32,7 +32,7 @@ Achlys/
 | **achlys-protocol** | Target manifests, `BuildIdentity`, content-addressed `InputId`, campaign JSONL events. No LibAFL. |
 | **achlys-cli** | Parses flags, always constructs `ForkExecTarget`, runs `FuzzerBuilder`, optional ratatui TUI. `--source` is rejected. |
 | **achlys-core** | `FuzzerBuilder` wraps LibAFL havoc. `run()` is the CLI path (blackbox). `run_substrate()` is the H0/T1 in-process graybox worker. `CampaignStore` / `CampaignSession` write post-campaign artifacts. |
-| **achlys-bridge** | `ForkExecTarget` (CLI): spawn binary, stdin or `@@`. `InProcessTarget` used by H0/T1. `CanonicalOracle` replays coverage independently. `SanitizerReplayer` verifies crashes off the hot path. |
+| **achlys-bridge** | `ForkExecTarget` (CLI): spawn binary, stdin or `@@`. `InProcessTarget` used by H0/T1. `DumpOracle` replays a separately compiled canonical dump binary. `SanitizerReplayer` verifies crashes off the hot path. |
 | **achlys-cortex** | ONNX load, `AutoTrainer`, `HotSwapCortex`. Experimental. Not on the H0/T1 path. |
 
 There is no QEMU backend, no network target, no symbolic engine, no orchestrator, and no multi-worker control plane. Canonical replay and sanitizer verification run **after** a worker campaign, not once per execution.

@@ -1,8 +1,21 @@
 use std::fmt;
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as DeError;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
+
+fn ser_hex<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&hex::encode(bytes))
+}
+
+fn de_hex<'de, D: Deserializer<'de>, const N: usize>(deserializer: D) -> Result<[u8; N], D::Error> {
+    let s = String::deserialize(deserializer)?;
+    let decoded = hex::decode(&s).map_err(D::Error::custom)?;
+    decoded
+        .try_into()
+        .map_err(|_| D::Error::custom(format!("expected {N} bytes, got hex of other length")))
+}
 
 /// SHA-256 of a UTF-8 label. Used for deterministic test IDs.
 fn sha256_16(label: &str) -> [u8; 16] {
@@ -17,8 +30,20 @@ fn sha256_32(bytes: &[u8]) -> [u8; 32] {
 }
 
 /// Campaign identifier. Metadata does not change it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CampaignId(pub [u8; 16]);
+
+impl Serialize for CampaignId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ser_hex(&self.0, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CampaignId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self(de_hex(deserializer)?))
+    }
+}
 
 impl CampaignId {
     /// Deterministic ID from a label (tests and reproducible campaign dirs).
@@ -57,8 +82,20 @@ impl fmt::Display for TargetId {
 }
 
 /// Content-addressed input identity. Metadata must not alter this.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InputId(pub [u8; 32]);
+
+impl Serialize for InputId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ser_hex(&self.0, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for InputId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self(de_hex(deserializer)?))
+    }
+}
 
 impl InputId {
     #[must_use]
@@ -100,8 +137,20 @@ impl FromStr for InputId {
 }
 
 /// Hash of a build's identity parts (compiler, flags, sources, kind).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BuildId(pub [u8; 32]);
+
+impl Serialize for BuildId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ser_hex(&self.0, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for BuildId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self(de_hex(deserializer)?))
+    }
+}
 
 impl BuildId {
     #[must_use]
@@ -127,8 +176,20 @@ impl fmt::Display for BuildId {
 }
 
 /// Hash of a coverage bitmap (or of the set of hit edge indices).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CoverageDigest(pub [u8; 32]);
+
+impl Serialize for CoverageDigest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ser_hex(&self.0, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CoverageDigest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self(de_hex(deserializer)?))
+    }
+}
 
 impl CoverageDigest {
     #[must_use]
@@ -199,6 +260,18 @@ mod tests {
         assert_eq!(a.len(), 2);
         assert_eq!(b.len(), 2);
         assert!(id.to_hex().starts_with(&format!("{a}{b}")));
+    }
+
+    #[test]
+    fn digest_json_is_hex_string() {
+        let d = CoverageDigest::from_map(&[1, 0, 2]);
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(
+            json.starts_with('"'),
+            "digest must serialize as a hex string, got {json}"
+        );
+        assert_eq!(json.len(), 66);
+        assert_eq!(serde_json::from_str::<CoverageDigest>(&json).unwrap(), d);
     }
 
     #[test]

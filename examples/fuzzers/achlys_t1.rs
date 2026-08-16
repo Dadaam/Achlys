@@ -1,39 +1,61 @@
-//! Tranche 1 single-worker campaign: manifest → substrate → store → canonical replay.
-//!
-//! The hot loop is still `FuzzerBuilder::run_substrate` (H0). Canonical
-//! admission and artifact writes happen after the worker stops.
+//! Tranche 1 campaign: the manifest selects the harness, then substrate,
+//! content-addressed store, independent canonical dump, and sanitizer verify.
 
+use std::collections::HashSet;
 use std::env;
-use std::ffi::CString;
 use std::fs;
-use std::os::raw::{c_char, c_void};
+use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Command};
 use std::ptr::addr_of_mut;
 use std::time::Duration;
 
 use achlys_bridge::{
-    CanonicalOracle, CoverageMap, InProcessTarget, ReplayClass, SanitizerReplayer, dedup_key,
+    CoverageMap, DumpOracle, InProcessTarget, ReplayClass, SanitizerReplayer, WorkerTarget,
+    compile_canonical, compile_sanitizer, dedup_key,
 };
 use achlys_core::{CampaignSession, CanonicalReport, FuzzerBuilder};
 use achlys_protocol::{
-    BuildId, BuildIdentity, BuildKind, CampaignEvent, MetricsSnapshot, TargetManifest,
+    BuildId, BuildIdentity, BuildKind, CampaignEvent, CampaignId, CampaignRecord, CrashStats,
+    InputId, MetricsSnapshot, TargetManifest,
 };
 use libafl::executors::ExitKind;
 
 const MAX_EDGES: usize = 65536;
+const MICRO_MAP_LEN: usize = 256;
 const DEFAULT_OUT: &str = "./campaigns/t1";
 const DEFAULT_MANIFEST: &str = "benchmarks/manifests/cjson-parse.toml";
 const DEFAULT_SECONDS: u64 = 10;
+const EXTRA_IDENTITY: &[&str] = &[
+    "rust-toolchain.toml",
+    "Cargo.lock",
+    "build.rs",
+    "examples/fuzzers/achlys_t1.rs",
+];
 
 #[link(name = "cjson_graybox")]
 unsafe extern "C" {
-    fn cJSON_Parse(value: *const c_char) -> *mut c_void;
-    fn cJSON_Delete(c: *mut c_void);
-
+    fn achlys_cjson_test_one_input(data: *const u8, size: usize) -> c_int;
     static mut EDGES_MAP: [u8; MAX_EDGES];
     static mut EDGES_COUNT: std::ffi::c_ulong;
 }
+
+#[link(name = "micro_crash_if_magic")]
+unsafe extern "C" {
+    fn achlys_micro_crash_if_magic(data: *const u8, len: usize) -> c_int;
+}
+
+#[link(name = "micro_nonzero_exit")]
+unsafe extern "C" {
+    fn achlys_micro_nonzero_exit(data: *const u8, len: usize) -> c_int;
+}
+
+#[link(name = "micro_coverage_stable")]
+unsafe extern "C" {
+    fn achlys_micro_coverage_stable(data: *const u8, len: usize) -> c_int;
+}
+
+static mut MICRO_MAP: [u8; MICRO_MAP_LEN] = [0; MICRO_MAP_LEN];
 
 struct Args {
     seed: u64,
@@ -52,7 +74,7 @@ fn parse_args() -> Args {
     let mut corpus = None;
     let mut out = PathBuf::from(DEFAULT_OUT);
     let mut manifest = PathBuf::from(DEFAULT_MANIFEST);
-    let mut label = "t1-cjson".to_string();
+    let mut label = "t1".to_string();
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -140,124 +162,211 @@ fn unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn coverage_ptr() -> (*mut u8, usize) {
-    unsafe {
-        let count = if EDGES_COUNT > 0 {
-            EDGES_COUNT as usize
-        } else {
-            MAX_EDGES
-        };
-        (addr_of_mut!(EDGES_MAP) as *mut u8, count)
+fn require_fresh(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    if path.is_file() {
+        die(&format!("{} exists and is a file", path.display()));
+    }
+    let occupied = fs::read_dir(path)
+        .ok()
+        .map(|it| it.flatten().any(|e| e.file_name() != ".DS_Store"))
+        .unwrap_or(true);
+    if occupied {
+        die(&format!(
+            "--out {} is not empty; reuse is forbidden (pick a new directory)",
+            path.display()
+        ));
     }
 }
 
-fn cjson_target() -> InProcessTarget {
-    let (edges_ptr, edges_len) = coverage_ptr();
-    // SAFETY: EDGES_MAP is process-static; this campaign is single-threaded.
-    unsafe {
-        InProcessTarget::with_coverage(
-            move |buf| {
-                if let Ok(c_str) = CString::new(buf) {
-                    let p = cJSON_Parse(c_str.as_ptr());
-                    if !p.is_null() {
-                        cJSON_Delete(p);
-                    }
-                }
-                ExitKind::Ok
-            },
-            CoverageMap::new(edges_ptr, edges_len),
-            "edges",
-        )
+fn worker_target(kind: WorkerTarget) -> InProcessTarget {
+    match kind {
+        WorkerTarget::CjsonParse => {
+            let (ptr, len) = unsafe {
+                let count = if EDGES_COUNT > 0 {
+                    EDGES_COUNT as usize
+                } else {
+                    MAX_EDGES
+                };
+                (addr_of_mut!(EDGES_MAP) as *mut u8, count)
+            };
+            unsafe {
+                InProcessTarget::with_coverage(
+                    move |buf| {
+                        let _ = achlys_cjson_test_one_input(buf.as_ptr(), buf.len());
+                        ExitKind::Ok
+                    },
+                    CoverageMap::new(ptr, len),
+                    "edges",
+                )
+            }
+        }
+        other => {
+            let ptr = addr_of_mut!(MICRO_MAP) as *mut u8;
+            unsafe {
+                InProcessTarget::with_coverage(
+                    move |buf| {
+                        let map = std::slice::from_raw_parts_mut(ptr, MICRO_MAP_LEN);
+                        map.fill(0);
+                        let rc = match other {
+                            WorkerTarget::CjsonParse => unreachable!(),
+                            WorkerTarget::MicroCrashIfMagic => {
+                                achlys_micro_crash_if_magic(buf.as_ptr(), buf.len())
+                            }
+                            WorkerTarget::MicroNonzeroExit => {
+                                achlys_micro_nonzero_exit(buf.as_ptr(), buf.len())
+                            }
+                            WorkerTarget::MicroCoverageStable => {
+                                achlys_micro_coverage_stable(buf.as_ptr(), buf.len())
+                            }
+                        };
+                        if let Some(&b) = buf.first() {
+                            map[b as usize] = 1;
+                        }
+                        if rc != 0 {
+                            map[1] = 1;
+                        }
+                        ExitKind::Ok
+                    },
+                    CoverageMap::new(ptr, MICRO_MAP_LEN),
+                    "edges",
+                )
+            }
+        }
     }
 }
 
-fn ingest_crashes(session: &CampaignSession, dir: &Path, producer_build: BuildId) -> usize {
+fn list_regular_files(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
-        return 0;
+        return Vec::new();
     };
-    let mut n = 0usize;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() || is_sidecar(&path) {
-            continue;
-        }
-        let Ok(bytes) = fs::read(&path) else {
-            continue;
-        };
-        if bytes.is_empty() {
-            continue;
-        }
-        if let Ok(id) = session.store().put_crash(&bytes) {
-            let _ = session
-                .store()
-                .append_event(&CampaignEvent::CrashDiscovered {
-                    campaign_id: session.store().campaign_id(),
-                    input_id: id,
-                    producer_build,
-                    unix_ms: unix_ms(),
-                });
-            n += 1;
-        }
-    }
-    n
-}
-
-fn verify_crashes(session: &CampaignSession, dir: &Path, asan_dir: &Path) -> usize {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return 0;
-    };
-    let files: Vec<_> = entries
+    let mut files: Vec<_> = entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_file() && !is_sidecar(p))
         .collect();
-    if files.is_empty() {
-        return 0;
-    }
-    let bin = match SanitizerReplayer::compile_cjson(asan_dir) {
-        Ok(p) => p,
-        Err(err) => {
-            eprintln!("achlys_t1: sanitizer compile skipped: {err:#}");
-            return 0;
-        }
-    };
-    let replayer = SanitizerReplayer::new(bin).with_timeout(Duration::from_secs(5));
-    let mut verified = 0usize;
-    for path in files {
+    files.sort();
+    files
+}
+
+fn ingest_crashes(
+    session: &CampaignSession,
+    dir: &Path,
+    producer_build: BuildId,
+) -> (usize, usize, Vec<(InputId, Vec<u8>)>) {
+    let mut unique = HashSet::new();
+    let mut items = Vec::new();
+    for path in list_regular_files(dir) {
         let Ok(bytes) = fs::read(&path) else {
             continue;
         };
         if bytes.is_empty() {
             continue;
         }
-        let id = achlys_protocol::InputId::from_bytes(&bytes);
-        let (class, signature, reproducible) = match replayer.replay(&bytes) {
-            Ok(report) => {
-                let repro = report.class == ReplayClass::ReproducibleCrash;
-                (
-                    format!("{:?}", report.class),
-                    Some(dedup_key(&report)),
-                    repro,
-                )
+        let id = InputId::from_bytes(&bytes);
+        if let Ok(stored) = session.store().put_crash(&bytes)
+            && unique.insert(stored)
+        {
+            let _ = session
+                .store()
+                .append_event(&CampaignEvent::CrashDiscovered {
+                    campaign_id: session.store().campaign_id(),
+                    input_id: stored,
+                    producer_build,
+                    unix_ms: unix_ms(),
+                });
+            items.push((stored, bytes));
+        }
+        let _ = id;
+    }
+    (list_regular_files(dir).len(), unique.len(), items)
+}
+
+fn verify_crashes(
+    session: &CampaignSession,
+    candidates: &[(InputId, Vec<u8>)],
+    sanitizer_id: BuildId,
+    binary: &Path,
+    timeout: Duration,
+) -> Result<CrashStats, String> {
+    let mut stats = CrashStats {
+        candidates: candidates.len(),
+        unique_candidates: candidates.len(),
+        ..CrashStats::default()
+    };
+    if candidates.is_empty() {
+        return Ok(stats);
+    }
+    let replayer = SanitizerReplayer::new(binary).with_timeout(timeout);
+    let mut signatures = HashSet::new();
+    for (id, bytes) in candidates {
+        stats.replays_attempted += 1;
+        let report = replayer
+            .replay(bytes)
+            .map_err(|err| format!("sanitizer infra: {err}"))?;
+        match report.class {
+            ReplayClass::ReproducibleCrash => {
+                stats.reproduced_crashes += 1;
+                if let Some(sig) = &report.stack_signature {
+                    signatures.insert(sig.clone());
+                } else {
+                    signatures.insert(dedup_key(&report));
+                }
             }
-            Err(err) => (format!("InfraFailure:{err}"), None, false),
-        };
-        if session
+            ReplayClass::Clean => stats.clean_replays += 1,
+            ReplayClass::Timeout => stats.timeouts += 1,
+            ReplayClass::InfraFailure => stats.infra_failures += 1,
+        }
+        session
             .store()
             .append_event(&CampaignEvent::CrashVerified {
                 campaign_id: session.store().campaign_id(),
-                input_id: id,
-                class,
-                stack_signature: signature,
-                reproducible,
+                input_id: *id,
+                class: format!("{:?}", report.class),
+                stack_signature: report.stack_signature.clone(),
+                dedup_key: dedup_key(&report),
+                sanitizer_build: sanitizer_id,
+                reproducible: report.class == ReplayClass::ReproducibleCrash,
                 unix_ms: unix_ms(),
             })
-            .is_ok()
-        {
-            verified += 1;
-        }
+            .map_err(|e| format!("event: {e:#}"))?;
     }
-    verified
+    stats.unique_crash_signatures = signatures.len();
+    Ok(stats)
+}
+
+fn fingerprint_git(root: &Path) -> (String, u32) {
+    let sha = Command::new("git")
+        .args(["-C", &root.display().to_string(), "rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let dirty = Command::new("git")
+        .args(["-C", &root.display().to_string(), "status", "--porcelain"])
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| !l.is_empty() && !l.starts_with("??"))
+                .count() as u32
+        })
+        .unwrap_or(0);
+    (sha, dirty)
+}
+
+fn rustc_version() -> String {
+    Command::new("rustc")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "rustc-unknown".into())
 }
 
 fn main() {
@@ -275,11 +384,22 @@ fn main() {
         die("achlys_t1 only runs in-process manifests in this tranche");
     }
 
-    let max_input_len = manifest.max_input_len;
-    let exec_timeout = Duration::from_millis(manifest.timeout_ms.max(1));
+    let kind = WorkerTarget::parse(&manifest.target_id).unwrap_or_else(|e| die(&e.to_string()));
+    if kind.as_str() != manifest.target_id {
+        die("internal target id mismatch");
+    }
 
-    let build = BuildIdentity::from_manifest(&manifest, BuildKind::Fast, &root)
-        .unwrap_or_else(|e| die(&format!("build identity: {e}")));
+    require_fresh(&args.out);
+
+    let exe = env::current_exe().unwrap_or_else(|e| die(&format!("current_exe: {e}")));
+    let fast = BuildIdentity::from_executed(
+        &manifest,
+        BuildKind::Fast,
+        &root,
+        EXTRA_IDENTITY,
+        Some(&exe),
+    )
+    .unwrap_or_else(|e| die(&format!("fast identity: {e}")));
 
     fs::create_dir_all(&args.out)
         .unwrap_or_else(|e| die(&format!("create {}: {e}", args.out.display())));
@@ -288,17 +408,58 @@ fn main() {
     let worker = args.out.join("worker");
     let persist_dir = worker.join("corpus");
     let crashes_dir = worker.join("crashes");
+    let measure_dir = args.out.join("builds");
 
-    let session = CampaignSession::begin(&artifacts, &args.label, &manifest, &build)
+    let canonical = compile_canonical(
+        &root,
+        &manifest,
+        &measure_dir.join("canonical"),
+        EXTRA_IDENTITY,
+    )
+    .unwrap_or_else(|e| die(&format!("canonical compile: {e:#}")));
+    let sanitizer = compile_sanitizer(
+        &root,
+        &manifest,
+        &measure_dir.join("sanitizer"),
+        EXTRA_IDENTITY,
+    )
+    .unwrap_or_else(|e| die(&format!("sanitizer compile: {e:#}")));
+
+    let (git, dirty) = fingerprint_git(&root);
+    let record = CampaignRecord {
+        schema_version: CampaignEvent::SCHEMA_VERSION,
+        campaign_id: CampaignId::from_label(&format!(
+            "{}-{}-{}",
+            args.label, manifest.target_id, args.seed
+        )),
+        target_id: manifest.target_id.clone(),
+        label: args.label.clone(),
+        seed: args.seed,
+        max_iters: args.iters,
+        max_seconds: args.seconds,
+        max_input_len: manifest.max_input_len,
+        timeout_ms: manifest.timeout_ms,
+        tool: "achlys_t1".into(),
+        host: format!("{} {}", env::consts::OS, env::consts::ARCH),
+        rustc: rustc_version(),
+        git,
+        git_dirty: dirty,
+        fast_build: fast.clone(),
+        canonical_build: Some(canonical.identity.clone()),
+        sanitizer_build: Some(sanitizer.identity.clone()),
+        started_unix_ms: unix_ms(),
+    };
+
+    let session = CampaignSession::begin(&artifacts, &manifest, &record)
         .unwrap_or_else(|e| die(&format!("campaign begin: {e:#}")));
 
-    let target = cjson_target();
+    let target = worker_target(kind);
     let mut builder = FuzzerBuilder::new()
         .rng_seed(args.seed)
-        .max_input_len(max_input_len)
+        .max_input_len(manifest.max_input_len)
         .crashes_dir(&crashes_dir)
         .persist_corpus_dir(&persist_dir)
-        .exec_timeout(exec_timeout);
+        .exec_timeout(Duration::from_millis(manifest.timeout_ms.max(1)));
 
     if let Some(dir) = args.corpus {
         builder = builder.corpus_dir(dir);
@@ -315,14 +476,24 @@ fn main() {
         .unwrap_or_else(|e| die(&format!("substrate: {e:#}")));
 
     let ingested = session
-        .ingest_worker_dir(&persist_dir, "havoc-substrate", build.build_id)
+        .ingest_worker_dir(&persist_dir, "havoc-substrate", fast.build_id)
         .unwrap_or_else(|e| die(&format!("ingest corpus: {e:#}")));
-    let crash_n = ingest_crashes(&session, &crashes_dir, build.build_id);
-    let verified_n = verify_crashes(&session, &crashes_dir, &args.out.join("asan"));
+    let (crash_files, unique_crashes, crash_items) =
+        ingest_crashes(&session, &crashes_dir, fast.build_id);
+    let crash = verify_crashes(
+        &session,
+        &crash_items,
+        sanitizer.identity.build_id,
+        &sanitizer.path,
+        Duration::from_millis(manifest.timeout_ms.max(1)),
+    )
+    .unwrap_or_else(|e| die(&e));
+    let mut crash = crash;
+    crash.candidates = crash_files;
+    crash.unique_candidates = unique_crashes;
 
-    // Worker target dropped; reuse the same SanCov map for independent replay.
-    let mut oracle =
-        CanonicalOracle::new(cjson_target()).unwrap_or_else(|e| die(&format!("oracle: {e:#}")));
+    let mut oracle = DumpOracle::new(&canonical.path, canonical.identity.build_id)
+        .unwrap_or_else(|e| die(&format!("oracle: {e:#}")));
 
     let mut admitted = 0usize;
     let mut rejected = 0usize;
@@ -348,6 +519,7 @@ fn main() {
                 digest: admission.digest,
                 new_edges: admission.new_edges,
                 total_edges: admission.total_edges,
+                canonical_build: canonical.identity.build_id,
                 unix_ms: unix_ms(),
             }
         } else {
@@ -356,6 +528,7 @@ fn main() {
                 campaign_id: session.store().campaign_id(),
                 input_id: *id,
                 digest: admission.digest,
+                canonical_build: canonical.identity.build_id,
                 unix_ms: unix_ms(),
             }
         };
@@ -374,6 +547,8 @@ fn main() {
             admitted: oracle_report.admitted,
             rejected: oracle_report.rejected,
             replayed: oracle_report.replayed,
+            canonical_build: canonical.identity.build_id,
+            artifact_hash: canonical.identity.artifact_hash.clone(),
         })
         .unwrap_or_else(|e| die(&format!("canonical report: {e:#}")));
 
@@ -383,22 +558,31 @@ fn main() {
         objectives: report.objectives,
         canonical_edges: oracle_report.edge_count,
         elapsed_ms: u64::try_from(report.elapsed.as_millis()).unwrap_or(u64::MAX),
+        crash: crash.clone(),
     };
     session
-        .finish(snapshot.clone())
+        .finish(snapshot)
         .unwrap_or_else(|e| die(&format!("finish: {e:#}")));
 
     println!(
-        "T1_RESULT execs={} corpus={} ingested={} crashes={} verified={} replayed={} admitted={} rejected={} edges={} digest={}",
+        "T1_RESULT target={} execs={} corpus={} ingested={} replayed={} admitted={} rejected={} edges={} digest={} crash_files={} unique_candidates={} replays={} reproduced={} unique_sigs={} clean={} timeouts={} infra={} canonical_build={}",
+        manifest.target_id,
         report.executions,
         report.corpus_count,
         ingested,
-        crash_n,
-        verified_n,
         oracle_report.replayed,
         oracle_report.admitted,
         oracle_report.rejected,
         oracle_report.edge_count,
-        oracle_report.digest.to_hex()
+        oracle_report.digest.to_hex(),
+        crash.candidates,
+        crash.unique_candidates,
+        crash.replays_attempted,
+        crash.reproduced_crashes,
+        crash.unique_crash_signatures,
+        crash.clean_replays,
+        crash.timeouts,
+        crash.infra_failures,
+        canonical.identity.build_id.to_hex()
     );
 }

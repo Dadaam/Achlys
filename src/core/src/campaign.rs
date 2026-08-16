@@ -5,8 +5,7 @@ use std::fs;
 use std::path::Path;
 
 use achlys_protocol::{
-    BuildId, BuildIdentity, CampaignEvent, CampaignId, InputId, InputMetadata, MetricsSnapshot,
-    TargetManifest,
+    BuildId, CampaignEvent, CampaignRecord, InputId, InputMetadata, MetricsSnapshot, TargetManifest,
 };
 use anyhow::{Context, Result};
 
@@ -19,20 +18,21 @@ pub struct CampaignSession {
 }
 
 impl CampaignSession {
-    /// Copy manifest into the campaign dir, write CampaignStarted.
+    /// Create a fresh campaign root, persist `campaign.json`, write CampaignStarted.
     pub fn begin(
         out_dir: impl AsRef<Path>,
-        campaign_label: &str,
         manifest: &TargetManifest,
-        build: &BuildIdentity,
+        record: &CampaignRecord,
     ) -> Result<Self> {
-        let campaign_id = CampaignId::from_label(campaign_label);
-        let store = CampaignStore::create(out_dir, campaign_id, manifest)?;
+        let store = CampaignStore::create(out_dir, record.campaign_id, manifest)?;
+        store.write_campaign_record(record)?;
         store.append_event(&CampaignEvent::CampaignStarted {
             schema_version: CampaignEvent::SCHEMA_VERSION,
-            campaign_id,
+            campaign_id: record.campaign_id,
             target_id: manifest.target_id.clone(),
-            build: build.clone(),
+            fast_build: record.fast_build.clone(),
+            canonical_build: record.canonical_build.clone(),
+            sanitizer_build: record.sanitizer_build.clone(),
             unix_ms: now_unix_ms(),
         })?;
         Ok(Self { store })
@@ -104,7 +104,9 @@ fn is_libafl_sidecar(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::store::{sample_target_manifest, unique_temp_dir};
-    use achlys_protocol::{BuildIdentity, BuildIdentityParts, BuildKind, TargetId};
+    use achlys_protocol::{
+        BuildIdentity, BuildIdentityParts, BuildKind, CampaignId, CampaignRecord, TargetId,
+    };
     use std::collections::BTreeMap;
 
     struct TempDir(std::path::PathBuf);
@@ -135,9 +137,28 @@ mod tests {
     #[test]
     fn ingest_worker_dir_dedups_identical_files() {
         let out = TempDir::new("session");
-        let session =
-            CampaignSession::begin(&out.0, "ingest", &sample_target_manifest(), &sample_build())
-                .unwrap();
+        let build = sample_build();
+        let record = CampaignRecord {
+            schema_version: CampaignEvent::SCHEMA_VERSION,
+            campaign_id: CampaignId::from_label("ingest"),
+            target_id: "micro-store".into(),
+            label: "ingest".into(),
+            seed: 1,
+            max_iters: Some(1),
+            max_seconds: None,
+            max_input_len: 64,
+            timeout_ms: 1000,
+            tool: "test".into(),
+            host: "test".into(),
+            rustc: "test".into(),
+            git: "test".into(),
+            git_dirty: 0,
+            fast_build: build,
+            canonical_build: None,
+            sanitizer_build: None,
+            started_unix_ms: 0,
+        };
+        let session = CampaignSession::begin(&out.0, &sample_target_manifest(), &record).unwrap();
 
         let worker = TempDir::new("worker");
         fs::write(worker.0.join("a"), b"alpha").unwrap();
@@ -159,6 +180,7 @@ mod tests {
             objectives: 1,
             canonical_edges: 0,
             elapsed_ms: 1,
+            crash: Default::default(),
         };
         session.finish(snapshot).unwrap();
         assert!(

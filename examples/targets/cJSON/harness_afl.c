@@ -12,7 +12,13 @@
  * This is a harness, not a performance or superiority claim.
  */
 
+int achlys_cjson_test_one_input(const uint8_t *data, size_t size);
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    return achlys_cjson_test_one_input(data, size);
+}
+
+int achlys_cjson_test_one_input(const uint8_t *data, size_t size) {
     char buf[ACHLYS_AFL_HARNESS_CAP];
     size_t n = size;
 

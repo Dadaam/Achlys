@@ -9,7 +9,7 @@ pub mod identity;
 pub mod ids;
 pub mod manifest;
 
-pub use events::{CampaignEvent, InputMetadata, MetricsSnapshot};
+pub use events::{CampaignEvent, CampaignRecord, CrashStats, InputMetadata, MetricsSnapshot};
 pub use identity::{BuildIdentity, BuildIdentityParts};
 pub use ids::{BuildId, CampaignId, CoverageDigest, InputId, TargetId};
 pub use manifest::{

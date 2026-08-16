@@ -2,13 +2,18 @@ fn main() {
     let cjson_dir = "examples/targets/cJSON";
 
     println!("cargo::rerun-if-changed={}/cJSON.c", cjson_dir);
+    println!("cargo::rerun-if-changed={}/cJSON.h", cjson_dir);
     println!("cargo::rerun-if-changed={}/sancov_callbacks.c", cjson_dir);
+    println!("cargo::rerun-if-changed={}/harness_afl.c", cjson_dir);
     println!("cargo::rerun-if-changed=benchmarks/micro/crash_if_magic.c");
+    println!("cargo::rerun-if-changed=benchmarks/micro/nonzero_exit.c");
+    println!("cargo::rerun-if-changed=benchmarks/micro/coverage_stable.c");
 
     // Graybox first: both libs export cJSON_Parse. The first linked copy wins.
     // H0 needs the SanCov-instrumented definition plus the callbacks.
     cc::Build::new()
         .file(format!("{}/cJSON.c", cjson_dir))
+        .file(format!("{}/harness_afl.c", cjson_dir))
         .file(format!("{}/sancov_callbacks.c", cjson_dir))
         .include(cjson_dir)
         .compiler("clang")
@@ -27,4 +32,14 @@ fn main() {
         .file("benchmarks/micro/crash_if_magic.c")
         .opt_level(3)
         .compile("micro_crash_if_magic");
+
+    cc::Build::new()
+        .file("benchmarks/micro/nonzero_exit.c")
+        .opt_level(3)
+        .compile("micro_nonzero_exit");
+
+    cc::Build::new()
+        .file("benchmarks/micro/coverage_stable.c")
+        .opt_level(3)
+        .compile("micro_coverage_stable");
 }

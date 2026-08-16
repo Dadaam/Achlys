@@ -275,7 +275,16 @@ int main(void) {
         let pid = child.id();
 
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(input);
+            match stdin.write_all(input) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
+                Err(source) => {
+                    kill_process_group(pid);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(InfraError::Write { source });
+                }
+            }
         }
 
         let stdout = child.stdout.take();

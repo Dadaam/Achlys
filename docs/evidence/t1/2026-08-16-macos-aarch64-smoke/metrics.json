@@ -1,7 +1,17 @@
 {
-  "executions": 3078,
-  "corpus_count": 67,
+  "executions": 2965,
+  "corpus_count": 59,
   "objectives": 0,
-  "canonical_edges": 88,
-  "elapsed_ms": 28
+  "canonical_edges": 115,
+  "elapsed_ms": 21,
+  "crash": {
+    "candidates": 0,
+    "unique_candidates": 0,
+    "replays_attempted": 0,
+    "reproduced_crashes": 0,
+    "unique_crash_signatures": 0,
+    "clean_replays": 0,
+    "timeouts": 0,
+    "infra_failures": 0
+  }
 }

@@ -266,6 +266,7 @@ flags = ["-O1", "-g", "-fsanitize=address,undefined"]
             "micro-crash-if-magic.toml",
             "micro-nonzero-exit.toml",
             "micro-coverage-stable.toml",
+            "micro-timeout-hang.toml",
         ] {
             let m = TargetManifest::from_path(root.join(name)).unwrap();
             assert_eq!(m.schema_version, MANIFEST_SCHEMA_VERSION);

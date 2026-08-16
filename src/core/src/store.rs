@@ -21,8 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use achlys_protocol::{
-    CampaignEvent, CampaignId, CoverageDigest, InputId, InputMetadata, MetricsSnapshot,
-    TargetManifest,
+    BuildId, CampaignEvent, CampaignId, CampaignRecord, CoverageDigest, InputId, InputMetadata,
+    MetricsSnapshot, TargetManifest,
 };
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -36,6 +36,8 @@ pub struct CanonicalReport {
     pub admitted: usize,
     pub rejected: usize,
     pub replayed: usize,
+    pub canonical_build: BuildId,
+    pub artifact_hash: Option<String>,
 }
 
 /// Filesystem object store for one campaign. Not invoked per execution.
@@ -53,6 +55,12 @@ impl CampaignStore {
         manifest: &TargetManifest,
     ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
+        if is_occupied(&root) {
+            bail!(
+                "campaign root is not empty: {} (reuse is forbidden; pick a new --out)",
+                root.display()
+            );
+        }
         fs::create_dir_all(&root)
             .with_context(|| format!("create campaign root {}", root.display()))?;
         for dir in [
@@ -202,12 +210,38 @@ impl CampaignStore {
         self.campaign_id
     }
 
+    pub fn write_campaign_record(&self, record: &CampaignRecord) -> Result<()> {
+        if record.campaign_id != self.campaign_id {
+            bail!(
+                "campaign record id {} does not match store {}",
+                record.campaign_id,
+                self.campaign_id
+            );
+        }
+        let path = self.root.join("campaign.json");
+        let json = serde_json::to_vec_pretty(record).context("serialize campaign.json")?;
+        write_atomic(&path, &json)
+    }
+
     fn input_object_path(&self, id: &InputId) -> PathBuf {
         object_path(&self.root.join("corpus").join("objects"), id)
     }
 
     fn crash_object_path(&self, id: &InputId) -> PathBuf {
         object_path(&self.root.join("crashes").join("objects"), id)
+    }
+}
+
+pub(crate) fn is_occupied(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    if !path.is_dir() {
+        return true;
+    }
+    match fs::read_dir(path) {
+        Ok(entries) => entries.flatten().any(|e| e.file_name() != ".DS_Store"),
+        Err(_) => true,
     }
 }
 
@@ -451,6 +485,19 @@ mod tests {
             }
         }
         assert_eq!(stored, 2, "InputStored only on first insert");
+    }
+
+    #[test]
+    fn create_rejects_occupied_root() {
+        let tmp = TempDir::new("occupied");
+        let campaign = CampaignId::from_label("occupied");
+        CampaignStore::create(&tmp.0, campaign, &sample_target_manifest()).unwrap();
+        let err = CampaignStore::create(&tmp.0, campaign, &sample_target_manifest())
+            .expect_err("second create must fail");
+        assert!(
+            err.to_string().contains("not empty"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]

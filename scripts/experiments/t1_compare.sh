@@ -196,14 +196,7 @@ else
     BUILD_LOG="${AFL_DIR}/build.log"
     built=0
 
-    if afl-clang-fast -O0 -g -fsanitize=fuzzer \
-      -I "${CJSON_DIR}" \
-      "${HARNESS_SRC}" "${CJSON_DIR}/cJSON.c" \
-      -o "${HARNESS_BIN}" > "${BUILD_LOG}" 2>&1; then
-      built=1
-      echo "aflpp_harness=libfuzzer" > "${AFL_DIR}/harness.mode"
-    else
-      cat > "${AFL_DIR}/stdin_driver.c" <<'EOF'
+    cat > "${AFL_DIR}/stdin_driver.c" <<'EOF'
 #include <stdint.h>
 #include <stdio.h>
 
@@ -215,13 +208,13 @@ int main(void) {
     return LLVMFuzzerTestOneInput(buf, n);
 }
 EOF
-      if afl-clang-fast -O0 -g \
-        -I "${CJSON_DIR}" \
-        "${HARNESS_SRC}" "${CJSON_DIR}/cJSON.c" "${AFL_DIR}/stdin_driver.c" \
-        -o "${HARNESS_BIN}" >> "${BUILD_LOG}" 2>&1; then
-        built=1
-        echo "aflpp_harness=stdin" > "${AFL_DIR}/harness.mode"
-      fi
+    # Same harness as Achlys T1 (harness_afl.c), -O3, 64-byte cap, seeded, 1s timeout.
+    if afl-clang-fast -O3 \
+      -I "${CJSON_DIR}" \
+      "${HARNESS_SRC}" "${CJSON_DIR}/cJSON.c" "${AFL_DIR}/stdin_driver.c" \
+      -o "${HARNESS_BIN}" > "${BUILD_LOG}" 2>&1; then
+      built=1
+      echo "aflpp_harness=stdin-o3-g64" > "${AFL_DIR}/harness.mode"
     fi
 
     if [[ "${built}" != "1" ]]; then
@@ -233,13 +226,16 @@ EOF
       export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
       export AFL_NO_AFFINITY=1
       export AFL_NO_UI=1
+      export AFL_MAP_SIZE=65536
 
       AFL_OUT="${AFL_DIR}/out"
       AFL_LOG="${AFL_DIR}/stdout.log"
-      # -V is seconds in AFL++. Same seed corpus and wall budget as the pair.
       if afl-fuzz \
         -i "${SEED_DIR}" \
         -o "${AFL_OUT}" \
+        -s "${SEED}" \
+        -G 64 \
+        -t 1000 \
         -V "${SECONDS_BUDGET}" \
         -- "${HARNESS_BIN}" \
         > "${AFL_LOG}" 2>&1; then
@@ -251,6 +247,39 @@ EOF
         echo "T1_AFLPP=FAIL reason=afl-fuzz-run-failed"
       fi
     fi
+  fi
+fi
+
+# Replay each lane's corpus on the same canonical dump. Coverage, not exec/s.
+if command -v cargo >/dev/null 2>&1; then
+  cargo build --release --example achlys_oracle >/dev/null
+  replay_one() {
+    local name="$1"
+    local corpus="$2"
+    if [[ ! -d "${corpus}" ]]; then
+      echo "T1_CANONICAL_${name}=SKIP reason=no-corpus"
+      return 0
+    fi
+    local outf="${OUT_ROOT}/canonical_${name}.json"
+    if ./target/release/examples/achlys_oracle \
+      --manifest benchmarks/manifests/cjson-parse.toml \
+      --corpus "${corpus}" \
+      --out "${outf}" \
+      > "${OUT_ROOT}/canonical_${name}.log"; then
+      echo "T1_CANONICAL_${name}=OK file=${outf}"
+    else
+      echo "T1_CANONICAL_${name}=FAIL"
+      return 1
+    fi
+  }
+  replay_one LIBAFL "${OUT_ROOT}/libafl/corpus" || true
+  replay_one ACHLYS "${OUT_ROOT}/achlys/corpus" || true
+  if [[ -d "${OUT_ROOT}/aflpp/out/default/queue" ]]; then
+    replay_one AFLPP "${OUT_ROOT}/aflpp/out/default/queue" || true
+  elif [[ -d "${OUT_ROOT}/aflpp/out/queue" ]]; then
+    replay_one AFLPP "${OUT_ROOT}/aflpp/out/queue" || true
+  else
+    echo "T1_CANONICAL_AFLPP=SKIP reason=no-queue"
   fi
 fi
 
