@@ -20,33 +20,29 @@ Treat the following as **unsupported**, even if a flag or type still exists:
 
 | Claim or flag | Actual behavior |
 |---|---|
-| `--source` “graybox” | Compiles C/C++ with SanCov, then **still fork+execs** the binary. The fuzzer never reads the child coverage map. This is not graybox. Scheduled to be disabled. |
-| Autonomous / default AI training | `AutoTrainer` watches `--corpus` or `./runtime/corpus`. The fuzzer never writes that directory. Training is **disconnected** and **not functional**. |
+| `--source` “graybox” | **Rejected.** SanCov child coverage is not transported. The flag errors out. |
+| Autonomous / default AI training | **Disabled.** `AutoTrainer` is not started. AI only loads if `--model` is given. |
 | `--model`, ONNX, `achlys-cortex` | Experimental code. Not on the H0 (substrate correctness) path. Do not treat this as a working AI-guided fuzzer. |
 | 4-stage escalation, symbolic execution, QEMU, network, distributed | Not implemented. Not the current product. |
 | Clean-clone examples | `examples/targets/cJSON` is a broken gitlink. A clean clone does **not** currently build the root package or the cJSON examples. |
 
-Use `--no-ai` so the CLI does not start the disconnected trainer.
+Default CLI is havoc-only. `--model` is optional and experimental.
 
 ## Build
 
 Requirements:
 
-- **Rust 1.97+** (edition 2024)
-- **clang** only if you compile the cJSON examples (currently broken on a clean clone) or the unsupported `--source` path
-- Python / PyTorch are **not** required. The fuzzer does not train a model.
+- **Rust 1.97.1** (`rust-toolchain.toml`)
+- **clang** to compile the vendored cJSON examples and micro targets
+- Python / PyTorch are **not** required
 
 ```bash
 git clone https://github.com/Dadaam/achlys.git
 cd achlys
-
-# CLI only — avoids the root build.rs that compiles missing cJSON sources
-cargo build -p achlys-cli --release
+cargo build --workspace --release
 ```
 
-A bare `cargo build` or `cargo build --release` at the workspace root will fail on a clean clone because `build.rs` expects `examples/targets/cJSON/cJSON.c`.
-
-If the cJSON tree is present (it is not, on a clean clone):
+cJSON is vendored at `examples/targets/cJSON` (DaveGamble/cJSON v1.7.18). The root `build.rs` compiles the example libraries.
 
 ```bash
 cargo run --example cjson_graybox
@@ -71,13 +67,13 @@ From a source checkout:
 cargo run -p achlys-cli --release -- fuzz ./parser @@ --corpus seeds/ --no-ai
 ```
 
-`--source`, `--model`, and `--train-delay` still parse. They do not provide graybox coverage or working autonomous training.
+`--source` is rejected. `--train-delay` is ignored. `--model` is experimental.
 
 ## Limitations
 
-- Success ladder **Level 0** only. No H0 throughput evidence. No coverage or “hard branch” claims.
-- CLI campaigns have no coverage map. Blackbox admission currently uses `ConstFeedback(true)` (unbounded keep-everything).
-- Spawn, write, and observer failures in `ForkExecTarget` can be reported as successful executions.
+- Success ladder **Level 0** only. No H0 throughput evidence yet. No coverage or “hard branch” claims.
+- CLI campaigns have no coverage map. Blackbox admission uses `ConstFeedback(false)` (seeds + crashes only).
+- Spawn, write, and wait failures are `InfraError` and abort the campaign. They are not target crashes.
 - No forkserver, persistent mode, shared-memory coverage, sanitizer replay, or multi-worker campaign.
 - ML crates (`achlys-cortex`, `AiMutator`, `HybridStage`, `AutoTrainer`) are experimental leftovers, not the research baseline.
 
