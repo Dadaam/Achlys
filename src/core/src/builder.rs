@@ -16,7 +16,7 @@ use libafl::{
     fuzzer::{Fuzzer, StdFuzzer},
     generators::RandBytesGenerator,
     inputs::{BytesInput, HasTargetBytes},
-    monitors::SimpleMonitor,
+    monitors::{NopMonitor, SimpleMonitor},
     mutators::{havoc_mutations::havoc_mutations, scheduled::HavocScheduledMutator},
     observers::{HitcountsMapObserver, StdMapObserver},
     schedulers::QueueScheduler,
@@ -431,7 +431,7 @@ impl FuzzerBuilder {
     }
 
     fn run_substrate_with_corpus<T, C>(
-        mut self,
+        self,
         mut target: T,
         corpus: C,
     ) -> Result<SubstrateReport>
@@ -483,7 +483,9 @@ impl FuzzerBuilder {
             }
         };
 
-        let mon = self.make_monitor();
+        // Measurement path: no per-event formatting. Verbose monitors
+        // belong in a separate observability experiment.
+        let mon = NopMonitor::new();
         let mut mgr = SimpleEventManager::new(mon);
 
         let mut executor = InProcessExecutor::with_timeout(

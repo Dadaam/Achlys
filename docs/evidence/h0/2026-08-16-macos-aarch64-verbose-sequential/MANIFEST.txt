@@ -1,0 +1,16 @@
+date=2026-08-16T16:09:25Z
+git=201fea685bc7886d7cc60a24defeeabeeec5796f
+rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)
+rustc_vv.rustc 1.97.1 (8bab26f4f 2026-07-14)
+rustc_vv.binary: rustc
+rustc_vv.commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+rustc_vv.commit-date: 2026-07-14
+rustc_vv.host: aarch64-apple-darwin
+rustc_vv.release: 1.97.1
+rustc_vv.LLVM version: 22.1.6
+seconds=30
+trials=5
+max_input_len=64
+target=cjson
+profile=release
+examples=libafl_baseline,achlys_h0

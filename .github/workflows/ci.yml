@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 jobs:
@@ -28,3 +27,6 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-targets
+
+      - name: H0 functional smoke
+        run: H0_FUNCTIONAL=1 ./scripts/experiments/h0_throughput.sh

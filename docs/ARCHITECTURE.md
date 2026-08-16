@@ -15,21 +15,21 @@ Status: **Level 0** (buildable prototype). Public positioning until evidence exi
 ```
 Achlys/
 ├── Cargo.toml                 # workspace + root package (examples / cJSON build.rs)
-├── build.rs                   # compiles vendored cJSON; fails on a clean clone
+├── build.rs                   # compiles vendored cJSON + micro target
 ├── src/
 │   ├── cli/                   # achlys-cli  — `achlys fuzz`
 │   ├── core/                  # achlys-core — FuzzerBuilder + LibAFL wiring
 │   ├── bridge/                # achlys-bridge — Target, ForkExec, InProcess, AutoCompiler
 │   └── cortex/                # achlys-cortex — experimental ONNX / trainer (not H0)
 ├── examples/fuzzers/          # hand-wired LibAFL examples
-└── examples/targets/cJSON     # broken gitlink; not present after a clean clone
+└── examples/targets/cJSON     # vendored DaveGamble/cJSON v1.7.18 + SanCov callbacks
 ```
 
 | Crate | What it actually does today |
 |---|---|
-| **achlys-cli** | Parses flags, optionally compiles `--source`, always constructs `ForkExecTarget`, runs `FuzzerBuilder`, optional ratatui TUI. |
-| **achlys-core** | `FuzzerBuilder` wraps LibAFL havoc. `run()` dispatches to `run_blackbox` or `run_graybox`. CLI always hits blackbox. |
-| **achlys-bridge** | `ForkExecTarget` (used): spawn binary, stdin or `@@`, crash/timeout from the child. `InProcessTarget` (unused by CLI). `AutoCompiler` (used only by `--source`). |
+| **achlys-cli** | Parses flags, always constructs `ForkExecTarget`, runs `FuzzerBuilder`, optional ratatui TUI. `--source` is rejected. |
+| **achlys-core** | `FuzzerBuilder` wraps LibAFL havoc. `run()` is the CLI path (blackbox). `run_substrate()` is the H0 in-process graybox worker. |
+| **achlys-bridge** | `ForkExecTarget` (CLI): spawn binary, stdin or `@@`. Spawn/write/wait failures are `InfraError`. `InProcessTarget` used by `achlys_h0`. |
 | **achlys-cortex** | ONNX load, `AutoTrainer`, `HotSwapCortex`. Experimental. Not on the H0 path. |
 
 There is no QEMU backend, no network target, no symbolic engine, no orchestrator, and no multi-worker control plane.
@@ -39,8 +39,7 @@ There is no QEMU backend, no network target, no symbolic engine, no orchestrator
 ```
 achlys fuzz <binary> [args]
         │
-        ├─ --source …  → AutoCompiler::compile_binary (SanCov in the child)
-        │                    └── still ForkExecTarget(instrumented)
+        ├─ --source …  → error (SanCov child coverage is not transported)
         │
         └─ otherwise   → ForkExecTarget(user binary)
                               │
@@ -55,28 +54,29 @@ achlys fuzz <binary> [args]
               InProcessExecutor around a harness that
               calls target.execute() → fork+exec the child
                               │
-              ConstFeedback(true) + CrashFeedback
+              ConstFeedback(false) + CrashFeedback
               HavocScheduledMutator / havoc_mutations()
 ```
 
 `achlys fuzz` never constructs `InProcessTarget`. There is no coverage-guided CLI campaign.
 
-`--source` is **not graybox**. SanCov writes a map inside the child process. The parent fuzzer does not transport or consume that map (Master Plan §24.1). The flag is unsupported and scheduled to be disabled.
+`--source` is rejected. SanCov in a child process is not graybox (Master Plan §24.1).
 
 ## Corpus and results
 
-- Queue: `InMemoryCorpus`. Seeds are read from `--corpus` once. New queue entries are not written back to that directory.
-- Crashes: `OnDiskCorpus` under `--output` (default `./crashes`).
-- Blackbox admission: `ConstFeedback(true)` — every execution is “interesting.” Unbounded. Not a novelty policy.
-- `ForkExecTarget` maps several spawn/I/O errors to `ExitKind::Ok`. Those are infrastructure failures, not successful executions.
+- CLI queue: `InMemoryCorpus`. Seeds are read from `--corpus` once. New queue entries are not written back to that directory.
+- H0 queue: `InMemoryOnDiskCorpus` under the example `--out` directory.
+- Crashes: `OnDiskCorpus` under `--output` / `--out`.
+- Blackbox admission: `ConstFeedback(false)` — seeds and crashes only. No novelty signal.
+- `ForkExecTarget` returns `Err(InfraError)` on missing binary, spawn, write, and wait failures.
 
 ## Unused or disconnected pieces
 
 These types exist. They are not a working product surface:
 
-- **`InProcessTarget` + `FuzzerBuilder::run_graybox`.** Used only if a `Target` reports a coverage map. The CLI never does. The working graybox demonstration is `examples/fuzzers/cjson_graybox_fuzzer.rs` (requires cJSON sources).
-- **`EscalatingStage`, `PlateauDetector`, `AiMutator`, `HybridStage`.** Wired when a `CortexInterface` is supplied. In CLI blackbox mode the plateau timer fires on wall time alone (no coverage events).
-- **`AutoTrainer`.** Watches `--corpus` or `./runtime/corpus`. The fuzzer does not write that directory. Autonomous training is disconnected and not functional.
+- **`FuzzerBuilder::run_graybox`.** Plateau-wrapped graybox. H0 uses `run_substrate` instead. The CLI never hits this path.
+- **`EscalatingStage`, `PlateauDetector`, `AiMutator`, `HybridStage`.** Wired when a `CortexInterface` is supplied (`--model`). Not on the H0 path.
+- **`AutoTrainer`.** Not started. The live corpus is still in-memory on the CLI path.
 - **TUI.** Displays LibAFL monitor stats. It does not implement a campaign control plane.
 
 ## Examples

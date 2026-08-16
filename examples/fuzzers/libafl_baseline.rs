@@ -19,7 +19,7 @@ use libafl::{
     fuzzer::{Fuzzer, StdFuzzer},
     generators::RandBytesGenerator,
     inputs::{BytesInput, HasTargetBytes},
-    monitors::SimpleMonitor,
+    monitors::NopMonitor,
     mutators::{havoc_mutations::havoc_mutations, scheduled::HavocScheduledMutator},
     observers::{HitcountsMapObserver, StdMapObserver},
     schedulers::QueueScheduler,
@@ -244,7 +244,7 @@ fn main() {
         ExitKind::Ok
     };
 
-    let mon = SimpleMonitor::new(|s| println!("{s}"));
+    let mon = NopMonitor::new();
     let mut mgr = SimpleEventManager::new(mon);
 
     let mut executor = InProcessExecutor::with_timeout(

@@ -31,9 +31,10 @@ impl CoverageMap {
     }
 }
 
-// SAFETY: The coverage map is only accessed single-threaded within the fuzz loop.
+// SAFETY: Send transfers exclusive ownership of the pointer. It does not
+// allow concurrent access. Do not add Sync: a shared &CoverageMap would
+// alias a mutable coverage bitmap across threads.
 unsafe impl Send for CoverageMap {}
-unsafe impl Sync for CoverageMap {}
 
 /// Harness function type: takes input bytes, returns execution result.
 type HarnessFn = Box<dyn FnMut(&[u8]) -> ExitKind>;

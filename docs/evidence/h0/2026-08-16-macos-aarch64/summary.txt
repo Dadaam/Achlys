@@ -1,0 +1,9 @@
+mean_overhead=0.010973
+median_overhead=0.009918
+min_overhead=0.005948
+max_overhead=0.020360
+t95_lo=0.003823
+t95_hi=0.018123
+gate=0.05
+n=5
+pass=1

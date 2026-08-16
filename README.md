@@ -2,7 +2,7 @@
 
 > Achlys is an experimental cooperative fuzzing system built on LibAFL. It investigates whether typed cross-strategy assistance and cost-aware worker allocation can improve coverage and hard-branch discovery under equal resource budgets.
 
-This repository is a **Level 0** prototype. A development H0 run (cJSON in-process, 5 × 30 s, macOS aarch64) showed Achlys `run_substrate` within **0.56%** of a minimal LibAFL baseline. That is not a release result, not an AFL++ comparison, and not Level 1.
+This repository is a **Level 0** prototype. A development H0 experiment on cJSON in-process (macOS aarch64, 5 × 30 s) found **low overhead, under the 5% gate**, versus a minimal LibAFL baseline. That is a point estimate under that protocol, not a release result, not an AFL++ comparison, and not Level 1.
 
 The design source of truth is [`docs/MASTER_PLAN.md`](docs/MASTER_PLAN.md). If this README or [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) conflicts with the Master Plan, the Master Plan wins.
 
@@ -24,7 +24,6 @@ Treat the following as **unsupported**, even if a flag or type still exists:
 | Autonomous / default AI training | **Disabled.** `AutoTrainer` is not started. AI only loads if `--model` is given. |
 | `--model`, ONNX, `achlys-cortex` | Experimental code. Not on the H0 (substrate correctness) path. Do not treat this as a working AI-guided fuzzer. |
 | 4-stage escalation, symbolic execution, QEMU, network, distributed | Not implemented. Not the current product. |
-| Clean-clone examples | `examples/targets/cJSON` is a broken gitlink. A clean clone does **not** currently build the root package or the cJSON examples. |
 
 Default CLI is havoc-only. `--model` is optional and experimental.
 
@@ -71,7 +70,7 @@ cargo run -p achlys-cli --release -- fuzz ./parser @@ --corpus seeds/ --no-ai
 
 ## Limitations
 
-- Success ladder **Level 0**. H0 development evidence: [`docs/decisions/2026-08-16-h0-substrate.md`](docs/decisions/2026-08-16-h0-substrate.md). Re-run on Linux x86-64 before quoting it. No AFL++ or “hard branch” claims.
+- Success ladder **Level 0**. H0 development evidence: [`docs/decisions/2026-08-16-h0-substrate.md`](docs/decisions/2026-08-16-h0-substrate.md) and [`docs/evidence/h0/`](docs/evidence/h0/). Re-run on Linux x86-64 before quoting a number. No AFL++ or “hard branch” claims.
 - CLI campaigns have no coverage map. Blackbox admission uses `ConstFeedback(false)` (seeds + crashes only).
 - Spawn, write, and wait failures are `InfraError` and abort the campaign. They are not target crashes.
 - No forkserver, persistent mode, shared-memory coverage, sanitizer replay, or multi-worker campaign.

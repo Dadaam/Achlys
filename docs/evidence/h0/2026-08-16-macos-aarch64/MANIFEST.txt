@@ -1,0 +1,27 @@
+date=2026-08-16T16:31:13Z
+git=75090bed596a90dd1685c22cd94502e790ce1492
+git_dirty=8
+cargo_lock=249367f51e3ff403d77074565485f7976a397135c9c0fece4fc1d84b22aaec52
+rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)
+rustc_vv.rustc 1.97.1 (8bab26f4f 2026-07-14)
+rustc_vv.binary: rustc
+rustc_vv.commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+rustc_vv.commit-date: 2026-07-14
+rustc_vv.host: aarch64-apple-darwin
+rustc_vv.release: 1.97.1
+rustc_vv.LLVM version: 22.1.6
+uname=Darwin Mac.lan 25.5.0 Darwin Kernel Version 25.5.0: Tue Jun  9 22:28:17 PDT 2026; root:xnu-12377.121.10~1/RELEASE_ARM64_T8142 arm64
+seconds=30
+trials=5
+warmup_seconds=3
+order=abba
+order_seed=10056
+max_input_len=64
+func_seed=4242
+func_iters=1000
+func_corpus_files=150
+target=cjson
+profile=release
+monitor=NopMonitor
+examples=libafl_baseline,achlys_h0
+gate=0.05
