@@ -137,6 +137,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn from_manifest_hashes_repo_sources() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = crate::manifest::TargetManifest::from_path(
+            root.join("benchmarks/manifests/cjson-parse.toml"),
+        )
+        .unwrap();
+        let fast = BuildIdentity::from_manifest(&manifest, BuildKind::Fast, &root).unwrap();
+        let canon = BuildIdentity::from_manifest(&manifest, BuildKind::Canonical, &root).unwrap();
+        assert_eq!(fast.target_id.0, "cjson-parse");
+        assert_eq!(fast.source_hashes.len(), 2);
+        assert_ne!(fast.build_id, canon.build_id);
+    }
+
+    #[test]
     fn build_id_is_stable_and_sensitive() {
         let mut sources = BTreeMap::new();
         sources.insert("a.c".into(), [1u8; 32]);
