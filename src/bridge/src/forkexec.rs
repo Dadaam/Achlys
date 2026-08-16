@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use libafl::executors::ExitKind;
 
-use crate::target::Target;
+use crate::target::{InfraError, Target};
 
 /// Unix signals indicating a crash.
 #[cfg(unix)]
@@ -87,6 +87,72 @@ impl ForkExecTarget {
         self
     }
 
+    #[cfg(test)]
+    #[must_use]
+    fn with_temp_dir(mut self, dir: PathBuf) -> Self {
+        self.temp_dir = dir;
+        self
+    }
+
+    fn run_child(&self, cmd: &mut Command, input: &[u8]) -> Result<ExitKind, InfraError> {
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(InfraError::MissingBinary {
+                    path: self.binary_path.clone(),
+                });
+            }
+            Err(source) => {
+                return Err(InfraError::Spawn {
+                    path: self.binary_path.clone(),
+                    source,
+                });
+            }
+        };
+
+        // Write input to stdin if needed. Broken pipe is the target exiting
+        // early, not an infrastructure failure.
+        if matches!(self.input_method, InputMethod::Stdin)
+            && let Some(mut stdin) = child.stdin.take()
+        {
+            let _ = stdin.write_all(input);
+        }
+
+        match child.wait_timeout(self.timeout) {
+            Ok(Some(status)) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    if let Some(signal) = status.signal() {
+                        use signals::*;
+                        match signal {
+                            SIGILL | SIGABRT | SIGBUS | SIGFPE | SIGSEGV => Ok(ExitKind::Crash),
+                            _ => Ok(ExitKind::Ok),
+                        }
+                    } else {
+                        // Nonzero exit without a crash signal is not a crash
+                        // and not an infrastructure failure.
+                        Ok(ExitKind::Ok)
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    if status.success() {
+                        Ok(ExitKind::Ok)
+                    } else {
+                        Ok(ExitKind::Crash)
+                    }
+                }
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Ok(ExitKind::Timeout)
+            }
+            Err(source) => Err(InfraError::Wait { source }),
+        }
+    }
+
     fn build_command(&self, input: &[u8]) -> std::io::Result<(Command, Option<PathBuf>)> {
         let mut cmd = Command::new(&self.binary_path);
         let mut temp_file = None;
@@ -127,60 +193,20 @@ impl ForkExecTarget {
 }
 
 impl Target for ForkExecTarget {
-    fn execute(&mut self, input: &[u8]) -> ExitKind {
-        let (mut cmd, temp_file) = match self.build_command(input) {
-            Ok(result) => result,
-            Err(_) => return ExitKind::Ok,
-        };
-
-        let mut child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(_) => return ExitKind::Ok,
-        };
-
-        // Write input to stdin if needed
-        if matches!(self.input_method, InputMethod::Stdin)
-            && let Some(mut stdin) = child.stdin.take()
-        {
-            let _ = stdin.write_all(input);
-            // Drop stdin to close pipe and let the process proceed
+    fn execute(&mut self, input: &[u8]) -> Result<ExitKind, InfraError> {
+        if !self.binary_path.is_file() {
+            return Err(InfraError::MissingBinary {
+                path: self.binary_path.clone(),
+            });
         }
 
-        // Wait with timeout
-        let result = match child.wait_timeout(self.timeout) {
-            Ok(Some(status)) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::ExitStatusExt;
-                    if let Some(signal) = status.signal() {
-                        use signals::*;
-                        match signal {
-                            SIGILL | SIGABRT | SIGBUS | SIGFPE | SIGSEGV => ExitKind::Crash,
-                            _ => ExitKind::Ok,
-                        }
-                    } else {
-                        ExitKind::Ok
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    if status.success() {
-                        ExitKind::Ok
-                    } else {
-                        ExitKind::Crash
-                    }
-                }
-            }
-            Ok(None) => {
-                // Timed out
-                let _ = child.kill();
-                let _ = child.wait();
-                ExitKind::Timeout
-            }
-            Err(_) => ExitKind::Ok,
+        let (mut cmd, temp_file) = match self.build_command(input) {
+            Ok(result) => result,
+            Err(source) => return Err(InfraError::Write { source }),
         };
 
-        // Cleanup temp file
+        let result = self.run_child(&mut cmd, input);
+
         if let Some(path) = temp_file {
             let _ = fs::remove_file(path);
         }
@@ -200,11 +226,17 @@ impl Target for ForkExecTarget {
 
 /// Extension trait for `std::process::Child` to add timeout support.
 trait ChildExt {
-    fn wait_timeout(&mut self, timeout: Duration) -> std::io::Result<Option<std::process::ExitStatus>>;
+    fn wait_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> std::io::Result<Option<std::process::ExitStatus>>;
 }
 
 impl ChildExt for std::process::Child {
-    fn wait_timeout(&mut self, timeout: Duration) -> std::io::Result<Option<std::process::ExitStatus>> {
+    fn wait_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
         let start = std::time::Instant::now();
         let poll_interval = Duration::from_millis(1);
 
@@ -236,23 +268,54 @@ mod tests {
     fn test_file_replace_detection() {
         let target = ForkExecTarget::new(
             "/usr/bin/test_binary",
-            vec!["-i".to_string(), "@@".to_string(), "-o".to_string(), "/dev/null".to_string()],
+            vec![
+                "-i".to_string(),
+                "@@".to_string(),
+                "-o".to_string(),
+                "/dev/null".to_string(),
+            ],
         );
-        assert!(matches!(target.input_method, InputMethod::FileReplace { position: 1 }));
+        assert!(matches!(
+            target.input_method,
+            InputMethod::FileReplace { position: 1 }
+        ));
     }
 
     #[test]
     fn test_execute_cat_stdin() {
         let mut target = ForkExecTarget::new("/bin/cat", vec![]);
-        let result = target.execute(b"hello world");
+        let result = target.execute(b"hello world").expect("cat should run");
         assert!(matches!(result, ExitKind::Ok));
     }
 
     #[test]
     fn test_execute_false_returns_ok() {
-        // /bin/false exits with code 1, but that's not a crash signal
-        let mut target = ForkExecTarget::new("/bin/false", vec![]);
-        let result = target.execute(b"");
+        // false exits with code 1, but that's not a crash signal
+        let mut target = ForkExecTarget::new("/usr/bin/false", vec![]);
+        let result = target.execute(b"").expect("false should run");
         assert!(matches!(result, ExitKind::Ok));
+    }
+
+    #[test]
+    fn test_execute_missing_binary_is_infra_error() {
+        let mut target = ForkExecTarget::new("/no/such/achlys_target_binary", vec![]);
+        let err = target
+            .execute(b"")
+            .expect_err("missing binary must be an infrastructure failure");
+        assert!(matches!(err, InfraError::MissingBinary { .. }));
+    }
+
+    #[test]
+    fn test_execute_write_failure_is_infra_error() {
+        let blocker =
+            std::env::temp_dir().join(format!("achlys_forkexec_not_a_dir_{}", std::process::id()));
+        fs::write(&blocker, b"x").expect("create blocker file");
+        let mut target =
+            ForkExecTarget::new("/bin/cat", vec!["@@".into()]).with_temp_dir(blocker.clone());
+        let err = target
+            .execute(b"hello")
+            .expect_err("unwritable input path must be an infrastructure failure");
+        let _ = fs::remove_file(blocker);
+        assert!(matches!(err, InfraError::Write { .. }));
     }
 }

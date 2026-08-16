@@ -45,7 +45,9 @@ fn main() {
         StdMapObserver::new("dummy_map", slice) 
     };
     
-    let mut feedback = ConstFeedback::new(true); // on MEEEEEEENT vu qu'on est en blackbox
+    // Blackbox has no novelty signal; ConstFeedback(true) admits every exec
+    // (unbounded corpus, Master Plan 24.2).
+    let mut feedback = ConstFeedback::new(false);
     let mut objective = CrashFeedback::new(); // détecter le crash 
 
     let mut state = StdState::new(

@@ -1,6 +1,6 @@
 use libafl::executors::ExitKind;
 
-use crate::target::Target;
+use crate::target::{InfraError, Target};
 
 /// Raw pointer + length to an external coverage map (e.g. EDGES_MAP from SanCov).
 ///
@@ -80,8 +80,8 @@ impl InProcessTarget {
 }
 
 impl Target for InProcessTarget {
-    fn execute(&mut self, input: &[u8]) -> ExitKind {
-        (self.harness)(input)
+    fn execute(&mut self, input: &[u8]) -> Result<ExitKind, InfraError> {
+        Ok((self.harness)(input))
     }
 
     fn coverage_map(&mut self) -> Option<&mut [u8]> {
@@ -116,8 +116,8 @@ mod tests {
         assert_eq!(target.observer_name(), "test_observer");
         assert!(!target.has_coverage());
 
-        assert!(matches!(target.execute(b"hello"), ExitKind::Ok));
-        assert!(matches!(target.execute(&[0xff]), ExitKind::Crash));
+        assert!(matches!(target.execute(b"hello"), Ok(ExitKind::Ok)));
+        assert!(matches!(target.execute(&[0xff]), Ok(ExitKind::Crash)));
     }
 
     #[test]
@@ -143,6 +143,6 @@ mod tests {
 
         assert!(target.has_coverage());
         assert_eq!(target.coverage_map().unwrap().len(), 16);
-        assert!(matches!(target.execute(b"hi"), ExitKind::Ok));
+        assert!(matches!(target.execute(b"hi"), Ok(ExitKind::Ok)));
     }
 }

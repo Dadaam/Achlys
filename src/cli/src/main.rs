@@ -7,14 +7,14 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use achlys_bridge::{AutoCompiler, ForkExecTarget};
+use achlys_bridge::ForkExecTarget;
 use achlys_core::{CortexInterface, FuzzerBuilder, FuzzerConfig, shared_log_sink};
-use achlys_cortex::{AutoTrainer, CortexModel, HotSwapCortex};
+use achlys_cortex::CortexModel;
 
 use crate::tui::{AchlysTui, create_tui_callback};
 
 #[derive(Parser)]
-#[command(name = "achlys", about = "4-stage adaptive fuzzer — hunt zero-days in any binary")]
+#[command(name = "achlys", about = "LibAFL-based fuzzer")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -39,12 +39,12 @@ enum Commands {
         #[arg(short, long, default_value = "./crashes")]
         output: PathBuf,
 
-        /// ONNX model path for AI-guided mutations (Stage 2).
-        /// If not provided, the model is trained autonomously during fuzzing.
+        /// ONNX model path for AI-guided mutations. Required to enable AI;
+        /// auto-training is disabled.
         #[arg(short, long)]
         model: Option<PathBuf>,
 
-        /// Disable autonomous AI training (havoc-only mode)
+        /// Force havoc-only mode (ignore --model)
         #[arg(long)]
         no_ai: bool,
 
@@ -52,7 +52,7 @@ enum Commands {
         #[arg(long)]
         no_tui: bool,
 
-        /// C/C++ source files to compile with SanCov instrumentation (graybox mode)
+        /// Disabled: SanCov child coverage is not transported. Omit this flag.
         #[arg(short, long, num_args = 1..)]
         source: Vec<PathBuf>,
 
@@ -64,7 +64,7 @@ enum Commands {
         #[arg(long, default_value = "4096")]
         max_input_len: usize,
 
-        /// Delay in seconds before first autonomous training (default: 300s = 5min)
+        /// Autonomous training is disabled; this flag is ignored.
         #[arg(long, default_value = "300")]
         train_delay: u64,
     },
@@ -85,7 +85,7 @@ fn main() -> Result<()> {
             source,
             plateau_timeout,
             max_input_len,
-            train_delay,
+            train_delay: _,
         } => {
             let config = FuzzerConfig {
                 corpus_dir: corpus.clone(),
@@ -96,21 +96,12 @@ fn main() -> Result<()> {
                 model_path: model.clone(),
             };
 
-            let cortex = setup_cortex(
-                no_ai,
-                model.as_ref(),
-                max_input_len,
-                corpus.as_ref(),
-                train_delay,
-                plateau_timeout,
-            )?;
+            let cortex = setup_cortex(no_ai, model.as_ref(), max_input_len)?;
 
-            let mode = if no_ai {
-                "havoc only"
-            } else if model.is_some() {
+            let mode = if model.is_some() && !no_ai {
                 "havoc → AI (model loaded)"
             } else {
-                "havoc → AI (auto-training)"
+                "havoc only"
             };
 
             let target_display = binary.display().to_string();
@@ -144,106 +135,36 @@ fn main() -> Result<()> {
             };
 
             if !source.is_empty() {
-                if no_tui {
-                    println!("[achlys] compiling source files with SanCov instrumentation...");
-                }
-                let compiler = AutoCompiler::new(std::env::temp_dir().join("achlys_build"));
-                let instrumented = compiler
-                    .compile_binary(&source, "target_instrumented")
-                    .context("source compilation failed")?;
-
-                let target = ForkExecTarget::new(instrumented, args);
-                builder.run(target)
-            } else {
-                let target = ForkExecTarget::new(binary, args);
-                builder.run(target)
+                anyhow::bail!(
+                    "--source is disabled: SanCov child coverage is not transported, \
+                     so this is not graybox. Omit --source."
+                );
             }
+
+            let target = ForkExecTarget::new(binary, args);
+            builder.run(target)
         }
     }
 }
 
 /// Set up the AI cortex based on CLI flags.
+///
+/// AutoTrainer is not started: the live campaign corpus is in-memory and
+/// is not connected to the training path.
 fn setup_cortex(
     no_ai: bool,
     model: Option<&PathBuf>,
     max_input_len: usize,
-    corpus: Option<&PathBuf>,
-    train_delay: u64,
-    plateau_timeout: u64,
 ) -> Result<Option<Arc<dyn CortexInterface>>> {
     if no_ai {
         return Ok(None);
     }
 
-    if let Some(model_path) = model {
-        let cortex_model = CortexModel::load(model_path, max_input_len)
-            .context("failed to load ONNX model")?;
-        return Ok(Some(Arc::new(cortex_model)));
-    }
+    let Some(model_path) = model else {
+        return Ok(None);
+    };
 
-    let hotswap = HotSwapCortex::empty(max_input_len);
-
-    let train_corpus = corpus
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from("./runtime/corpus"));
-
-    let model_output = std::env::temp_dir()
-        .join("achlys_models")
-        .join("auto_brain.onnx");
-
-    let training_script = find_training_script()?;
-
-    let mut trainer = AutoTrainer::new(&train_corpus, &model_output, max_input_len)
-        .with_initial_delay(Duration::from_secs(train_delay))
-        .with_retrain_interval(Duration::from_secs(plateau_timeout * 2))
-        .with_epochs(30)
-        .with_min_corpus_size(20)
-        .with_training_script(&training_script);
-
-    let hotswap_for_thread = hotswap.clone();
-    let model_ready = trainer.model_ready_flag();
-
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(10));
-
-        if let Err(e) = trainer.tick() {
-            eprintln!("[achlys-trainer] error: {}", e);
-        }
-
-        if model_ready.load(std::sync::atomic::Ordering::Acquire) {
-            if let Err(e) = hotswap_for_thread.load_model(&model_output) {
-                eprintln!("[achlys-trainer] failed to hot-load model: {}", e);
-            }
-            trainer.acknowledge_model();
-        }
-    });
-
-    Ok(Some(hotswap as Arc<dyn CortexInterface>))
-}
-
-fn find_training_script() -> Result<PathBuf> {
-    let candidates = [
-        PathBuf::from("src/cortex/training/train.py"),
-        PathBuf::from("cortex/training/train.py"),
-    ];
-
-    for candidate in &candidates {
-        if candidate.exists() {
-            return Ok(candidate.clone());
-        }
-    }
-
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let script = dir.join("../src/cortex/training/train.py");
-        if script.exists() {
-            return Ok(script);
-        }
-    }
-
-    anyhow::bail!(
-        "training script not found. Expected at: src/cortex/training/train.py\n\
-         Run from the project root or provide --model with a pre-trained ONNX model."
-    )
+    let cortex_model =
+        CortexModel::load(model_path, max_input_len).context("failed to load ONNX model")?;
+    Ok(Some(Arc::new(cortex_model)))
 }
