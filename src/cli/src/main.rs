@@ -94,6 +94,7 @@ fn main() -> Result<()> {
                 max_input_len,
                 plateau_timeout: Duration::from_secs(plateau_timeout),
                 model_path: model.clone(),
+                ..FuzzerConfig::default()
             };
 
             let cortex = setup_cortex(no_ai, model.as_ref(), max_input_len)?;

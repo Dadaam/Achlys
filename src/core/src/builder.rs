@@ -3,28 +3,31 @@ use std::num::NonZero;
 use std::path::PathBuf;
 use std::ptr::addr_of_mut;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 
 use libafl::{
-    corpus::{Corpus, InMemoryCorpus, OnDiskCorpus, Testcase},
+    corpus::{Corpus, InMemoryCorpus, InMemoryOnDiskCorpus, OnDiskCorpus, Testcase},
     events::SimpleEventManager,
     executors::{ExitKind, inprocess::InProcessExecutor},
-    feedbacks::{ConstFeedback, CrashFeedback, MaxMapFeedback},
+    feedback_or_fast,
+    feedbacks::{ConstFeedback, CrashFeedback, MaxMapFeedback, TimeoutFeedback},
     fuzzer::{Fuzzer, StdFuzzer},
     generators::RandBytesGenerator,
     inputs::{BytesInput, HasTargetBytes},
     monitors::SimpleMonitor,
     mutators::{havoc_mutations::havoc_mutations, scheduled::HavocScheduledMutator},
-    observers::StdMapObserver,
+    observers::{HitcountsMapObserver, StdMapObserver},
     schedulers::QueueScheduler,
     stages::mutational::StdMutationalStage,
-    state::{HasCorpus, StdState},
+    state::{HasCorpus, HasExecutions, HasMaxSize, HasSolutions, StdState},
 };
 use libafl_bolts::{AsSlice, current_nanos, rands::StdRand, tuples::tuple_list};
 
 use achlys_bridge::{InfraError, Target};
+
+use crate::config::SubstrateReport;
 
 /// Callback type for custom monitor output (TUI, logging, etc.).
 type MonitorCallback = Box<dyn FnMut(&str)>;
@@ -101,6 +104,36 @@ impl FuzzerBuilder {
         self
     }
 
+    /// Pin the LibAFL RNG seed (required for H0 paired trials).
+    pub fn rng_seed(mut self, seed: u64) -> Self {
+        self.config.rng_seed = seed;
+        self
+    }
+
+    /// Bound the substrate campaign to `fuzz_loop_for(iters)`.
+    pub fn max_iters(mut self, iters: u64) -> Self {
+        self.config.max_iters = Some(iters);
+        self
+    }
+
+    /// Bound the substrate campaign by wall clock (`fuzz_loop_for(1)` until elapsed).
+    pub fn max_time(mut self, duration: Duration) -> Self {
+        self.config.max_time = Some(duration);
+        self
+    }
+
+    /// Per-execution timeout for `InProcessExecutor::with_timeout`.
+    pub fn exec_timeout(mut self, timeout: Duration) -> Self {
+        self.config.exec_timeout = timeout;
+        self
+    }
+
+    /// Persist the working corpus (`InMemoryOnDiskCorpus`). Required for H0 binaries.
+    pub fn persist_corpus_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config.persist_corpus_dir = Some(path.into());
+        self
+    }
+
     /// Set a shared log sink for escalation events (visible in TUI).
     pub fn log_sink(mut self, sink: SharedLogSink) -> Self {
         self.log_sink = Some(sink);
@@ -119,6 +152,25 @@ impl FuzzerBuilder {
             self.run_graybox(target)
         } else {
             self.run_blackbox(target)
+        }
+    }
+
+    /// LibAFL-only graybox worker (no cortex, plateau, or escalation).
+    pub fn run_substrate(self, mut target: impl Target) -> Result<SubstrateReport> {
+        if !target.has_coverage() {
+            anyhow::bail!("run_substrate requires a coverage-capable target");
+        }
+        if self.config.max_iters.is_none() && self.config.max_time.is_none() {
+            anyhow::bail!("run_substrate requires max_iters or max_time");
+        }
+
+        if let Some(dir) = self.config.persist_corpus_dir.clone() {
+            let corpus = InMemoryOnDiskCorpus::<BytesInput>::new(&dir).with_context(|| {
+                format!("failed to create persistent corpus at {}", dir.display())
+            })?;
+            self.run_substrate_with_corpus(target, corpus)
+        } else {
+            self.run_substrate_with_corpus(target, InMemoryCorpus::<BytesInput>::new())
         }
     }
 
@@ -377,6 +429,158 @@ impl FuzzerBuilder {
 
         Ok(())
     }
+
+    fn run_substrate_with_corpus<T, C>(
+        mut self,
+        mut target: T,
+        corpus: C,
+    ) -> Result<SubstrateReport>
+    where
+        T: Target,
+        C: Corpus<BytesInput> + serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let (coverage_ptr, coverage_len) = {
+            let coverage = target
+                .coverage_map()
+                .context("target reported coverage but returned None")?;
+            (coverage.as_mut_ptr(), coverage.len())
+        };
+        // StdMapObserver wants a 'static name; the process owns this campaign.
+        let obs_name: &'static str = Box::leak(target.observer_name().to_string().into_boxed_str());
+
+        // SAFETY: same-process SanCov / test map, valid for the campaign.
+        let observer = HitcountsMapObserver::new(unsafe {
+            StdMapObserver::from_mut_ptr(obs_name, coverage_ptr, coverage_len)
+        });
+
+        let mut feedback = MaxMapFeedback::new(&observer);
+        let mut objective = feedback_or_fast!(CrashFeedback::new(), TimeoutFeedback::new());
+
+        let mut state = StdState::new(
+            StdRand::with_seed(self.config.rng_seed),
+            corpus,
+            OnDiskCorpus::new(&self.config.crashes_dir)
+                .context("failed to create crashes corpus")?,
+            &mut feedback,
+            &mut objective,
+        )
+        .context("failed to create fuzzer state")?;
+        state.set_max_size(self.config.max_input_len.max(1));
+
+        let scheduler = QueueScheduler::new();
+        let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
+
+        let infra = Arc::new(Mutex::new(None::<InfraError>));
+        let infra_h = Arc::clone(&infra);
+        let mut harness = move |input: &BytesInput| {
+            let bytes = input.target_bytes();
+            match target.execute(bytes.as_slice()) {
+                Ok(kind) => kind,
+                Err(err) => {
+                    *infra_h.lock().expect("infra mutex poisoned") = Some(err);
+                    ExitKind::Ok
+                }
+            }
+        };
+
+        let mon = self.make_monitor();
+        let mut mgr = SimpleEventManager::new(mon);
+
+        let mut executor = InProcessExecutor::with_timeout(
+            &mut harness,
+            tuple_list!(observer),
+            &mut fuzzer,
+            &mut state,
+            &mut mgr,
+            self.config.exec_timeout,
+        )
+        .context("failed to create in-process executor")?;
+        take_infra_error(&infra)?;
+
+        if let Some(ref corpus_dir) = self.config.corpus_dir {
+            let load_res = state.load_initial_inputs(
+                &mut fuzzer,
+                &mut executor,
+                &mut mgr,
+                std::slice::from_ref(corpus_dir),
+            );
+            take_infra_error(&infra)?;
+            load_res.with_context(|| {
+                format!(
+                    "failed to load initial inputs from {}",
+                    corpus_dir.display()
+                )
+            })?;
+        } else {
+            let mut generator = RandBytesGenerator::new(
+                NonZero::new(self.config.max_input_len)
+                    .unwrap_or(NonZero::new(4096).expect("4096 is non-zero")),
+            );
+            let gen_res = state.generate_initial_inputs(
+                &mut fuzzer,
+                &mut executor,
+                &mut generator,
+                &mut mgr,
+                self.config.initial_inputs,
+            );
+            take_infra_error(&infra)?;
+            gen_res.context("failed to generate initial inputs")?;
+        }
+
+        if state.corpus().count() == 0 {
+            anyhow::bail!(
+                "no initial inputs were admitted (empty seeds or no novelty). \
+                 Provide a non-empty corpus directory or a target that reports coverage"
+            );
+        }
+
+        let mutator = HavocScheduledMutator::new(havoc_mutations());
+        let mut stages = tuple_list!(StdMutationalStage::new(mutator));
+
+        let start = Instant::now();
+        match (self.config.max_iters, self.config.max_time) {
+            (Some(iters), None) => {
+                let step_res =
+                    fuzzer.fuzz_loop_for(&mut stages, &mut executor, &mut state, &mut mgr, iters);
+                take_infra_error(&infra)?;
+                step_res.context("fatal error in substrate fuzz loop")?;
+            }
+            (iters, Some(max_time)) => {
+                let mut remaining = iters.unwrap_or(u64::MAX);
+                while remaining > 0 && start.elapsed() < max_time {
+                    let step_res =
+                        fuzzer.fuzz_loop_for(&mut stages, &mut executor, &mut state, &mut mgr, 1);
+                    take_infra_error(&infra)?;
+                    step_res.context("fatal error in substrate fuzz loop")?;
+                    remaining -= 1;
+                }
+            }
+            (None, None) => unreachable!("run_substrate checks bounds"),
+        }
+
+        let elapsed = start.elapsed();
+        let report = SubstrateReport {
+            executions: *state.executions(),
+            corpus_count: state.corpus().count(),
+            objectives: state.solutions().count(),
+            elapsed,
+        };
+        print_h0_result(&report);
+        Ok(report)
+    }
+}
+
+fn print_h0_result(report: &SubstrateReport) {
+    let elapsed_ms = report.elapsed.as_millis();
+    let exec_per_sec = if report.elapsed.as_secs_f64() > 0.0 {
+        report.executions as f64 / report.elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    println!(
+        "H0_RESULT execs={} elapsed_ms={} corpus={} objectives={} exec_per_sec={:.2}",
+        report.executions, elapsed_ms, report.corpus_count, report.objectives, exec_per_sec
+    );
 }
 
 fn take_infra_error(infra: &Mutex<Option<InfraError>>) -> Result<()> {
@@ -421,5 +625,55 @@ fn load_seeds_from_dir(
 impl Default for FuzzerBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use achlys_bridge::{CoverageMap, InProcessTarget};
+
+    #[test]
+    fn run_substrate_tiny_map_reports_executions() {
+        let mut map = [0u8; 32];
+        let ptr = map.as_mut_ptr();
+        let target = unsafe {
+            InProcessTarget::with_coverage(
+                move |input| {
+                    if let Some(&b) = input.first() {
+                        *ptr.add((b as usize) % 32) = 1;
+                    }
+                    ExitKind::Ok
+                },
+                CoverageMap::new(ptr, 32),
+                "edges",
+            )
+        };
+
+        let tmp = std::env::temp_dir().join(format!(
+            "achlys_h0_unit_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+
+        let report = FuzzerBuilder::new()
+            .rng_seed(1)
+            .max_iters(2)
+            .max_input_len(16)
+            .initial_inputs(2)
+            .crashes_dir(tmp.join("crashes"))
+            .monitor(|_| {})
+            .run_substrate(target)
+            .expect("run_substrate");
+
+        let _ = fs::remove_dir_all(&tmp);
+
+        assert!(report.executions > 0, "expected at least one execution");
+        assert!(report.corpus_count > 0, "novelty policy should keep a seed");
+        let _ = report.objectives;
+        let _ = report.elapsed;
     }
 }
