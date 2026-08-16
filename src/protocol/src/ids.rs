@@ -64,8 +64,9 @@ impl fmt::Display for CampaignId {
     }
 }
 
-/// Worker identifier. Stable across a restart of the same slot when the
-/// launcher reuses `WorkerId::from_slot`. A new id is a late join.
+/// Worker identifier. Stable across an offline restart of the same slot
+/// when the launcher reuses `WorkerId::from_slot`. A new id is a first
+/// registration, not a live late join.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WorkerId(pub [u8; 16]);
 

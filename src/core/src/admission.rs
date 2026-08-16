@@ -5,7 +5,8 @@
 //! writes `CanonicalAdmitted` / `CanonicalRejected` / `CorpusDelta`.
 
 use std::collections::{HashSet, VecDeque};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use achlys_bridge::{Admission, DumpOracle};
 use achlys_protocol::{
@@ -42,6 +43,10 @@ pub struct DrainStats {
     pub rejected: usize,
     pub deltas: usize,
     pub queue_full: usize,
+    /// Sequence of the `CorpusDelta` written this call, if any.
+    pub delta_seq: Option<u64>,
+    /// Admitted ids in that delta. Empty when `delta_seq` is `None`.
+    pub delta_admitted: Vec<InputId>,
 }
 
 /// Replay surface used by the authority. [`DumpOracle`] implements it.
@@ -141,6 +146,16 @@ impl CorpusAuthority {
     #[must_use]
     pub fn pending_len(&self) -> usize {
         self.pending.len()
+    }
+
+    #[must_use]
+    pub fn replayed(&self) -> usize {
+        self.replayed
+    }
+
+    #[must_use]
+    pub fn rejected_len(&self) -> usize {
+        self.rejected.len()
     }
 
     #[must_use]
@@ -247,10 +262,12 @@ impl CorpusAuthority {
             self.store.append_event(&CampaignEvent::CorpusDelta {
                 campaign_id: self.store.campaign_id(),
                 sequence,
-                admitted: batch,
+                admitted: batch.clone(),
                 unix_ms: now_unix_ms(),
             })?;
             stats.deltas = 1;
+            stats.delta_seq = Some(sequence);
+            stats.delta_admitted = batch;
         }
         Ok(stats)
     }
@@ -362,10 +379,9 @@ impl CorpusAuthority {
 }
 
 fn monotonic_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
+    static START: OnceLock<Instant> = OnceLock::new();
+    let start = START.get_or_init(Instant::now);
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -575,5 +591,40 @@ mod tests {
         assert_eq!(auth.pending_len(), 1);
         assert_eq!(auth.store().list_inputs().unwrap().len(), 2);
         assert_eq!(auth.queue_full_count(), 1);
+    }
+
+    #[test]
+    fn drain_returns_delta_without_rereading_log() {
+        let (_tmp, mut auth) = open_auth("adm_delta", 8);
+        let mut oracle = FakeOracle::new();
+        auth.submit(cand(b"\x03zz", 0, 1)).unwrap();
+        let stats = auth.drain(&mut oracle, 8).unwrap();
+        assert_eq!(stats.delta_seq, Some(1));
+        assert_eq!(stats.delta_admitted.len(), 1);
+        assert_eq!(stats.delta_admitted[0], InputId::from_bytes(b"\x03zz"));
+    }
+
+    #[test]
+    fn queue_full_then_drain_can_enqueue_again() {
+        let (_tmp, mut auth) = open_auth("adm_full_drain", 1);
+        let mut oracle = FakeOracle::new();
+        assert_eq!(
+            auth.submit(cand(b"\x01one", 0, 1)).unwrap(),
+            SubmitOutcome::Queued
+        );
+        assert_eq!(
+            auth.submit(cand(b"\x02two", 0, 2)).unwrap(),
+            SubmitOutcome::QueueFull
+        );
+        auth.drain(&mut oracle, 8).unwrap();
+        assert_eq!(auth.pending_len(), 0);
+        assert_eq!(
+            auth.submit(cand(b"\x02two", 0, 2)).unwrap(),
+            SubmitOutcome::Queued
+        );
+        let stats = auth.drain(&mut oracle, 8).unwrap();
+        assert_eq!(stats.replayed, 1);
+        assert_eq!(auth.replayed(), 2);
+        assert_eq!(auth.admitted_ids().len() + auth.rejected_len(), 2);
     }
 }

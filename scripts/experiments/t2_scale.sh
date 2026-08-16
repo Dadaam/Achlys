@@ -6,9 +6,8 @@
 # That profile is applied only when T2_LADDER=1 on Linux. macOS never
 # becomes T2_LADDER=RAN, even if the 1- and 2-worker smoke cells run.
 #
-# achlys_t2 has no shared-dump flag today. Each cell compiles its own
-# canonical dump. A future flag should pin one dump per trial so worker
-# counts are comparable. Do not invent numbers to paper over that.
+# One canonical dump is compiled per trial and reused by every worker
+# count via --canonical-bin. Campaign roots stay empty of logs.
 #
 # Never prints a T2 accept / pass token. Do not publish these rows.
 set -euo pipefail
@@ -77,7 +76,7 @@ write_summary() {
     echo "workers=${WORKERS}"
     echo "out=${OUT_ROOT}"
     echo "target=benchmarks/manifests/cjson-parse.toml"
-    echo "dump=each cell compiles its own dump; achlys_t2 has no shared-dump flag; a future flag should pin one dump per trial"
+    echo "dump=one compile per trial, reused via --canonical-bin"
     echo "note=not a T2 accept; not a scaling claim; not an AFL++ comparison"
     echo "tsv=${tsv}"
   } >"${OUT_ROOT}/summary.txt"
@@ -109,14 +108,32 @@ if [[ ! -x "$t2_bin" ]]; then
 fi
 
 cell_fail=0
+logs_dir="${OUT_ROOT}/logs"
+cells_dir="${OUT_ROOT}/campaigns"
+canon_root="${OUT_ROOT}/canonical"
+mkdir -p "$logs_dir" "$cells_dir" "$canon_root"
 
 for trial in $(seq 1 "$TRIALS"); do
   seed="$trial"
+  trial_canon="${canon_root}/t${trial}"
+  rm -rf "$trial_canon"
+  set +e
+  ./target/release/examples/achlys_oracle \
+    --manifest benchmarks/manifests/cjson-parse.toml \
+    --compile-out "$trial_canon" \
+    >"${logs_dir}/compile_t${trial}.log" 2>&1
+  compile_rc=$?
+  set -e
+  dump="${trial_canon}/canonical"
+  if [[ "$compile_rc" -ne 0 || ! -x "$dump" ]]; then
+    echo "T2_SCALE compile failed trial=${trial}" >&2
+    cell_fail=1
+    continue
+  fi
   for workers in $WORKERS; do
-    cell="${OUT_ROOT}/w${workers}_t${trial}"
+    cell="${cells_dir}/w${workers}_t${trial}"
     rm -rf "$cell"
-    mkdir -p "$cell"
-    log="${cell}/stdout.log"
+    log="${logs_dir}/w${workers}_t${trial}.log"
     start_s="$(date +%s)"
     set +e
     port="$((17300 + trial * 20 + workers))"
@@ -128,6 +145,7 @@ for trial in $(seq 1 "$TRIALS"); do
       --workers "$workers" \
       --broker-port "$port" \
       --corpus "$SEED_DIR" \
+      --canonical-bin "$dump" \
       --out "$cell" >"$log" 2>&1
     rc=$?
     set -e

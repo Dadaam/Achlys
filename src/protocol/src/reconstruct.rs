@@ -99,15 +99,19 @@ where
                 previous_seq,
                 ..
             } => {
-                {
+                let already = out
+                    .workers
+                    .get(&worker_id)
+                    .is_some_and(|rec| sender_seq <= rec.last_seq);
+                if !already {
                     let rec = out.worker_mut(worker_id);
                     rec.left = false;
                     rec.restarts = rec.restarts.saturating_add(1);
                     if previous_seq > rec.last_seq {
                         rec.last_seq = previous_seq;
                     }
+                    out.note_seq(worker_id, sender_seq);
                 }
-                out.note_seq(worker_id, sender_seq);
             }
             CampaignEvent::CandidateDiscovered {
                 worker_id,
@@ -117,8 +121,8 @@ where
                 out.note_seq(worker_id, sender_seq);
             }
             CampaignEvent::CorpusDelta { sequence, .. } => {
-                out.deltas = out.deltas.saturating_add(1);
                 if sequence > out.last_delta_seq {
+                    out.deltas = out.deltas.saturating_add(1);
                     out.last_delta_seq = sequence;
                 }
             }
@@ -231,6 +235,34 @@ mod tests {
         assert_eq!(twice.admitted, once.admitted);
         assert_eq!(twice.rejected, once.rejected);
         assert_eq!(twice.workers[&w0].last_seq, 4);
+        assert_eq!(twice.workers[&w0].restarts, once.workers[&w0].restarts);
+        assert_eq!(twice.deltas, once.deltas);
+    }
+
+    #[test]
+    fn duplicate_restart_and_delta_do_not_double_count() {
+        let w0 = WorkerId::from_slot(0);
+        let restart = CampaignEvent::WorkerRestarted {
+            campaign_id: campaign(),
+            worker_id: w0,
+            sender_seq: 4,
+            timestamp_monotonic_ns: 5,
+            dedup_key: CampaignEvent::worker_dedup_key(w0, 4),
+            previous_seq: 3,
+            unix_ms: 5,
+        };
+        let delta = CampaignEvent::CorpusDelta {
+            campaign_id: campaign(),
+            sequence: 1,
+            admitted: vec![InputId::from_bytes(b"a")],
+            unix_ms: 4,
+        };
+        let once = reconstruct_events(vec![restart.clone(), delta.clone()]);
+        let twice = reconstruct_events(vec![restart.clone(), delta.clone(), restart, delta]);
+        assert_eq!(once.workers[&w0].restarts, 1);
+        assert_eq!(twice.workers[&w0].restarts, 1);
+        assert_eq!(once.deltas, 1);
+        assert_eq!(twice.deltas, 1);
     }
 
     fn once_more(

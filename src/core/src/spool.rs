@@ -25,6 +25,25 @@ pub struct WorkerRegistration {
     pub previous_seq: Option<u64>,
 }
 
+/// Offline continuation plan written by the launcher before spawn.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkerResume {
+    pub worker_id: WorkerId,
+    pub slot: u32,
+    pub restart: bool,
+    pub previous_seq: Option<u64>,
+    pub next_seq: u64,
+}
+
+/// Worker exit notice. Admit turns this into `WorkerLeft`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkerExit {
+    pub worker_id: WorkerId,
+    pub slot: u32,
+    pub sender_seq: u64,
+    pub reason: String,
+}
+
 /// Filesystem spool under `<out>/spool`.
 #[derive(Debug, Clone)]
 pub struct CandidateSpool {
@@ -41,6 +60,8 @@ impl CandidateSpool {
             root.join("deltas"),
             root.join("workers"),
             root.join("snapshot"),
+            root.join("resume"),
+            root.join("left"),
         ] {
             fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         }
@@ -97,6 +118,21 @@ impl CandidateSpool {
         let _ = fs::remove_file(self.processing_dir().join(&hex));
         let _ = fs::remove_file(self.processing_dir().join(format!("{hex}.json")));
         Ok(())
+    }
+
+    #[must_use]
+    pub fn inbox_len(&self) -> usize {
+        count_pairs(&self.inbox_dir())
+    }
+
+    #[must_use]
+    pub fn processing_len(&self) -> usize {
+        count_pairs(&self.processing_dir())
+    }
+
+    #[must_use]
+    pub fn overflow_len(&self) -> usize {
+        count_pairs(&self.overflow_dir())
     }
 
     pub fn write_overflow(&self, bytes: &[u8], meta: &InputMetadata) -> Result<InputId> {
@@ -223,6 +259,64 @@ impl CandidateSpool {
         Ok(out)
     }
 
+    pub fn write_resume(&self, resume: &WorkerResume) -> Result<PathBuf> {
+        let path = self.resume_dir().join(format!("{}.json", resume.slot));
+        let json = serde_json::to_vec_pretty(resume).context("serialize worker resume")?;
+        write_atomic(&path, &json)?;
+        Ok(path)
+    }
+
+    pub fn read_resume(&self, slot: u32) -> Result<Option<WorkerResume>> {
+        let path = self.resume_dir().join(format!("{slot}.json"));
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let resume =
+            serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+        Ok(Some(resume))
+    }
+
+    pub fn write_left(&self, exit: &WorkerExit) -> Result<PathBuf> {
+        let path = self
+            .left_dir()
+            .join(format!("{}.json", exit.worker_id.to_hex()));
+        let json = serde_json::to_vec_pretty(exit).context("serialize worker exit")?;
+        write_atomic(&path, &json)?;
+        Ok(path)
+    }
+
+    pub fn take_worker_exits(&self) -> Result<Vec<WorkerExit>> {
+        let dir = self.left_dir();
+        let mut out = Vec::new();
+        if !dir.is_dir() {
+            return Ok(out);
+        }
+        for entry in fs::read_dir(&dir).with_context(|| format!("list {}", dir.display()))? {
+            let entry = entry.with_context(|| format!("read {}", dir.display()))?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.ends_with(".taken"))
+            {
+                continue;
+            }
+            let text =
+                fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+            let exit: WorkerExit =
+                serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+            let taken = path.with_extension("taken.json");
+            fs::rename(&path, &taken)
+                .with_context(|| format!("rename {} -> {}", path.display(), taken.display()))?;
+            out.push(exit);
+        }
+        Ok(out)
+    }
+
     pub fn export_admitted_snapshot(
         &self,
         dest: &Path,
@@ -250,6 +344,35 @@ impl CandidateSpool {
     fn workers_dir(&self) -> PathBuf {
         self.root.join("workers")
     }
+    fn resume_dir(&self) -> PathBuf {
+        self.root.join("resume")
+    }
+    fn left_dir(&self) -> PathBuf {
+        self.root.join("left")
+    }
+}
+
+fn count_pairs(dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut n = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.parse::<InputId>().is_ok() && dir.join(format!("{name}.json")).is_file() {
+            n += 1;
+        }
+    }
+    n
 }
 
 fn take_from_dir(
@@ -387,7 +510,21 @@ mod tests {
         assert_eq!(first[0].0, a);
         assert!(spool.take_inbox(8).unwrap().is_empty());
         spool.ack_processed(&a).unwrap();
+        assert_eq!(spool.processing_len(), 0);
         assert!(spool.take_processing(8).unwrap().is_empty());
+    }
+
+    #[test]
+    fn processing_empty_only_after_ack() {
+        let tmp = TempDir::new("spool_ack");
+        let spool = CandidateSpool::create(tmp.0.join("spool")).unwrap();
+        let id = spool.push(b"keep", &meta(b"keep")).unwrap();
+        assert_eq!(spool.inbox_len(), 1);
+        let _ = spool.take_inbox(8).unwrap();
+        assert_eq!(spool.processing_len(), 1);
+        assert_eq!(spool.inbox_len(), 0);
+        spool.ack_processed(&id).unwrap();
+        assert_eq!(spool.processing_len(), 0);
     }
 
     #[test]

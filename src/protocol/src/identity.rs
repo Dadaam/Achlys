@@ -191,6 +191,13 @@ impl BuildIdentity {
             artifact_hash,
         }))
     }
+
+    /// SHA-256 of a file, hex-encoded. Used to pin a canonical dump.
+    pub fn hash_file(path: &Path) -> Result<String, String> {
+        let bytes =
+            fs::read(path).map_err(|err| format!("failed to hash {}: {err}", path.display()))?;
+        Ok(hex::encode(Sha256::digest(&bytes)))
+    }
 }
 
 fn detect_clang_version() -> Option<String> {

@@ -32,6 +32,6 @@ pub use escalation::{
 };
 pub use feedback::PlateauAwareFeedback;
 pub use plateau::{PlateauDetector, SharedPlateauDetector, shared_detector};
-pub use spool::{CandidateSpool, WorkerRegistration};
+pub use spool::{CandidateSpool, WorkerExit, WorkerRegistration, WorkerResume};
 pub use store::{CampaignStore, CanonicalReport};
 pub use worker::{list_corpus_files, run_homogeneous_simple, scan_new_inputs};

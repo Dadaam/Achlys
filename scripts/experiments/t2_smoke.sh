@@ -81,6 +81,10 @@ def need(k):
 
 if need("workers") != "2":
     raise SystemExit(f"T2_RESULT workers={kv.get('workers')!r} want 2")
+if need("reports") != "2":
+    raise SystemExit(f"T2_RESULT reports={kv.get('reports')!r} want 2")
+if "queue_full" not in kv:
+    raise SystemExit("missing queue_full in T2_RESULT")
 
 canon = json.loads(open(canon_p, encoding="utf-8").read())
 digest = canon.get("digest")
@@ -167,6 +171,10 @@ if len(admitted_set) != canon_admitted:
         f"CanonicalAdmitted set {len(admitted_set)} != canonical.json admitted {canon_admitted}"
     )
 
+objects_n = len(set(object_hashes))
+if replayed is not None and objects_n != replayed:
+    raise SystemExit(f"objects {objects_n} != replayed {replayed}")
+
 campaign = json.loads(open(campaign_p, encoding="utf-8").read())
 if not campaign:
     raise SystemExit("campaign.json empty")
@@ -175,6 +183,14 @@ print("T2_SEMANTICS=OK")
 print("T2_RECONSTRUCT=OK")
 print("T2_OBJECTS=OK")
 PY
+
+processing="$out/run1/spool/processing"
+if [[ -d "$processing" ]] && find "$processing" -type f ! -name '.DS_Store' | grep -q .; then
+  echo "T2_SPOOL=FAIL reason=processing-not-empty" >&2
+  find "$processing" -type f | head >&2
+  exit 1
+fi
+echo "T2_PROCESSING=OK"
 
 set +e
 help_out="$("$t2_bin" --help 2>&1)"
@@ -191,13 +207,17 @@ if grep -q -- '--join' <<<"$help_out"; then
     --broker-port "${T2_JOIN_BROKER_PORT:-17361}" \
     --corpus "$out/seeds" \
     --out "$out/run1" | tee "$join_log"
-  python3 - "$canon" "$events" <<'PY'
+  python3 - "$canon" "$events" "$join_log" <<'PY'
 import json, sys
-canon_p, events_p = sys.argv[1:]
+canon_p, events_p, join_log = sys.argv[1:]
 canon = json.loads(open(canon_p, encoding="utf-8").read())
 registered = 0
+restarted = 0
+left = 0
 stored = []
 admitted = set()
+worker_keys = []
+seq_by_worker = {}
 for raw in open(events_p, encoding="utf-8"):
     raw = raw.strip()
     if not raw:
@@ -206,12 +226,34 @@ for raw in open(events_p, encoding="utf-8"):
     typ = ev.get("type")
     if typ == "worker_registered":
         registered += 1
+        worker_keys.append((typ, ev.get("worker_id"), ev.get("sender_seq")))
+        seq_by_worker.setdefault(ev.get("worker_id"), []).append(ev.get("sender_seq"))
+    elif typ == "worker_restarted":
+        restarted += 1
+        worker_keys.append((typ, ev.get("worker_id"), ev.get("sender_seq")))
+        seq_by_worker.setdefault(ev.get("worker_id"), []).append(ev.get("sender_seq"))
+    elif typ == "worker_left":
+        left += 1
+        worker_keys.append((typ, ev.get("worker_id"), ev.get("sender_seq")))
+        seq_by_worker.setdefault(ev.get("worker_id"), []).append(ev.get("sender_seq"))
+    elif typ == "candidate_discovered":
+        worker_keys.append((typ, ev.get("worker_id"), ev.get("sender_seq")))
     elif typ == "input_stored":
         stored.append(ev.get("input_id"))
     elif typ == "canonical_admitted":
         admitted.add(ev.get("input_id"))
-if registered < 2:
-    raise SystemExit(f"post-join worker_registered={registered} want >= 2")
+if registered != 2:
+    raise SystemExit(f"post-join worker_registered={registered} want 2 (first run only)")
+if restarted < 1:
+    raise SystemExit(f"post-join worker_restarted={restarted} want >= 1")
+if left < 1:
+    raise SystemExit(f"post-join worker_left={left} want >= 1")
+if len(worker_keys) != len(set(worker_keys)):
+    raise SystemExit("duplicate (type, worker_id, sender_seq) after --join")
+for wid, seqs in seq_by_worker.items():
+    nums = [s for s in seqs if isinstance(s, int)]
+    if nums != sorted(nums):
+        raise SystemExit(f"sender_seq not nondecreasing for {wid}: {nums}")
 if len(stored) != len(set(stored)):
     raise SystemExit("post-join InputStored ids are not unique")
 if "admitted" not in canon:
@@ -220,6 +262,15 @@ if len(admitted) != int(canon["admitted"]):
     raise SystemExit(
         f"post-join CanonicalAdmitted {len(admitted)} != canonical.json admitted {canon['admitted']}"
     )
+join_text = open(join_log, encoding="utf-8", errors="replace").read()
+jline = [ln for ln in join_text.splitlines() if "T2_RESULT" in ln]
+if not jline:
+    raise SystemExit("join missing T2_RESULT")
+jkv = dict(part.split("=", 1) for part in jline[-1].split("T2_RESULT", 1)[1].split() if "=" in part)
+if jkv.get("workers") != "1" or jkv.get("reports") != "1":
+    raise SystemExit(f"join workers/reports {jkv}")
+if int(jkv.get("objects", "-1")) != int(jkv.get("replayed", "-2")):
+    raise SystemExit(f"join objects != replayed: {jkv}")
 print("T2_JOIN=OK")
 PY
 fi
@@ -244,6 +295,88 @@ if ! grep -Eiq 'not empty|occupied|reuse|already exists|--join' "$out/reuse.log"
   echo "T2_REUSE=FAIL reason=missing-occupied-root-error" >&2
   cat "$out/reuse.log" >&2
   exit 1
+fi
+
+set +e
+"$t2_bin" \
+  --manifest benchmarks/manifests/micro-nonzero-exit.toml \
+  --label t2-crosstarget \
+  --seed 1 \
+  --iters 2 \
+  --workers 1 \
+  --join \
+  --broker-port 17362 \
+  --out "$out/run1" \
+  >"$out/crosstarget.log" 2>&1
+cross_rc=$?
+set -e
+if [[ "$cross_rc" -eq 0 ]]; then
+  echo "T2_JOIN_TARGET=FAIL reason=cross-target-join-succeeded" >&2
+  cat "$out/crosstarget.log" >&2
+  exit 1
+fi
+if ! grep -Eiq 'target mismatch|join target' "$out/crosstarget.log"; then
+  echo "T2_JOIN_TARGET=FAIL reason=missing-target-mismatch" >&2
+  cat "$out/crosstarget.log" >&2
+  exit 1
+fi
+echo "T2_JOIN_TARGET=OK"
+
+set +e
+"$t2_bin" \
+  --manifest benchmarks/manifests/cjson-parse.toml \
+  --label t2-cores \
+  --seed 1 \
+  --iters 2 \
+  --workers 1 \
+  --cores 0-1 \
+  --broker-port 17363 \
+  --corpus "$out/seeds" \
+  --out "$out/cores-mismatch" \
+  >"$out/cores.log" 2>&1
+cores_rc=$?
+set -e
+if [[ "$cores_rc" -eq 0 ]]; then
+  echo "T2_CORES=FAIL reason=workers-ne-cores-succeeded" >&2
+  cat "$out/cores.log" >&2
+  exit 1
+fi
+if ! grep -Eiq 'must match|cores selects' "$out/cores.log"; then
+  echo "T2_CORES=FAIL reason=missing-cores-mismatch" >&2
+  cat "$out/cores.log" >&2
+  exit 1
+fi
+echo "T2_CORES=OK"
+
+tamper="$out/run1/builds/canonical/canonical"
+if [[ -f "$tamper" ]]; then
+  cp "$tamper" "$out/canonical.bak"
+  printf 'x' >>"$tamper"
+  set +e
+  "$t2_bin" \
+    --manifest benchmarks/manifests/cjson-parse.toml \
+    --label t2-tamper \
+    --seed 1 \
+    --iters 2 \
+    --workers 1 \
+    --join \
+    --broker-port 17364 \
+    --out "$out/run1" \
+    >"$out/tamper.log" 2>&1
+  tamper_rc=$?
+  set -e
+  mv "$out/canonical.bak" "$tamper"
+  if [[ "$tamper_rc" -eq 0 ]]; then
+    echo "T2_CANONICAL_HASH=FAIL reason=tampered-dump-join-succeeded" >&2
+    cat "$out/tamper.log" >&2
+    exit 1
+  fi
+  if ! grep -Eiq 'hash|artifact_hash|canonical dump' "$out/tamper.log"; then
+    echo "T2_CANONICAL_HASH=FAIL reason=missing-hash-error" >&2
+    cat "$out/tamper.log" >&2
+    exit 1
+  fi
+  echo "T2_CANONICAL_HASH=OK"
 fi
 
 echo "T2_FUNCTIONAL=OK"

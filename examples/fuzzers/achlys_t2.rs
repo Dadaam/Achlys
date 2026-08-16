@@ -20,7 +20,7 @@ use achlys_bridge::{
 };
 use achlys_core::{
     CampaignSession, CandidateSpool, CorpusAuthority, FuzzerConfig, PendingCandidate,
-    SubmitOutcome, WorkerRegistration, scan_new_inputs,
+    SubmitOutcome, WorkerExit, WorkerRegistration, WorkerResume, scan_new_inputs,
 };
 use achlys_protocol::{
     BuildIdentity, BuildKind, CampaignEvent, CampaignId, CampaignRecord, InputId, InputMetadata,
@@ -106,6 +106,8 @@ struct Args {
     broker_port: u16,
     join: bool,
     role: Role,
+    canonical_bin: Option<PathBuf>,
+    pending_bound: usize,
 }
 
 fn parse_args() -> Args {
@@ -121,6 +123,8 @@ fn parse_args() -> Args {
     let mut broker_port = 1337u16;
     let mut join = false;
     let mut role = Role::Launcher;
+    let mut canonical_bin = None;
+    let mut pending_bound = achlys_core::DEFAULT_PENDING_BOUND;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -164,6 +168,15 @@ fn parse_args() -> Args {
                     .unwrap_or_else(|_| die("--broker-port must be u16"));
             }
             "--join" => join = true,
+            "--canonical-bin" => canonical_bin = Some(PathBuf::from(need("--canonical-bin"))),
+            "--pending-bound" => {
+                pending_bound = need("--pending-bound")
+                    .parse()
+                    .unwrap_or_else(|_| die("--pending-bound must be usize"));
+                if pending_bound == 0 {
+                    die("--pending-bound must be >= 1");
+                }
+            }
             "--role" => {
                 role = match need("--role").as_str() {
                     "launcher" => Role::Launcher,
@@ -202,6 +215,8 @@ fn parse_args() -> Args {
         broker_port,
         join,
         role,
+        canonical_bin,
+        pending_bound,
     }
 }
 
@@ -209,7 +224,9 @@ fn print_help() {
     eprintln!(
         "achlys_t2 --manifest PATH --out DIR --workers N [--seed N] \
          [--iters N | --seconds N] [--cores LIST] [--broker-port P] \
-         [--corpus DIR] [--label NAME] [--join] [--role launcher|admit]"
+         [--corpus DIR] [--label NAME] [--canonical-bin PATH] \
+         [--pending-bound N] [--join] [--role launcher|admit]\n\
+         --join is offline continuation of a stopped campaign, not a live late join."
     );
 }
 
@@ -375,8 +392,12 @@ fn spool_dir(out: &Path) -> PathBuf {
 }
 
 fn run_admit(out: &Path) -> Result<()> {
+    let bound = env::var("ACHLYS_T2_PENDING_BOUND")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(achlys_core::DEFAULT_PENDING_BOUND);
     let store = achlys_core::CampaignStore::open(artifacts_dir(out), read_campaign_id(out)?)?;
-    let mut auth = CorpusAuthority::reconstruct(store, achlys_core::DEFAULT_PENDING_BOUND)?;
+    let mut auth = CorpusAuthority::reconstruct(store, bound)?;
     let spool = CandidateSpool::open(spool_dir(out))?;
     let record: CampaignRecord =
         serde_json::from_slice(&fs::read(artifacts_dir(out).join("campaign.json"))?)?;
@@ -385,42 +406,26 @@ fn run_admit(out: &Path) -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow!("campaign.json missing canonical_build"))?;
     let bin = out.join("builds").join("canonical").join("canonical");
+    let on_disk = BuildIdentity::hash_file(&bin).map_err(|e| anyhow!(e))?;
+    match &canonical.artifact_hash {
+        Some(expected) if expected == &on_disk => {}
+        Some(expected) => {
+            anyhow::bail!("canonical dump hash {on_disk} != campaign artifact_hash {expected}");
+        }
+        None => anyhow::bail!("campaign canonical_build missing artifact_hash"),
+    }
     let mut oracle = DumpOracle::new(&bin, canonical.build_id)?;
 
     auth.warm_oracle(&mut oracle)?;
-    let leftover = spool.take_processing(4096)?;
-    ingest_batch(&mut auth, leftover)?;
+    ingest_batch(&mut auth, &spool, spool.take_processing(256)?)?;
     let mut idle = 0u32;
     loop {
-        for reg in spool.take_worker_registrations()? {
-            if reg.restart {
-                auth.note_restarted(reg.worker_id, reg.sender_seq, reg.previous_seq.unwrap_or(0))?;
-            } else {
-                auth.register_worker(
-                    reg.worker_id,
-                    reg.slot,
-                    record.fast_build.build_id,
-                    reg.sender_seq,
-                )?;
-            }
-        }
-        let inbox = spool.take_inbox(64)?;
-        let overflow = spool.take_overflow(64)?;
-        let incoming = inbox.len() + overflow.len();
-        ingest_batch(&mut auth, inbox)?;
-        ingest_batch(&mut auth, overflow)?;
-        let stats = auth.drain(&mut oracle, 64)?;
-        if stats.admitted > 0 {
-            let seq = auth.next_delta_seq().saturating_sub(1);
-            let admitted = auth.admitted_ids();
-            // Last delta is the batch just written; rewrite the file from events.
-            if let Some(last) = last_delta_ids(&auth)? {
-                spool.write_delta(seq, &last)?;
-            } else if !admitted.is_empty() {
-                spool.write_delta(seq, &admitted)?;
-            }
-        }
-        if incoming == 0 && stats.replayed == 0 {
+        admit_once(&mut auth, &spool, &record, &mut oracle)?;
+        let quiet = spool.inbox_len() == 0
+            && spool.overflow_len() == 0
+            && spool.processing_len() == 0
+            && auth.pending_len() == 0;
+        if quiet {
             idle = idle.saturating_add(1);
         } else {
             idle = 0;
@@ -430,12 +435,27 @@ fn run_admit(out: &Path) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(25));
     }
-    let leftover = spool.take_inbox(4096)?;
-    ingest_batch(&mut auth, leftover)?;
-    let leftover = spool.take_overflow(4096)?;
-    ingest_batch(&mut auth, leftover)?;
-    while auth.pending_len() > 0 {
-        auth.drain(&mut oracle, 64)?;
+    // Final drain: keep going until every stage is empty or we hit a bound
+    // that still has overflow (then keep draining pending to free slots).
+    for _ in 0..1_000_000 {
+        let progress = admit_once(&mut auth, &spool, &record, &mut oracle)?;
+        if !progress
+            && spool.inbox_len() == 0
+            && spool.overflow_len() == 0
+            && spool.processing_len() == 0
+            && auth.pending_len() == 0
+        {
+            break;
+        }
+    }
+    if spool.inbox_len() != 0 || spool.processing_len() != 0 || auth.pending_len() != 0 {
+        anyhow::bail!(
+            "admit shutdown incomplete: inbox={} processing={} overflow={} pending={}",
+            spool.inbox_len(),
+            spool.processing_len(),
+            spool.overflow_len(),
+            auth.pending_len()
+        );
     }
     auth.write_canonical_report(
         &oracle,
@@ -444,33 +464,89 @@ fn run_admit(out: &Path) -> Result<()> {
             .as_ref()
             .and_then(|b| b.artifact_hash.clone()),
     )?;
+    let report = serde_json::json!({
+        "queue_full": auth.queue_full_count(),
+        "replayed": auth.replayed(),
+        "admitted": auth.admitted_ids().len(),
+        "rejected": auth.rejected_len(),
+        "pending": auth.pending_len(),
+        "inbox": spool.inbox_len(),
+        "processing": spool.processing_len(),
+        "overflow": spool.overflow_len(),
+    });
+    let metrics_dir = artifacts_dir(out).join("metrics");
+    fs::create_dir_all(&metrics_dir)?;
+    fs::write(
+        metrics_dir.join("admission.json"),
+        serde_json::to_vec_pretty(&report)?,
+    )?;
     Ok(())
 }
 
-fn last_delta_ids(auth: &CorpusAuthority) -> Result<Option<Vec<InputId>>> {
-    let events = auth.store().read_events()?;
-    Ok(events.into_iter().rev().find_map(|ev| match ev {
-        CampaignEvent::CorpusDelta { admitted, .. } => Some(admitted),
-        _ => None,
-    }))
+fn admit_once(
+    auth: &mut CorpusAuthority,
+    spool: &CandidateSpool,
+    record: &CampaignRecord,
+    oracle: &mut DumpOracle,
+) -> Result<bool> {
+    let mut progress = false;
+    for reg in spool.take_worker_registrations()? {
+        if reg.restart {
+            auth.note_restarted(reg.worker_id, reg.sender_seq, reg.previous_seq.unwrap_or(0))?;
+        } else {
+            auth.register_worker(
+                reg.worker_id,
+                reg.slot,
+                record.fast_build.build_id,
+                reg.sender_seq,
+            )?;
+        }
+        progress = true;
+    }
+    for exit in spool.take_worker_exits()? {
+        auth.note_left(exit.worker_id, exit.sender_seq, &exit.reason)?;
+        progress = true;
+    }
+    let inbox = spool.take_inbox(64)?;
+    let overflow = spool.take_overflow(64)?;
+    if !inbox.is_empty() || !overflow.is_empty() {
+        progress = true;
+    }
+    ingest_batch(auth, spool, inbox)?;
+    ingest_batch(auth, spool, overflow)?;
+    let stats = auth.drain(oracle, 64)?;
+    if let Some(seq) = stats.delta_seq {
+        spool.write_delta(seq, &stats.delta_admitted)?;
+        progress = true;
+    }
+    if stats.replayed > 0 {
+        progress = true;
+    }
+    Ok(progress)
 }
 
 fn ingest_batch(
     auth: &mut CorpusAuthority,
+    spool: &CandidateSpool,
     batch: Vec<(InputId, Vec<u8>, InputMetadata)>,
 ) -> Result<()> {
     for (id, bytes, meta) in batch {
-        let _ = id;
-        if meta.worker_id.is_some() {
-            let _ = auth.note_discovered(&meta);
-        }
         match auth.submit(PendingCandidate {
-            bytes,
+            bytes: bytes.clone(),
             meta: meta.clone(),
         })? {
-            SubmitOutcome::Queued | SubmitOutcome::Duplicate => {}
+            SubmitOutcome::Queued => {
+                if meta.worker_id.is_some() {
+                    auth.note_discovered(&meta)?;
+                }
+                spool.ack_processed(&id)?;
+            }
+            SubmitOutcome::Duplicate => {
+                spool.ack_processed(&id)?;
+            }
             SubmitOutcome::QueueFull => {
-                // Object is stored; reconstruct will requeue. Keep going.
+                spool.write_overflow(&bytes, &meta)?;
+                spool.ack_processed(&id)?;
             }
         }
     }
@@ -478,9 +554,127 @@ fn ingest_batch(
 }
 
 fn read_campaign_id(out: &Path) -> Result<CampaignId> {
-    let record: CampaignRecord =
-        serde_json::from_slice(&fs::read(artifacts_dir(out).join("campaign.json"))?)?;
-    Ok(record.campaign_id)
+    Ok(read_campaign_record(out)?.campaign_id)
+}
+
+fn read_campaign_record(out: &Path) -> Result<CampaignRecord> {
+    let path = artifacts_dir(out).join("campaign.json");
+    let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
+}
+
+fn assert_join_compatible(
+    record: &CampaignRecord,
+    manifest: &TargetManifest,
+    fast: &BuildIdentity,
+    out: &Path,
+    workspace: &Path,
+) {
+    if record.target_id != manifest.target_id {
+        die(&format!(
+            "--join target mismatch: campaign is {}, manifest is {}",
+            record.target_id, manifest.target_id
+        ));
+    }
+    let stored_manifest = artifacts_dir(out).join("manifest.toml");
+    let stored = TargetManifest::from_path(&stored_manifest).unwrap_or_else(|e| {
+        die(&format!(
+            "--join cannot load stored manifest {}: {e}",
+            stored_manifest.display()
+        ))
+    });
+    if stored.target_id != manifest.target_id {
+        die("--join stored manifest target_id differs");
+    }
+    if stored.max_input_len != manifest.max_input_len {
+        die("--join max_input_len differs from stored campaign");
+    }
+    if stored.builds.fast.flags != manifest.builds.fast.flags
+        || stored.builds.canonical.flags != manifest.builds.canonical.flags
+    {
+        die("--join build flags differ from stored campaign");
+    }
+    if stored.builds.fast.instrumentation != manifest.builds.fast.instrumentation
+        || stored.builds.canonical.instrumentation != manifest.builds.canonical.instrumentation
+    {
+        die("--join instrumentation differs from stored campaign");
+    }
+    if record.fast_build.build_id != fast.build_id {
+        die(&format!(
+            "--join fast_build mismatch: campaign {} vs current {}",
+            record.fast_build.build_id.to_hex(),
+            fast.build_id.to_hex()
+        ));
+    }
+    let Some(canon) = &record.canonical_build else {
+        die("--join campaign missing canonical_build");
+    };
+    let bin = out.join("builds").join("canonical").join("canonical");
+    if !bin.is_file() {
+        die(&format!("--join missing canonical dump {}", bin.display()));
+    }
+    verify_canonical_file(&bin, canon);
+    let expected = BuildIdentity::from_executed(
+        manifest,
+        BuildKind::Canonical,
+        workspace,
+        EXTRA_IDENTITY,
+        Some(&bin),
+    )
+    .unwrap_or_else(|e| die(&format!("--join recompute canonical identity: {e}")));
+    if expected.build_id != canon.build_id {
+        die(&format!(
+            "--join canonical identity drifted: campaign {} vs recomputed {}",
+            canon.build_id.to_hex(),
+            expected.build_id.to_hex()
+        ));
+    }
+}
+
+fn verify_canonical_file(bin: &Path, identity: &BuildIdentity) {
+    let got = BuildIdentity::hash_file(bin).unwrap_or_else(|e| die(&e));
+    match &identity.artifact_hash {
+        Some(expected) if expected == &got => {}
+        Some(expected) => die(&format!(
+            "canonical dump {} hash {got} != campaign artifact_hash {expected}",
+            bin.display()
+        )),
+        None => die("campaign canonical_build missing artifact_hash"),
+    }
+}
+
+fn load_or_pin_canonical(
+    manifest: &TargetManifest,
+    workspace: &Path,
+    bin: &Path,
+    existing: Option<&CampaignRecord>,
+) -> Result<achlys_bridge::CompiledArtifact> {
+    if !bin.is_file() {
+        anyhow::bail!("--canonical-bin is not a file: {}", bin.display());
+    }
+    if let Some(record) = existing {
+        let identity = record
+            .canonical_build
+            .clone()
+            .ok_or_else(|| anyhow!("--join campaign missing canonical_build"))?;
+        verify_canonical_file(bin, &identity);
+        return Ok(achlys_bridge::CompiledArtifact {
+            path: bin.to_path_buf(),
+            identity,
+        });
+    }
+    let identity = BuildIdentity::from_executed(
+        manifest,
+        BuildKind::Canonical,
+        workspace,
+        EXTRA_IDENTITY,
+        Some(bin),
+    )
+    .map_err(|e| anyhow!(e))?;
+    Ok(achlys_bridge::CompiledArtifact {
+        path: bin.to_path_buf(),
+        identity,
+    })
 }
 
 fn main() {
@@ -492,6 +686,7 @@ fn main() {
 }
 
 fn run_launcher(args: Args) {
+    let started = Instant::now();
     let root = workspace_root();
     let manifest_path = if args.manifest.is_absolute() {
         args.manifest.clone()
@@ -520,6 +715,23 @@ fn run_launcher(args: Args) {
         ));
     }
 
+    let cores_spec = args.cores.clone().unwrap_or_else(|| {
+        if args.workers == 1 {
+            "0".into()
+        } else {
+            format!("0-{}", args.workers - 1)
+        }
+    });
+    let cores = Cores::from_cmdline(&cores_spec)
+        .unwrap_or_else(|e| die(&format!("--cores {cores_spec}: {e}")));
+    if cores.ids.len() != args.workers {
+        die(&format!(
+            "--cores selects {} ids, --workers is {} (they must match)",
+            cores.ids.len(),
+            args.workers
+        ));
+    }
+
     fs::create_dir_all(&args.out)
         .unwrap_or_else(|e| die(&format!("create {}: {e}", args.out.display())));
 
@@ -534,32 +746,44 @@ fn run_launcher(args: Args) {
     .unwrap_or_else(|e| die(&format!("fast identity: {e}")));
 
     let measure_dir = args.out.join("builds");
-    let canonical = if args.join && measure_dir.join("canonical").join("canonical").is_file() {
-        let record: CampaignRecord = serde_json::from_slice(
-            &fs::read(artifacts_dir(&args.out).join("campaign.json"))
-                .unwrap_or_else(|e| die(&format!("read campaign.json: {e}"))),
-        )
-        .unwrap_or_else(|e| die(&format!("parse campaign.json: {e}")));
+    let canonical_dir = measure_dir.join("canonical");
+    let default_bin = canonical_dir.join("canonical");
+    let existing_record = if args.join {
+        Some(read_campaign_record(&args.out).unwrap_or_else(|e| die(&format!("join: {e:#}"))))
+    } else {
+        None
+    };
+
+    if args.join {
+        let record = existing_record.as_ref().expect("join record");
+        assert_join_compatible(record, &manifest, &fast, &args.out, &root);
+    }
+
+    let canonical = if let Some(bin) = &args.canonical_bin {
+        load_or_pin_canonical(&manifest, &root, bin, existing_record.as_ref())
+            .unwrap_or_else(|e| die(&format!("canonical-bin: {e:#}")))
+    } else if args.join && default_bin.is_file() {
+        let record = existing_record.as_ref().expect("join record");
         let identity = record
             .canonical_build
+            .clone()
             .unwrap_or_else(|| die("--join campaign missing canonical_build"));
+        verify_canonical_file(&default_bin, &identity);
         achlys_bridge::CompiledArtifact {
-            path: measure_dir.join("canonical").join("canonical"),
+            path: default_bin.clone(),
             identity,
         }
     } else {
-        compile_canonical(
-            &root,
-            &manifest,
-            &measure_dir.join("canonical"),
-            EXTRA_IDENTITY,
-        )
-        .unwrap_or_else(|e| die(&format!("canonical compile: {e:#}")))
+        compile_canonical(&root, &manifest, &canonical_dir, EXTRA_IDENTITY)
+            .unwrap_or_else(|e| die(&format!("canonical compile: {e:#}")))
     };
 
     let (git, dirty, untracked) = fingerprint_git(&root);
     let campaign_id = if args.join {
-        read_campaign_id(&args.out).unwrap_or_else(|e| die(&format!("join: {e:#}")))
+        existing_record
+            .as_ref()
+            .map(|r| r.campaign_id)
+            .unwrap_or_else(|| die("join missing campaign id"))
     } else {
         CampaignId::from_label(&format!(
             "{}-{}-{}",
@@ -613,6 +837,56 @@ fn run_launcher(args: Args) {
             .unwrap_or_else(|e| die(&format!("export snapshot: {e:#}")));
     }
 
+    if canonical.path != default_bin {
+        fs::create_dir_all(&canonical_dir)
+            .unwrap_or_else(|e| die(&format!("create {}: {e}", canonical_dir.display())));
+        if !default_bin.is_file() {
+            fs::copy(&canonical.path, &default_bin).unwrap_or_else(|e| {
+                die(&format!(
+                    "copy canonical {} -> {}: {e}",
+                    canonical.path.display(),
+                    default_bin.display()
+                ))
+            });
+        } else {
+            verify_canonical_file(&default_bin, &canonical.identity);
+        }
+    }
+
+    let folded = {
+        let store = achlys_core::CampaignStore::open(artifacts_dir(&args.out), campaign_id)
+            .unwrap_or_else(|e| die(&format!("open store: {e:#}")));
+        reconstruct_events(
+            store
+                .read_events()
+                .unwrap_or_else(|e| die(&format!("read events: {e:#}"))),
+        )
+    };
+    for slot in 0..args.workers {
+        let slot = u32::try_from(slot).unwrap_or(u32::MAX);
+        let worker_id = WorkerId::from_slot(slot);
+        let resume = if let Some(rec) = folded.workers.get(&worker_id) {
+            WorkerResume {
+                worker_id,
+                slot,
+                restart: true,
+                previous_seq: Some(rec.last_seq),
+                next_seq: rec.last_seq.saturating_add(1),
+            }
+        } else {
+            WorkerResume {
+                worker_id,
+                slot,
+                restart: false,
+                previous_seq: None,
+                next_seq: 0,
+            }
+        };
+        spool
+            .write_resume(&resume)
+            .unwrap_or_else(|e| die(&format!("write resume slot {slot}: {e:#}")));
+    }
+
     let admit_log = args.out.join("admit.log");
     let admit_out = fs::File::create(&admit_log)
         .unwrap_or_else(|e| die(&format!("create {}: {e}", admit_log.display())));
@@ -624,21 +898,12 @@ fn run_launcher(args: Args) {
         .arg(&args.out)
         .arg("--manifest")
         .arg(&manifest_path)
+        .env("ACHLYS_T2_PENDING_BOUND", args.pending_bound.to_string())
         .stdout(Stdio::from(admit_out.try_clone().unwrap()))
         .stderr(Stdio::from(admit_out));
     let mut admit_child = admit_cmd
         .spawn()
         .unwrap_or_else(|e| die(&format!("spawn admit: {e}")));
-
-    let cores_spec = args.cores.clone().unwrap_or_else(|| {
-        if args.workers == 1 {
-            "0".into()
-        } else {
-            format!("0-{}", args.workers - 1)
-        }
-    });
-    let cores = Cores::from_cmdline(&cores_spec)
-        .unwrap_or_else(|e| die(&format!("--cores {cores_spec}: {e}")));
 
     let shmem = open_shmem_provider();
     let monitor = NopMonitor::new();
@@ -668,13 +933,29 @@ fn run_launcher(args: Args) {
 
             let spool = CandidateSpool::open(spool_dir(&worker_out))
                 .map_err(|e| libafl::Error::unknown(e.to_string()))?;
+            let resume = spool
+                .read_resume(slot)
+                .map_err(|e| libafl::Error::unknown(e.to_string()))?
+                .unwrap_or(WorkerResume {
+                    worker_id,
+                    slot,
+                    restart: false,
+                    previous_seq: None,
+                    next_seq: 0,
+                });
+            if resume.worker_id != worker_id {
+                return Err(libafl::Error::unknown(format!(
+                    "resume worker_id {} != slot worker {worker_id}",
+                    resume.worker_id
+                )));
+            }
             spool
                 .write_worker(&WorkerRegistration {
                     worker_id,
                     slot,
-                    sender_seq: 0,
-                    restart: false,
-                    previous_seq: None,
+                    sender_seq: resume.next_seq,
+                    restart: resume.restart,
+                    previous_seq: resume.previous_seq,
                 })
                 .map_err(|e| libafl::Error::unknown(e.to_string()))?;
 
@@ -699,7 +980,7 @@ fn run_launcher(args: Args) {
             config.persist_corpus_dir = Some(persist.clone());
 
             let target = worker_target(worker_kind);
-            let mut seq = 1u64;
+            let mut seq = resume.next_seq.saturating_add(1);
             let mut seen = HashSet::new();
             let report = run_llmp_worker(target, &config, &mut mgr, &extra, |corpus_dir| {
                 let new = scan_new_inputs(corpus_dir, &mut seen)?;
@@ -732,10 +1013,21 @@ fn run_launcher(args: Args) {
                 "objectives": report.objectives,
                 "elapsed_ms": report.elapsed.as_millis() as u64,
             });
-            let _ = fs::write(
+            fs::write(
                 dir.join("report.json"),
-                serde_json::to_vec_pretty(&summary).unwrap_or_default(),
-            );
+                serde_json::to_vec_pretty(&summary)
+                    .map_err(|e| libafl::Error::unknown(e.to_string()))?,
+            )
+            .map_err(|e| libafl::Error::unknown(e.to_string()))?;
+            let last_seq = seq.saturating_sub(1);
+            spool
+                .write_left(&WorkerExit {
+                    worker_id,
+                    slot,
+                    sender_seq: last_seq.max(resume.next_seq),
+                    reason: "budget".into(),
+                })
+                .map_err(|e| libafl::Error::unknown(e.to_string()))?;
             mgr.send_exiting()?;
             Ok(())
         };
@@ -806,35 +1098,93 @@ fn run_launcher(args: Args) {
         .map(|v| v.len())
         .unwrap_or(folded.stored.len());
     let mut execs = 0u64;
-    if let Ok(entries) = fs::read_dir(args.out.join("workers")) {
-        for entry in entries.flatten() {
-            let path = entry.path().join("report.json");
-            if let Ok(text) = fs::read_to_string(path)
-                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
-            {
-                execs =
-                    execs.saturating_add(v.get("executions").and_then(|x| x.as_u64()).unwrap_or(0));
-            }
+    let mut objectives = 0u64;
+    let mut reports = 0usize;
+    for slot in 0..args.workers {
+        let path = args
+            .out
+            .join("workers")
+            .join(slot.to_string())
+            .join("report.json");
+        if !path.is_file() {
+            die(&format!("missing worker report {}", path.display()));
         }
+        let v: serde_json::Value = serde_json::from_slice(
+            &fs::read(&path).unwrap_or_else(|e| die(&format!("read {}: {e}", path.display()))),
+        )
+        .unwrap_or_else(|e| die(&format!("parse {}: {e}", path.display())));
+        reports += 1;
+        execs = execs.saturating_add(v.get("executions").and_then(|x| x.as_u64()).unwrap_or(0));
+        objectives =
+            objectives.saturating_add(v.get("objectives").and_then(|x| x.as_u64()).unwrap_or(0));
+    }
+    if reports != args.workers {
+        die(&format!(
+            "worker reports {reports} != --workers {}",
+            args.workers
+        ));
     }
 
+    let admission_path = artifacts_dir(&args.out)
+        .join("metrics")
+        .join("admission.json");
+    let admission: serde_json::Value = if admission_path.is_file() {
+        serde_json::from_slice(
+            &fs::read(&admission_path).unwrap_or_else(|e| die(&format!("read admission: {e}"))),
+        )
+        .unwrap_or_else(|e| die(&format!("parse admission: {e}")))
+    } else {
+        die("admit did not write metrics/admission.json");
+    };
+    let queue_full = admission
+        .get("queue_full")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let processing = admission
+        .get("processing")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(u64::MAX);
+    let inbox = admission
+        .get("inbox")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(u64::MAX);
+    if processing != 0 || inbox != 0 {
+        die(&format!(
+            "admit left work behind: inbox={inbox} processing={processing}"
+        ));
+    }
+    if objects as u64 != replayed {
+        die(&format!("objects {objects} != replayed {replayed}"));
+    }
+    if admitted + rejected != replayed {
+        die(&format!(
+            "admitted+rejected {} != replayed {replayed}",
+            admitted + rejected
+        ));
+    }
+
+    let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let snapshot = MetricsSnapshot {
         executions: execs,
         corpus_count: objects,
-        objectives: 0,
+        objectives: usize::try_from(objectives).unwrap_or(usize::MAX),
         canonical_edges: u32::try_from(edges).unwrap_or(u32::MAX),
-        elapsed_ms: 0,
+        elapsed_ms: wall_ms,
         crash: Default::default(),
     };
-    let _ = store.write_metrics(&snapshot);
-    let _ = store.append_event(&CampaignEvent::CampaignFinished {
-        campaign_id,
-        snapshot,
-        unix_ms: unix_ms(),
-    });
+    store
+        .write_metrics(&snapshot)
+        .unwrap_or_else(|e| die(&format!("write metrics: {e:#}")));
+    store
+        .append_event(&CampaignEvent::CampaignFinished {
+            campaign_id,
+            snapshot,
+            unix_ms: unix_ms(),
+        })
+        .unwrap_or_else(|e| die(&format!("CampaignFinished: {e:#}")));
 
     println!(
-        "T2_RESULT workers={} ingested={} admitted={} rejected={} replayed={} edges={} objects={} queue_full=0 execs={} registered={}",
+        "T2_RESULT workers={} ingested={} admitted={} rejected={} replayed={} edges={} objects={} queue_full={} execs={} registered={} reports={} objectives={} wall_ms={}",
         args.workers,
         objects,
         admitted,
@@ -842,8 +1192,12 @@ fn run_launcher(args: Args) {
         replayed,
         edges,
         objects,
+        queue_full,
         execs,
-        folded.workers.len()
+        folded.workers.len(),
+        reports,
+        objectives,
+        wall_ms
     );
 }
 

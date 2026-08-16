@@ -122,14 +122,17 @@ Example `achlys_t2` (not the product CLI):
 achlys_t2 --manifest PATH --out DIR --workers N
           [--seed N] [--iters N | --seconds N]
           [--cores LIST] [--broker-port P] [--corpus DIR]
-          [--label NAME] [--join] [--role launcher|admit|worker]
+          [--label NAME] [--canonical-bin PATH] [--join] [--role launcher|admit]
 ```
 
 - Default role `launcher` creates a fresh `--out` (reuse forbidden
   unless `--join` on an existing campaign).
-- `--join` is late-join / restart: open the existing store, reconstruct
-  authority, seed the new worker from admitted objects, connect to the
-  existing broker. Do not wipe the campaign.
+- `--join` is **offline continuation** of a stopped campaign. It does
+  not attach to a live broker. A restarted slot emits `WorkerLeft`
+  (end of the previous run) then `WorkerRestarted` and continues
+  `sender_seq` from `last_seq + 1`. It is refused if `target_id`,
+  stored manifest flags, `fast_build`, or the on-disk canonical
+  dump hash do not match the campaign record.
 - `run_substrate` (H0) is unchanged: still `SimpleEventManager` +
   `NopMonitor`. T2 uses a new `run_homogeneous_worker` that takes an
   injected LibAFL `EventManager`.
@@ -145,8 +148,9 @@ achlys_t2 --manifest PATH --out DIR --workers N
   local-only candidates; it must not lose admitted objects.
 - A restarted worker with the same `WorkerId` emits `WorkerRestarted`
   and continues `sender_seq` from reconstruct (last seq + 1).
-- A new `WorkerId` is a late join: `WorkerRegistered`, load admitted
-  snapshot, then fuzz.
+- A new `WorkerId` in an offline continuation is registered as a
+  first-time worker and loads the admitted snapshot. Live late join
+  onto a running broker is not implemented.
 - Reconstructing the event log must recover: registered workers,
   last seq per worker, admitted set, rejected set, last delta seq.
 
@@ -216,11 +220,8 @@ totals from JSONL. Scaling remains unclaimed.
 
 ## Implementation status (not an accept)
 
-On this branch, `achlys_t2` + `CorpusAuthority` + `CandidateSpool` exist.
-`T2_FUNCTIONAL=1 ./scripts/experiments/t2_smoke.sh` is green on macOS
-aarch64 (2 workers, 40 iters, reconstruct, `--join` union restore,
-occupied-root reject). H0 functional (150 identical hashes) and T1
-semantic smoke still pass.
-
-That is mechanism evidence. It is not the Linux 1/2/4/8 multi-trial
-ladder and does not close T2.
+`--join` is documented as offline continuation. Live late join is
+not implemented. The first T2 close was refused (scale log inside
+`--out`, mixed-target join, fake restart, unacked spool, hardcoded
+`queue_full=0`, `--workers` vs `--cores`). Those contracts are now
+enforced. This is still **not** a T2 accept.
