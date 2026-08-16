@@ -2,15 +2,15 @@ use std::fs;
 use std::num::NonZero;
 use std::path::PathBuf;
 use std::ptr::addr_of_mut;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 use libafl::{
     corpus::{Corpus, InMemoryCorpus, OnDiskCorpus, Testcase},
     events::SimpleEventManager,
-    executors::inprocess::InProcessExecutor,
+    executors::{ExitKind, inprocess::InProcessExecutor},
     feedbacks::{ConstFeedback, CrashFeedback, MaxMapFeedback},
     fuzzer::{Fuzzer, StdFuzzer},
     generators::RandBytesGenerator,
@@ -24,7 +24,7 @@ use libafl::{
 };
 use libafl_bolts::{AsSlice, current_nanos, rands::StdRand, tuples::tuple_list};
 
-use achlys_bridge::Target;
+use achlys_bridge::{InfraError, Target};
 
 /// Callback type for custom monitor output (TUI, logging, etc.).
 type MonitorCallback = Box<dyn FnMut(&str)>;
@@ -164,9 +164,19 @@ impl FuzzerBuilder {
         let scheduler = QueueScheduler::new();
         let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
-        let mut harness = |input: &BytesInput| {
+        let infra = Arc::new(Mutex::new(None::<InfraError>));
+        let infra_h = Arc::clone(&infra);
+        let mut harness = move |input: &BytesInput| {
             let bytes = input.target_bytes();
-            target.execute(bytes.as_slice())
+            match target.execute(bytes.as_slice()) {
+                Ok(kind) => kind,
+                Err(err) => {
+                    *infra_h.lock().expect("infra mutex poisoned") = Some(err);
+                    // Not a target result. Avoid Crash so CrashFeedback
+                    // does not persist this input as a finding.
+                    ExitKind::Ok
+                }
+            }
         };
 
         let mon = self.make_monitor();
@@ -180,6 +190,7 @@ impl FuzzerBuilder {
             &mut mgr,
         )
         .context("failed to create executor")?;
+        take_infra_error(&infra)?;
 
         // Load seed corpus or generate random inputs
         if let Some(ref corpus_dir) = self.config.corpus_dir {
@@ -190,15 +201,15 @@ impl FuzzerBuilder {
                 NonZero::new(self.config.max_input_len)
                     .unwrap_or(NonZero::new(4096).expect("4096 is non-zero")),
             );
-            state
-                .generate_initial_inputs(
-                    &mut fuzzer,
-                    &mut executor,
-                    &mut generator,
-                    &mut mgr,
-                    self.config.initial_inputs,
-                )
-                .context("failed to generate initial inputs")?;
+            let gen_res = state.generate_initial_inputs(
+                &mut fuzzer,
+                &mut executor,
+                &mut generator,
+                &mut mgr,
+                self.config.initial_inputs,
+            );
+            take_infra_error(&infra)?;
+            gen_res.context("failed to generate initial inputs")?;
         }
 
         // Branch: with AI cortex or plain havoc
@@ -219,17 +230,27 @@ impl FuzzerBuilder {
             }
             let mut stages = tuple_list!(escalating);
 
-            fuzzer
-                .fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)
-                .context("fatal error in fuzz loop")?;
+            fuzz_loop_abort_on_infra(
+                || {
+                    fuzzer
+                        .fuzz_loop_for(&mut stages, &mut executor, &mut state, &mut mgr, 1)
+                        .map(|_| ())
+                },
+                &infra,
+            )?;
         } else {
             // Plain havoc (no AI)
             let mutator = HavocScheduledMutator::new(havoc_mutations());
             let mut stages = tuple_list!(StdMutationalStage::new(mutator));
 
-            fuzzer
-                .fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)
-                .context("fatal error in fuzz loop")?;
+            fuzz_loop_abort_on_infra(
+                || {
+                    fuzzer
+                        .fuzz_loop_for(&mut stages, &mut executor, &mut state, &mut mgr, 1)
+                        .map(|_| ())
+                },
+                &infra,
+            )?;
         }
 
         Ok(())
@@ -244,7 +265,10 @@ impl FuzzerBuilder {
             StdMapObserver::new("dummy_map", slice)
         };
 
-        let mut feedback = ConstFeedback::new(true);
+        // Blackbox has no novelty signal. Admitting every exec is unbounded
+        // and forbidden (Master Plan 24.2). Seeds still load via
+        // load_seeds_from_dir; crashes still go through CrashFeedback.
+        let mut feedback = ConstFeedback::new(false);
         let mut objective = CrashFeedback::new();
 
         let mut state = StdState::new(
@@ -260,9 +284,19 @@ impl FuzzerBuilder {
         let scheduler = QueueScheduler::new();
         let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
-        let mut harness = |input: &BytesInput| {
+        let infra = Arc::new(Mutex::new(None::<InfraError>));
+        let infra_h = Arc::clone(&infra);
+        let mut harness = move |input: &BytesInput| {
             let bytes = input.target_bytes();
-            target.execute(bytes.as_slice())
+            match target.execute(bytes.as_slice()) {
+                Ok(kind) => kind,
+                Err(err) => {
+                    *infra_h.lock().expect("infra mutex poisoned") = Some(err);
+                    // Not a target result. Avoid Crash so CrashFeedback
+                    // does not persist this input as a finding.
+                    ExitKind::Ok
+                }
+            }
         };
 
         let mon = self.make_monitor();
@@ -276,6 +310,7 @@ impl FuzzerBuilder {
             &mut mgr,
         )
         .context("failed to create executor")?;
+        take_infra_error(&infra)?;
 
         if let Some(ref corpus_dir) = self.config.corpus_dir {
             load_seeds_from_dir(&mut state, corpus_dir)?;
@@ -285,15 +320,17 @@ impl FuzzerBuilder {
                 NonZero::new(self.config.max_input_len)
                     .unwrap_or(NonZero::new(4096).expect("4096 is non-zero")),
             );
-            state
-                .generate_initial_inputs(
-                    &mut fuzzer,
-                    &mut executor,
-                    &mut generator,
-                    &mut mgr,
-                    self.config.initial_inputs,
-                )
-                .context("failed to generate initial inputs")?;
+            // ConstFeedback(false) will not admit generated inputs; force-seed
+            // so the campaign has a bounded starting corpus.
+            let gen_res = state.generate_initial_inputs_forced(
+                &mut fuzzer,
+                &mut executor,
+                &mut generator,
+                &mut mgr,
+                self.config.initial_inputs,
+            );
+            take_infra_error(&infra)?;
+            gen_res.context("failed to generate initial inputs")?;
         }
 
         // In blackbox mode, the plateau detector triggers on time alone
@@ -316,19 +353,47 @@ impl FuzzerBuilder {
             }
             let mut stages = tuple_list!(escalating);
 
-            fuzzer
-                .fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)
-                .context("fatal error in fuzz loop")?;
+            fuzz_loop_abort_on_infra(
+                || {
+                    fuzzer
+                        .fuzz_loop_for(&mut stages, &mut executor, &mut state, &mut mgr, 1)
+                        .map(|_| ())
+                },
+                &infra,
+            )?;
         } else {
             let mutator = HavocScheduledMutator::new(havoc_mutations());
             let mut stages = tuple_list!(StdMutationalStage::new(mutator));
 
-            fuzzer
-                .fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)
-                .context("fatal error in fuzz loop")?;
+            fuzz_loop_abort_on_infra(
+                || {
+                    fuzzer
+                        .fuzz_loop_for(&mut stages, &mut executor, &mut state, &mut mgr, 1)
+                        .map(|_| ())
+                },
+                &infra,
+            )?;
         }
 
         Ok(())
+    }
+}
+
+fn take_infra_error(infra: &Mutex<Option<InfraError>>) -> Result<()> {
+    match infra.lock().expect("infra mutex poisoned").take() {
+        Some(err) => Err(anyhow!(err)),
+        None => Ok(()),
+    }
+}
+
+fn fuzz_loop_abort_on_infra<F>(mut step: F, infra: &Mutex<Option<InfraError>>) -> Result<()>
+where
+    F: FnMut() -> Result<(), libafl::Error>,
+{
+    loop {
+        let step_res = step();
+        take_infra_error(infra)?;
+        step_res.context("fatal error in fuzz loop")?;
     }
 }
 
