@@ -198,6 +198,48 @@ impl BuildIdentity {
             fs::read(path).map_err(|err| format!("failed to hash {}: {err}", path.display()))?;
         Ok(hex::encode(Sha256::digest(&bytes)))
     }
+
+    /// Recompute `build_id` from the recorded fields. Does not trust the
+    /// stored `build_id` byte string.
+    pub fn recompute_build_id(&self) -> Result<BuildId, String> {
+        let mut source_hashes = BTreeMap::new();
+        for (path, hex_hash) in &self.source_hashes {
+            source_hashes.insert(path.clone(), decode_sha256_hex(hex_hash, path)?);
+        }
+        let artifact_hash = match &self.artifact_hash {
+            Some(hex_hash) => Some(decode_sha256_hex(hex_hash, "artifact_hash")?),
+            None => None,
+        };
+        Ok(Self::compute(BuildIdentityParts {
+            target_id: self.target_id.clone(),
+            kind: self.kind,
+            compiler: self.compiler.clone(),
+            flags: self.flags.clone(),
+            source_hashes,
+            artifact_hash,
+        })
+        .build_id)
+    }
+
+    /// Refuse an identity whose `build_id` is not the hash of its parts.
+    pub fn validate(&self) -> Result<(), String> {
+        let expected = self.recompute_build_id()?;
+        if expected != self.build_id {
+            return Err(format!(
+                "build_id {} is not the hash of the identity fields (recomputed {})",
+                self.build_id.to_hex(),
+                expected.to_hex()
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn decode_sha256_hex(hex_hash: &str, label: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(hex_hash).map_err(|err| format!("{label} is not hex: {err}"))?;
+    bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| format!("{label} is {} bytes, want 32", bytes.len()))
 }
 
 fn detect_clang_version() -> Option<String> {
@@ -259,5 +301,23 @@ mod tests {
             artifact_hash: None,
         });
         assert_ne!(a.build_id, c.build_id);
+        a.validate().expect("fresh compute() must validate");
+    }
+
+    #[test]
+    fn validate_rejects_incoherent_build_id() {
+        let mut sources = BTreeMap::new();
+        sources.insert("a.c".into(), [1u8; 32]);
+        let mut id = BuildIdentity::compute(BuildIdentityParts {
+            target_id: TargetId("t".into()),
+            kind: BuildKind::Canonical,
+            compiler: "clang".into(),
+            flags: vec!["-O1".into()],
+            source_hashes: sources,
+            artifact_hash: Some([2u8; 32]),
+        });
+        id.artifact_hash = Some(hex::encode([3u8; 32]));
+        let err = id.validate().expect_err("tampered artifact_hash");
+        assert!(err.contains("is not the hash"), "{err}");
     }
 }

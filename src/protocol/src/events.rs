@@ -13,7 +13,11 @@ pub struct EventEnvelope {
     pub dedup_key: String,
 }
 
-/// Worker-originated envelope: EventEnvelope plus sender identity and seq.
+/// Worker-originated envelope.
+///
+/// `sender_seq` is the **authority event_seq**: strictly increasing in
+/// journal write order for this worker. The worker's generation order
+/// lives on `CandidateDiscovered.producer_seq`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerEnvelope {
     pub schema_version: u32,
@@ -196,6 +200,9 @@ pub enum CampaignEvent {
         parent_ids: Vec<InputId>,
         producing_strategy: StrategyId,
         producer_build: BuildId,
+        /// Worker-local generation order. Not the journal `sender_seq`.
+        #[serde(default)]
+        producer_seq: u64,
         local_coverage: Option<CoverageDigest>,
         local_delta_count: u32,
         execution_ns: u64,
@@ -333,6 +340,7 @@ mod tests {
             parent_ids: vec![],
             producing_strategy: StrategyId::Havoc,
             producer_build: BuildId([1; 32]),
+            producer_seq: 3,
             local_coverage: None,
             local_delta_count: 1,
             execution_ns: 2,

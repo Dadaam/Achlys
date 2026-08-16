@@ -4,7 +4,7 @@
 //! content-addressed candidates, replays them on a [`AdmitOracle`], and
 //! writes `CanonicalAdmitted` / `CanonicalRejected` / `CorpusDelta`.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -86,6 +86,8 @@ pub struct CorpusAuthority {
     rejected: HashSet<InputId>,
     pending_bound: usize,
     next_delta_seq: u64,
+    /// Next authority-assigned event_seq per worker (journal order).
+    next_event_seq: HashMap<WorkerId, u64>,
     queue_full: u64,
     replayed: usize,
 }
@@ -102,6 +104,7 @@ impl CorpusAuthority {
             rejected: HashSet::new(),
             pending_bound: pending_bound.max(1),
             next_delta_seq: 1,
+            next_event_seq: HashMap::new(),
             queue_full: 0,
             replayed: 0,
         }
@@ -118,6 +121,10 @@ impl CorpusAuthority {
         auth.seen.extend(auth.rejected.iter().copied());
         auth.replayed = auth.admitted.len().saturating_add(auth.rejected.len());
         auth.next_delta_seq = folded.last_delta_seq.saturating_add(1);
+        for (worker_id, rec) in folded.workers {
+            auth.next_event_seq
+                .insert(worker_id, rec.last_seq.saturating_add(1));
+        }
         for id in auth.store.list_inputs()? {
             auth.seen.insert(id);
             if auth.admitted.contains(&id) || auth.rejected.contains(&id) {
@@ -295,8 +302,8 @@ impl CorpusAuthority {
         worker_id: WorkerId,
         slot: u32,
         build: BuildId,
-        seq: u64,
-    ) -> Result<()> {
+    ) -> Result<u64> {
+        let seq = self.alloc_event_seq(worker_id);
         self.store.append_event(&CampaignEvent::WorkerRegistered {
             envelope: WorkerEnvelope::new(
                 self.store.campaign_id(),
@@ -309,10 +316,12 @@ impl CorpusAuthority {
             producer_build: build,
             slot,
             unix_ms: now_unix_ms(),
-        })
+        })?;
+        Ok(seq)
     }
 
-    pub fn note_left(&mut self, worker_id: WorkerId, seq: u64, reason: &str) -> Result<()> {
+    pub fn note_left(&mut self, worker_id: WorkerId, reason: &str) -> Result<u64> {
+        let seq = self.alloc_event_seq(worker_id);
         self.store.append_event(&CampaignEvent::WorkerLeft {
             envelope: WorkerEnvelope::new(
                 self.store.campaign_id(),
@@ -323,15 +332,12 @@ impl CorpusAuthority {
             ),
             reason: reason.to_string(),
             unix_ms: now_unix_ms(),
-        })
+        })?;
+        Ok(seq)
     }
 
-    pub fn note_restarted(
-        &mut self,
-        worker_id: WorkerId,
-        seq: u64,
-        previous_seq: u64,
-    ) -> Result<()> {
+    pub fn note_restarted(&mut self, worker_id: WorkerId, previous_seq: u64) -> Result<u64> {
+        let seq = self.alloc_event_seq(worker_id);
         self.store.append_event(&CampaignEvent::WorkerRestarted {
             envelope: WorkerEnvelope::new(
                 self.store.campaign_id(),
@@ -342,20 +348,22 @@ impl CorpusAuthority {
             ),
             previous_seq,
             unix_ms: now_unix_ms(),
-        })
+        })?;
+        Ok(seq)
     }
 
-    pub fn note_discovered(&mut self, meta: &InputMetadata) -> Result<()> {
+    pub fn note_discovered(&mut self, meta: &InputMetadata) -> Result<u64> {
         let worker_id = meta
             .worker_id
             .ok_or_else(|| anyhow!("CandidateDiscovered requires worker_id"))?;
-        let sender_seq = meta.producer_seq.unwrap_or(0);
+        let producer_seq = meta.producer_seq.unwrap_or(0);
+        let seq = self.alloc_event_seq(worker_id);
         self.store
             .append_event(&CampaignEvent::CandidateDiscovered {
                 envelope: WorkerEnvelope::new(
                     self.store.campaign_id(),
                     worker_id,
-                    sender_seq,
+                    seq,
                     monotonic_ns(),
                     CampaignEvent::input_dedup_key(meta.input_id),
                 ),
@@ -363,12 +371,20 @@ impl CorpusAuthority {
                 parent_ids: meta.parent_ids.clone(),
                 producing_strategy: meta.strategy.unwrap_or(StrategyId::Havoc),
                 producer_build: meta.producer_build,
+                producer_seq,
                 local_coverage: meta.local_coverage,
                 local_delta_count: meta.canonical_delta.unwrap_or(0),
                 execution_ns: 0,
                 generation_ns: 0,
                 unix_ms: now_unix_ms(),
-            })
+            })?;
+        Ok(seq)
+    }
+
+    fn alloc_event_seq(&mut self, worker_id: WorkerId) -> u64 {
+        let seq = self.next_event_seq.get(&worker_id).copied().unwrap_or(0);
+        self.next_event_seq.insert(worker_id, seq.saturating_add(1));
+        seq
     }
 
     fn enqueue(&mut self, id: InputId) -> bool {
@@ -557,7 +573,7 @@ mod tests {
     fn reconstruct_keeps_admitted_after_drop() {
         let (tmp, mut auth) = open_auth("adm_recon", 8);
         let mut oracle = FakeOracle::new();
-        auth.register_worker(WorkerId::from_slot(0), 0, BuildId([1; 32]), 0)
+        auth.register_worker(WorkerId::from_slot(0), 0, BuildId([1; 32]))
             .unwrap();
         auth.submit(cand(b"\x02zz", 0, 1)).unwrap();
         auth.note_discovered(&cand(b"\x02zz", 0, 1).meta).unwrap();
@@ -632,5 +648,33 @@ mod tests {
         assert_eq!(stats.replayed, 1);
         assert_eq!(auth.replayed(), 2);
         assert_eq!(auth.admitted_ids().len() + auth.rejected_len(), 2);
+    }
+
+    #[test]
+    fn event_seq_is_monotonic_when_producer_seq_is_shuffled() {
+        let (_tmp, mut auth) = open_auth("adm_event_seq", 8);
+        let w = WorkerId::from_slot(0);
+        auth.register_worker(w, 0, BuildId([1; 32])).unwrap();
+        let mut late = cand(b"\x01late", 0, 9);
+        late.meta.producer_seq = Some(9);
+        let mut early = cand(b"\x02early", 0, 1);
+        early.meta.producer_seq = Some(1);
+        auth.note_discovered(&late.meta).unwrap();
+        auth.note_discovered(&early.meta).unwrap();
+        auth.note_left(w, "budget").unwrap();
+        let mut seqs = Vec::new();
+        for ev in auth.store().read_events().unwrap() {
+            match ev {
+                CampaignEvent::WorkerRegistered { envelope, .. }
+                | CampaignEvent::CandidateDiscovered { envelope, .. }
+                | CampaignEvent::WorkerLeft { envelope, .. }
+                    if envelope.worker_id == w =>
+                {
+                    seqs.push(envelope.sender_seq);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(seqs, vec![0, 1, 2, 3]);
     }
 }

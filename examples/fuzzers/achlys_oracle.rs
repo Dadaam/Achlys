@@ -115,8 +115,12 @@ fn write_identity(path: &Path, identity: &BuildIdentity) {
 fn load_identity(path: &Path) -> BuildIdentity {
     let text = fs::read_to_string(path)
         .unwrap_or_else(|e| die(&format!("read identity {}: {e}", path.display())));
-    serde_json::from_str(&text)
-        .unwrap_or_else(|e| die(&format!("parse identity {}: {e}", path.display())))
+    let identity: BuildIdentity = serde_json::from_str(&text)
+        .unwrap_or_else(|e| die(&format!("parse identity {}: {e}", path.display())));
+    identity
+        .validate()
+        .unwrap_or_else(|e| die(&format!("identity.json {}: {e}", path.display())));
+    identity
 }
 
 fn resolve_artifact(args: &Args) -> (PathBuf, BuildIdentity) {

@@ -407,8 +407,7 @@ fn run_admit(out: &Path) -> Result<()> {
     let store = achlys_core::CampaignStore::open(artifacts_dir(out), read_campaign_id(out)?)?;
     let mut auth = CorpusAuthority::reconstruct(store, bound)?;
     let spool = CandidateSpool::open(spool_dir(out))?;
-    let record: CampaignRecord =
-        serde_json::from_slice(&fs::read(artifacts_dir(out).join("campaign.json"))?)?;
+    let record = read_campaign_record(out)?;
     let canonical = record
         .canonical_build
         .as_ref()
@@ -519,19 +518,10 @@ fn admit_once(
     let mut progress = false;
     for reg in spool.take_worker_registrations()? {
         if reg.restart {
-            auth.note_restarted(reg.worker_id, reg.sender_seq, reg.previous_seq.unwrap_or(0))?;
+            auth.note_restarted(reg.worker_id, reg.previous_seq.unwrap_or(0))?;
         } else {
-            auth.register_worker(
-                reg.worker_id,
-                reg.slot,
-                record.fast_build.build_id,
-                reg.sender_seq,
-            )?;
+            auth.register_worker(reg.worker_id, reg.slot, record.fast_build.build_id)?;
         }
-        progress = true;
-    }
-    for exit in spool.take_worker_exits()? {
-        auth.note_left(exit.worker_id, exit.sender_seq, &exit.reason)?;
         progress = true;
     }
     let processing = spool.take_processing(64)?;
@@ -549,6 +539,14 @@ fn admit_once(
         progress = true;
     }
     if stats.replayed > 0 {
+        progress = true;
+    }
+    for exit in spool.take_worker_exits()? {
+        if spool.has_pending_for(exit.worker_id)? {
+            spool.write_left(&exit)?;
+            continue;
+        }
+        auth.note_left(exit.worker_id, &exit.reason)?;
         progress = true;
     }
     Ok(progress)
@@ -589,7 +587,18 @@ fn read_campaign_id(out: &Path) -> Result<CampaignId> {
 fn read_campaign_record(out: &Path) -> Result<CampaignRecord> {
     let path = artifacts_dir(out).join("campaign.json");
     let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
+    let record: CampaignRecord =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+    record
+        .fast_build
+        .validate()
+        .map_err(|err| anyhow!("campaign fast_build: {err}"))?;
+    if let Some(canon) = &record.canonical_build {
+        canon
+            .validate()
+            .map_err(|err| anyhow!("campaign canonical_build: {err}"))?;
+    }
+    Ok(record)
 }
 
 fn assert_join_compatible(
@@ -675,7 +684,12 @@ fn verify_canonical_file(bin: &Path, identity: &BuildIdentity) {
 fn load_identity_json(path: &Path) -> Result<BuildIdentity> {
     let text =
         fs::read_to_string(path).with_context(|| format!("read identity {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("parse identity {}", path.display()))
+    let identity: BuildIdentity = serde_json::from_str(&text)
+        .with_context(|| format!("parse identity {}", path.display()))?;
+    identity
+        .validate()
+        .map_err(|err| anyhow!("identity.json {}: {err}", path.display()))?;
+    Ok(identity)
 }
 
 fn write_identity_json(path: &Path, identity: &BuildIdentity) -> Result<()> {

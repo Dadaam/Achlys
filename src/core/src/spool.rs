@@ -155,6 +155,16 @@ impl CandidateSpool {
         take_from_dir(&self.overflow_dir(), &self.processing_dir(), max)
     }
 
+    /// True if inbox, processing, or overflow still holds an object from `worker`.
+    pub fn has_pending_for(&self, worker: WorkerId) -> Result<bool> {
+        for dir in [self.inbox_dir(), self.processing_dir(), self.overflow_dir()] {
+            if dir_has_worker(&dir, worker)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn write_delta(&self, sequence: u64, admitted: &[InputId]) -> Result<PathBuf> {
         let path = self.deltas_dir().join(format!("{sequence:016}.json"));
         let body = serde_json::json!({
@@ -350,6 +360,28 @@ impl CandidateSpool {
     fn left_dir(&self) -> PathBuf {
         self.root.join("left")
     }
+}
+
+fn dir_has_worker(dir: &Path, worker: WorkerId) -> Result<bool> {
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(dir).with_context(|| format!("list {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("read {}", dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let meta: InputMetadata = match serde_json::from_str(&text) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.worker_id == Some(worker) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn count_pairs(dir: &Path) -> usize {

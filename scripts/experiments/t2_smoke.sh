@@ -176,6 +176,8 @@ for raw in open(events_p, encoding="utf-8"):
 for wid, seqs in worker_seqs.items():
     if len(seqs) != len(set(seqs)):
         raise SystemExit(f"reused sender_seq for worker {wid}: {seqs}")
+    if seqs != sorted(seqs):
+        raise SystemExit(f"sender_seq not monotonic for worker {wid}: {seqs}")
 
 admitted_set = {i for i in admitted_ids if i}
 canon_admitted = as_int(canon, "admitted")
@@ -270,6 +272,8 @@ for wid, seqs in seq_by_worker.items():
     nums = [int(s) for s in seqs if s is not None]
     if len(nums) != len(set(nums)):
         raise SystemExit(f"reused sender_seq for worker {wid}: {nums}")
+    if nums != sorted(nums):
+        raise SystemExit(f"sender_seq not monotonic for worker {wid}: {nums}")
 if len(stored) != len(set(stored)):
     raise SystemExit("post-join InputStored ids are not unique")
 if "admitted" not in canon:
@@ -478,6 +482,51 @@ if ! grep -Eiq 'identity.json missing|refusing to invent' "$out/orphan.log"; the
 fi
 echo "T2_CANONICAL_ORPHAN=OK"
 
+# Honest cJSON identity + micro binary + artifact_hash rewritten, old build_id kept.
+incoherent="$out/incoherent-id"
+rm -rf "$incoherent"
+mkdir -p "$incoherent"
+cjson_id="$out/run1/builds/canonical/identity.json"
+if [[ ! -f "$cjson_id" ]]; then
+  echo "T2_BUILD_ID=FAIL reason=missing-cjson-identity" >&2
+  exit 1
+fi
+cp "$micro_dir/canonical" "$incoherent/canonical"
+python3 - "$cjson_id" "$incoherent/canonical" "$incoherent/identity.json" <<'PY'
+import hashlib, json, sys
+src, binary, dest = sys.argv[1:]
+ident = json.loads(open(src, encoding="utf-8").read())
+digest = hashlib.sha256(open(binary, "rb").read()).hexdigest()
+ident["artifact_hash"] = digest
+# keep the original build_id so the sidecar is internally inconsistent
+json.dump(ident, open(dest, "w", encoding="utf-8"), indent=2)
+PY
+set +e
+"$t2_bin" \
+  --manifest benchmarks/manifests/cjson-parse.toml \
+  --label t2-incoherent-id \
+  --seed 1 \
+  --iters 2 \
+  --workers 1 \
+  --broker-port 17369 \
+  --corpus "$out/seeds" \
+  --canonical-dir "$incoherent" \
+  --out "$out/incoherent" \
+  >"$out/incoherent.log" 2>&1
+inc_rc=$?
+set -e
+if [[ "$inc_rc" -eq 0 ]]; then
+  echo "T2_BUILD_ID=FAIL reason=incoherent-identity-accepted" >&2
+  cat "$out/incoherent.log" >&2
+  exit 1
+fi
+if ! grep -Eiq 'build_id|not the hash|identity.json' "$out/incoherent.log"; then
+  echo "T2_BUILD_ID=FAIL reason=missing-validate-error" >&2
+  cat "$out/incoherent.log" >&2
+  exit 1
+fi
+echo "T2_BUILD_ID=OK"
+
 qfull_out="$out/qfull"
 rm -rf "$qfull_out"
 set +e
@@ -514,6 +563,20 @@ if int(kv.get("queue_full", "0")) < 1:
     raise SystemExit(f"T2_RESULT queue_full={kv.get('queue_full')}")
 if int(kv["objects"]) != int(kv["replayed"]):
     raise SystemExit("qfull objects != replayed")
+seqs = {}
+events_p = sys.argv[1].replace("metrics/admission.json", "events/events.jsonl")
+for raw in open(events_p, encoding="utf-8"):
+    raw = raw.strip()
+    if not raw:
+        continue
+    ev = json.loads(raw)
+    wid, seq = ev.get("worker_id"), ev.get("sender_seq")
+    if wid is None or seq is None:
+        continue
+    seqs.setdefault(wid, []).append(int(seq))
+for wid, xs in seqs.items():
+    if xs != sorted(xs) or len(xs) != len(set(xs)):
+        raise SystemExit(f"qfull sender_seq not monotonic unique for {wid}: {xs}")
 print("T2_QUEUE_FULL=OK")
 PY
 
