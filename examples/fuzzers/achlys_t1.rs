@@ -65,6 +65,7 @@ struct Args {
     out: PathBuf,
     manifest: PathBuf,
     label: String,
+    extra_crashes: Vec<PathBuf>,
 }
 
 fn parse_args() -> Args {
@@ -75,6 +76,7 @@ fn parse_args() -> Args {
     let mut out = PathBuf::from(DEFAULT_OUT);
     let mut manifest = PathBuf::from(DEFAULT_MANIFEST);
     let mut label = "t1".to_string();
+    let mut extra_crashes = Vec::new();
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -106,6 +108,7 @@ fn parse_args() -> Args {
             "--out" => out = PathBuf::from(need("--out")),
             "--manifest" => manifest = PathBuf::from(need("--manifest")),
             "--label" => label = need("--label"),
+            "--extra-crash" => extra_crashes.push(PathBuf::from(need("--extra-crash"))),
             "-h" | "--help" => {
                 print_help();
                 process::exit(0);
@@ -129,13 +132,14 @@ fn parse_args() -> Args {
         out,
         manifest,
         label,
+        extra_crashes,
     }
 }
 
 fn print_help() {
     eprintln!(
         "achlys_t1 --manifest PATH [--label NAME] --seed N [--iters N | --seconds N] \
-         [--corpus DIR] [--out DIR]"
+         [--corpus DIR] [--out DIR] [--extra-crash FILE]"
     );
 }
 
@@ -204,6 +208,8 @@ fn worker_target(kind: WorkerTarget) -> InProcessTarget {
             }
         }
         other => {
+            // Worker-local map is synthetic (first byte + nonzero return).
+            // Published coverage comes only from the compiled SanCov dump.
             let ptr = addr_of_mut!(MICRO_MAP) as *mut u8;
             unsafe {
                 InProcessTarget::with_coverage(
@@ -238,50 +244,56 @@ fn worker_target(kind: WorkerTarget) -> InProcessTarget {
     }
 }
 
-fn list_regular_files(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut files: Vec<_> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && !is_sidecar(p))
-        .collect();
+fn list_regular_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let entries = fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read entry in {}: {e}", dir.display()))?;
+        let path = entry.path();
+        if path.is_file() && !is_sidecar(&path) {
+            files.push(path);
+        }
+    }
     files.sort();
-    files
+    Ok(files)
 }
+
+type CrashIngest = (usize, usize, Vec<(InputId, Vec<u8>)>);
 
 fn ingest_crashes(
     session: &CampaignSession,
     dir: &Path,
     producer_build: BuildId,
-) -> (usize, usize, Vec<(InputId, Vec<u8>)>) {
+) -> Result<CrashIngest, String> {
+    let files = list_regular_files(dir)?;
     let mut unique = HashSet::new();
     let mut items = Vec::new();
-    for path in list_regular_files(dir) {
-        let Ok(bytes) = fs::read(&path) else {
-            continue;
-        };
+    for path in &files {
+        let bytes = fs::read(path).map_err(|e| format!("read crash {}: {e}", path.display()))?;
         if bytes.is_empty() {
-            continue;
+            return Err(format!("empty crash candidate {}", path.display()));
         }
-        let id = InputId::from_bytes(&bytes);
-        if let Ok(stored) = session.store().put_crash(&bytes)
-            && unique.insert(stored)
-        {
-            let _ = session
+        let stored = session
+            .store()
+            .put_crash(&bytes)
+            .map_err(|e| format!("store crash {}: {e:#}", path.display()))?;
+        if unique.insert(stored) {
+            session
                 .store()
                 .append_event(&CampaignEvent::CrashDiscovered {
                     campaign_id: session.store().campaign_id(),
                     input_id: stored,
                     producer_build,
                     unix_ms: unix_ms(),
-                });
+                })
+                .map_err(|e| format!("CrashDiscovered {}: {e:#}", path.display()))?;
             items.push((stored, bytes));
         }
-        let _ = id;
     }
-    (list_regular_files(dir).len(), unique.len(), items)
+    Ok((files.len(), unique.len(), items))
 }
 
 fn verify_crashes(
@@ -337,7 +349,7 @@ fn verify_crashes(
     Ok(stats)
 }
 
-fn fingerprint_git(root: &Path) -> (String, u32) {
+fn fingerprint_git(root: &Path) -> (String, u32, u32) {
     let sha = Command::new("git")
         .args(["-C", &root.display().to_string(), "rev-parse", "HEAD"])
         .output()
@@ -345,18 +357,28 @@ fn fingerprint_git(root: &Path) -> (String, u32) {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "unknown".into());
-    let dirty = Command::new("git")
+    let porcelain = Command::new("git")
         .args(["-C", &root.display().to_string(), "status", "--porcelain"])
         .output()
-        .ok()
+        .ok();
+    let (dirty, untracked) = porcelain
         .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| !l.is_empty() && !l.starts_with("??"))
-                .count() as u32
+            let mut dirty = 0u32;
+            let mut untracked = 0u32;
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                if line.is_empty() {
+                    continue;
+                }
+                if line.starts_with("??") {
+                    untracked += 1;
+                } else {
+                    dirty += 1;
+                }
+            }
+            (dirty, untracked)
         })
-        .unwrap_or(0);
-    (sha, dirty)
+        .unwrap_or((0, 0));
+    (sha, dirty, untracked)
 }
 
 fn rustc_version() -> String {
@@ -425,7 +447,7 @@ fn main() {
     )
     .unwrap_or_else(|e| die(&format!("sanitizer compile: {e:#}")));
 
-    let (git, dirty) = fingerprint_git(&root);
+    let (git, dirty, untracked) = fingerprint_git(&root);
     let record = CampaignRecord {
         schema_version: CampaignEvent::SCHEMA_VERSION,
         campaign_id: CampaignId::from_label(&format!(
@@ -443,7 +465,8 @@ fn main() {
         host: format!("{} {}", env::consts::OS, env::consts::ARCH),
         rustc: rustc_version(),
         git,
-        git_dirty: dirty,
+        git_dirty_tracked: dirty,
+        git_untracked: untracked,
         fast_build: fast.clone(),
         canonical_build: Some(canonical.identity.clone()),
         sanitizer_build: Some(sanitizer.identity.clone()),
@@ -475,11 +498,27 @@ fn main() {
         .run_substrate(target)
         .unwrap_or_else(|e| die(&format!("substrate: {e:#}")));
 
+    fs::create_dir_all(&crashes_dir)
+        .unwrap_or_else(|e| die(&format!("create {}: {e}", crashes_dir.display())));
+    for (i, extra) in args.extra_crashes.iter().enumerate() {
+        if !extra.is_file() {
+            die(&format!("--extra-crash is not a file: {}", extra.display()));
+        }
+        let name = extra
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("extra-{i}"));
+        let dest = crashes_dir.join(format!("extra-{i}-{name}"));
+        fs::copy(extra, &dest)
+            .unwrap_or_else(|e| die(&format!("copy extra crash {}: {e}", extra.display())));
+    }
+
     let ingested = session
         .ingest_worker_dir(&persist_dir, "havoc-substrate", fast.build_id)
         .unwrap_or_else(|e| die(&format!("ingest corpus: {e:#}")));
     let (crash_files, unique_crashes, crash_items) =
-        ingest_crashes(&session, &crashes_dir, fast.build_id);
+        ingest_crashes(&session, &crashes_dir, fast.build_id)
+            .unwrap_or_else(|e| die(&format!("ingest crashes: {e}")));
     let crash = verify_crashes(
         &session,
         &crash_items,

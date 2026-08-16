@@ -74,6 +74,7 @@ cargo run -p achlys-cli --release -- fuzz ./parser @@ --corpus seeds/ --no-ai
 - CLI campaigns have no coverage map. Blackbox admission uses `ConstFeedback(false)` (seeds + crashes only).
 - Spawn, write, and wait failures are `InfraError` and abort the campaign. They are not target crashes.
 - Sanitizer replay and crash dedup exist **off** the hot path (`SanitizerReplayer`). They are not wired into `achlys fuzz`.
+- Micro-target workers in `achlys_t1` use a **synthetic** local coverage map. Canonical edges come from a separately compiled SanCov dump. Do not treat those worker maps as real SanCov.
 - No forkserver, LLMP, multi-worker campaign, or adaptive allocation.
 - ML crates (`achlys-cortex`, `AiMutator`, `HybridStage`, `AutoTrainer`) are experimental leftovers, not the research baseline.
 

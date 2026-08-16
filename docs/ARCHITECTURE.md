@@ -37,6 +37,8 @@ Achlys/
 
 There is no QEMU backend, no network target, no symbolic engine, no orchestrator, and no multi-worker control plane. Canonical replay and sanitizer verification run **after** a worker campaign, not once per execution.
 
+Micro-target **worker** coverage in `achlys_t1` is a synthetic local map (first input byte + nonzero return). Published edges come only from the compiled SanCov dump. That is an infrastructure test, not a representative SanCov worker.
+
 ## CLI execution path
 
 ```

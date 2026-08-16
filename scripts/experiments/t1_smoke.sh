@@ -93,9 +93,9 @@ if need("target") != "cjson-parse":
 if int(need("reproduced")) != 0:
     raise SystemExit("unexpected reproduced crashes on this smoke")
 if int(need("clean")) != 0 or int(need("crash_files")) != 0:
-    # no crash files expected
-    if int(need("reproduced")) > 0:
-        raise SystemExit("reproduced>0 without a known crash seed")
+    raise SystemExit(
+        f"unexpected crash activity: crash_files={need('crash_files')} clean={need('clean')}"
+    )
 
 canon = json.loads(open(canon_p).read())
 digest = canon["digest"]
@@ -173,5 +173,45 @@ if ! grep -q '"target_id": "micro-nonzero-exit"' "$out/micro/artifacts/campaign.
   echo "T1_MICRO=FAIL reason=campaign-target-mismatch" >&2
   exit 1
 fi
+
+crash_log="$out/crash-clean.log"
+./target/release/examples/achlys_t1 \
+  --manifest benchmarks/manifests/cjson-parse.toml \
+  --label t1-clean-crash \
+  --seed 1 \
+  --iters 2 \
+  --corpus "$out/seeds" \
+  --extra-crash "$out/seeds/seed.json" \
+  --out "$out/crash-clean" | tee "$crash_log"
+python3 - "$crash_log" "$out/crash-clean/artifacts/events/events.jsonl" <<'PY'
+import json, sys
+log, events_p = sys.argv[1], sys.argv[2]
+line = [ln for ln in open(log) if ln.startswith("T1_RESULT ")][-1]
+kv = dict(part.split("=", 1) for part in line.split()[1:] if "=" in part)
+want = {
+    "crash_files": "1",
+    "unique_candidates": "1",
+    "replays": "1",
+    "clean": "1",
+    "reproduced": "0",
+    "unique_sigs": "0",
+}
+for k, v in want.items():
+    if kv.get(k) != v:
+        raise SystemExit(f"clean-crash {k}={kv.get(k)!r} want {v}")
+verified = [
+    json.loads(ln)
+    for ln in open(events_p)
+    if ln.strip() and json.loads(ln).get("type") == "crash_verified"
+]
+if len(verified) != 1:
+    raise SystemExit(f"want 1 CrashVerified, got {len(verified)}")
+ev = verified[0]
+if ev.get("reproducible") is not False:
+    raise SystemExit(f"reproducible={ev.get('reproducible')}")
+if ev.get("class") != "Clean":
+    raise SystemExit(f"class={ev.get('class')}")
+print("T1_CLEAN_CRASH=OK")
+PY
 
 echo "T1_FUNCTIONAL=OK"

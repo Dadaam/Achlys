@@ -37,6 +37,11 @@ aflpp_status="skip"
 aflpp_reason=""
 libafl_reason=""
 achlys_reason=""
+canon_libafl="skip"
+canon_achlys="skip"
+canon_aflpp="skip"
+canon_reason=""
+canon_incomplete=0
 
 git_rev() {
   git rev-parse HEAD 2>/dev/null || echo unknown
@@ -71,6 +76,12 @@ write_manifest() {
     if [[ -n "${aflpp_reason}" ]]; then
       echo "aflpp_reason=${aflpp_reason}"
     fi
+    echo "canonical_libafl=${canon_libafl}"
+    echo "canonical_achlys=${canon_achlys}"
+    echo "canonical_aflpp=${canon_aflpp}"
+    if [[ -n "${canon_reason}" ]]; then
+      echo "canonical_reason=${canon_reason}"
+    fi
     echo "profile=release"
     echo "examples=libafl_baseline,achlys_h0"
     echo "harness=examples/targets/cJSON/harness_afl.c"
@@ -96,8 +107,17 @@ write_summary() {
     if [[ -n "${aflpp_reason}" ]]; then
       echo "aflpp_reason=${aflpp_reason}"
     fi
+    echo "canonical_libafl=${canon_libafl}"
+    echo "canonical_achlys=${canon_achlys}"
+    echo "canonical_aflpp=${canon_aflpp}"
+    if [[ -n "${canon_reason}" ]]; then
+      echo "canonical_reason=${canon_reason}"
+    fi
     echo "record_only=${RECORD_ONLY}"
-    echo "note=what ran / what was skipped; raw logs under ${OUT_ROOT}; no winner"
+    if [[ "${canon_incomplete}" == "1" ]]; then
+      echo "canonical_incomplete=1"
+    fi
+    echo "note=coverage via one shared DumpOracle artifact; not a superiority claim; not a 5-trial gate"
   } > "${OUT_ROOT}/summary.txt"
 }
 
@@ -250,36 +270,122 @@ EOF
   fi
 fi
 
-# Replay each lane's corpus on the same canonical dump. Coverage, not exec/s.
-if command -v cargo >/dev/null 2>&1; then
-  cargo build --release --example achlys_oracle >/dev/null
-  replay_one() {
-    local name="$1"
-    local corpus="$2"
-    if [[ ! -d "${corpus}" ]]; then
-      echo "T1_CANONICAL_${name}=SKIP reason=no-corpus"
-      return 0
-    fi
-    local outf="${OUT_ROOT}/canonical_${name}.json"
-    if ./target/release/examples/achlys_oracle \
-      --manifest benchmarks/manifests/cjson-parse.toml \
-      --corpus "${corpus}" \
-      --out "${outf}" \
-      > "${OUT_ROOT}/canonical_${name}.log"; then
-      echo "T1_CANONICAL_${name}=OK file=${outf}"
-    else
-      echo "T1_CANONICAL_${name}=FAIL"
-      return 1
-    fi
-  }
-  replay_one LIBAFL "${OUT_ROOT}/libafl/corpus" || true
-  replay_one ACHLYS "${OUT_ROOT}/achlys/corpus" || true
-  if [[ -d "${OUT_ROOT}/aflpp/out/default/queue" ]]; then
-    replay_one AFLPP "${OUT_ROOT}/aflpp/out/default/queue" || true
-  elif [[ -d "${OUT_ROOT}/aflpp/out/queue" ]]; then
-    replay_one AFLPP "${OUT_ROOT}/aflpp/out/queue" || true
+count_inputs() {
+  local dir="$1"
+  if [[ ! -d "${dir}" ]]; then
+    echo 0
+    return
+  fi
+  find "${dir}" -maxdepth 1 -type f ! -name '.*' ! -name '*.metadata' | wc -l | tr -d ' '
+}
+
+canon_fail() {
+  local msg="$1"
+  canon_reason="${msg}"
+  echo "T1_CANONICAL=FAIL reason=${msg}" >&2
+  if [[ "${RECORD_ONLY}" == "1" ]]; then
+    canon_incomplete=1
+    return 0
+  fi
+  write_manifest
+  write_summary
+  exit 1
+}
+
+# One compiled dump binary for every lane. Coverage, not exec/s.
+if ! cargo build --release --example achlys_oracle; then
+  canon_fail "oracle-build-failed"
+else
+  CANON_DIR="${OUT_ROOT}/canonical_build"
+  rm -rf "${CANON_DIR}"
+  mkdir -p "${CANON_DIR}"
+  if ! ./target/release/examples/achlys_oracle \
+    --manifest benchmarks/manifests/cjson-parse.toml \
+    --compile-out "${CANON_DIR}" \
+    > "${OUT_ROOT}/canonical_compile.log"; then
+    canon_fail "oracle-compile-failed"
   else
-    echo "T1_CANONICAL_AFLPP=SKIP reason=no-queue"
+    CANON_BIN="${CANON_DIR}/canonical"
+    CANON_ID="${CANON_DIR}/identity.json"
+    if [[ ! -f "${CANON_BIN}" || ! -f "${CANON_ID}" ]]; then
+      canon_fail "oracle-compile-missing-artifact"
+    else
+      replay_one() {
+        local name="$1"
+        local corpus="$2"
+        local var="$3"
+        if [[ ! -d "${corpus}" ]]; then
+          echo "T1_CANONICAL_${name}=SKIP reason=no-corpus"
+          eval "${var}=skip"
+          return 0
+        fi
+        local n
+        n="$(count_inputs "${corpus}")"
+        local outf="${OUT_ROOT}/canonical_${name}.json"
+        if ./target/release/examples/achlys_oracle \
+          --binary "${CANON_BIN}" \
+          --identity "${CANON_ID}" \
+          --corpus "${corpus}" \
+          --expected-files "${n}" \
+          --out "${outf}" \
+          > "${OUT_ROOT}/canonical_${name}.log"; then
+          echo "T1_CANONICAL_${name}=OK file=${outf} files=${n}"
+          eval "${var}=ok"
+        else
+          echo "T1_CANONICAL_${name}=FAIL"
+          eval "${var}=fail"
+          return 1
+        fi
+      }
+
+      set +e
+      if [[ "${libafl_status}" == "ok" ]]; then
+        replay_one LIBAFL "${OUT_ROOT}/libafl/corpus" canon_libafl
+      fi
+      if [[ "${achlys_status}" == "ok" ]]; then
+        replay_one ACHLYS "${OUT_ROOT}/achlys/corpus" canon_achlys
+      fi
+      if [[ "${aflpp_status}" == "ok" ]]; then
+        if [[ -d "${OUT_ROOT}/aflpp/out/default/queue" ]]; then
+          replay_one AFLPP "${OUT_ROOT}/aflpp/out/default/queue" canon_aflpp
+        elif [[ -d "${OUT_ROOT}/aflpp/out/queue" ]]; then
+          replay_one AFLPP "${OUT_ROOT}/aflpp/out/queue" canon_aflpp
+        else
+          echo "T1_CANONICAL_AFLPP=SKIP reason=no-queue"
+          canon_aflpp="skip"
+        fi
+      fi
+      set -e
+
+      if [[ "${canon_libafl}" == "fail" || "${canon_achlys}" == "fail" || "${canon_aflpp}" == "fail" ]]; then
+        canon_fail "replay-failed"
+      elif ! python3 - "${OUT_ROOT}" "${libafl_status}" "${achlys_status}" "${aflpp_status}" <<'PY'
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+want = {}
+for name, status in (("LIBAFL", sys.argv[2]), ("ACHLYS", sys.argv[3]), ("AFLPP", sys.argv[4])):
+    if status != "ok":
+        continue
+    path = root / f"canonical_{name}.json"
+    if not path.is_file():
+        raise SystemExit(f"missing {path}")
+    data = json.loads(path.read_text())
+    for key in ("canonical_build", "artifact_hash", "replayed", "digest"):
+        if key not in data or data[key] in (None, ""):
+            raise SystemExit(f"{path} missing {key}")
+    want.setdefault("canonical_build", data["canonical_build"])
+    want.setdefault("artifact_hash", data["artifact_hash"])
+    if data["canonical_build"] != want["canonical_build"]:
+        raise SystemExit("canonical_build mismatch across lanes")
+    if data["artifact_hash"] != want["artifact_hash"]:
+        raise SystemExit("artifact_hash mismatch across lanes")
+print("T1_CANONICAL_SHARED=OK")
+PY
+      then
+        canon_fail "canonical-reports-inconsistent"
+      fi
+    fi
   fi
 fi
 
@@ -290,10 +396,16 @@ echo "wrote ${OUT_ROOT}/MANIFEST.txt"
 
 if [[ "${RECORD_ONLY}" == "1" ]]; then
   echo "T1_RECORD_ONLY=1; exit 0"
+  if [[ "${canon_incomplete}" == "1" ]]; then
+    echo "T1_RECORD_ONLY incomplete canonical replay declared"
+  fi
   exit 0
 fi
 
 if [[ "${libafl_status}" == "fail" || "${achlys_status}" == "fail" || "${aflpp_status}" == "fail" ]]; then
+  exit 1
+fi
+if [[ "${canon_libafl}" == "fail" || "${canon_achlys}" == "fail" || "${canon_aflpp}" == "fail" ]]; then
   exit 1
 fi
 exit 0

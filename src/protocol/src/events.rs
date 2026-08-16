@@ -126,7 +126,12 @@ pub struct CampaignRecord {
     pub host: String,
     pub rustc: String,
     pub git: String,
-    pub git_dirty: u32,
+    /// Tracked dirty files only (`git status --porcelain`, excluding `??`).
+    #[serde(default, alias = "git_dirty")]
+    pub git_dirty_tracked: u32,
+    /// Untracked paths (`??`). Not included in `git_dirty_tracked`.
+    #[serde(default)]
+    pub git_untracked: u32,
     pub fast_build: BuildIdentity,
     pub canonical_build: Option<BuildIdentity>,
     pub sanitizer_build: Option<BuildIdentity>,
