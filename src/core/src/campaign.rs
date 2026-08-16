@@ -53,7 +53,7 @@ impl CampaignSession {
         for entry in entries {
             let entry = entry.with_context(|| format!("read entry in {}", dir.display()))?;
             let path = entry.path();
-            if !path.is_file() {
+            if !path.is_file() || is_libafl_sidecar(&path) {
                 continue;
             }
             let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
@@ -90,6 +90,14 @@ impl CampaignSession {
     pub fn store(&self) -> &CampaignStore {
         &self.store
     }
+}
+
+/// LibAFL `InMemoryOnDiskCorpus` writes `.*.metadata` next to inputs.
+fn is_libafl_sidecar(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name.starts_with('.') || name.ends_with(".metadata")
 }
 
 #[cfg(test)]
@@ -136,6 +144,7 @@ mod tests {
         fs::write(worker.0.join("b"), b"beta").unwrap();
         fs::write(worker.0.join("c"), b"alpha").unwrap();
         fs::write(worker.0.join("empty"), b"").unwrap();
+        fs::write(worker.0.join(".deadbeef_1.metadata"), b"not-an-input").unwrap();
         fs::create_dir(worker.0.join("nested")).unwrap();
 
         let stored = session

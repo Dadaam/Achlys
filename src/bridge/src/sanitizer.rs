@@ -181,6 +181,59 @@ impl SanitizerReplayer {
         Ok(path)
     }
 
+    /// Compile vendored cJSON + `harness_afl.c` with ASan/UBSan into
+    /// `out_dir/cjson_asan`. Verification only — not a throughput worker.
+    pub fn compile_cjson(out_dir: &Path) -> Result<PathBuf> {
+        let cjson = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/targets/cJSON");
+        let src = cjson.join("cJSON.c");
+        let harness = cjson.join("harness_afl.c");
+        if !src.is_file() || !harness.is_file() {
+            bail!("missing cJSON sources under {}", cjson.display());
+        }
+
+        std::fs::create_dir_all(out_dir)
+            .with_context(|| format!("create {}", out_dir.display()))?;
+
+        let driver = out_dir.join("cjson_stdin_driver.c");
+        std::fs::write(
+            &driver,
+            r#"
+#include <stdint.h>
+#include <stdio.h>
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
+int main(void) {
+    uint8_t buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf), stdin);
+    return LLVMFuzzerTestOneInput(buf, n);
+}
+"#,
+        )
+        .with_context(|| format!("write {}", driver.display()))?;
+
+        let path = out_dir.join("cjson_asan");
+        let output = Command::new("clang")
+            .args(["-O0", "-g", "-fsanitize=address,undefined", "-o"])
+            .arg(&path)
+            .arg("-I")
+            .arg(&cjson)
+            .arg(&harness)
+            .arg(&src)
+            .arg(&driver)
+            .output()
+            .context("failed to run clang (is it installed?)")?;
+        if !output.status.success() {
+            bail!(
+                "clang sanitizer build failed for cJSON: {}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        if !path.is_file() {
+            bail!("clang produced no binary at {}", path.display());
+        }
+        Ok(path)
+    }
+
     /// Replay `input` on stdin. Missing binary / spawn failure is `Err`,
     /// not `Clean`. Timeout kills the child process group.
     pub fn replay(&self, input: &[u8]) -> Result<ReplayReport, InfraError> {
@@ -582,6 +635,23 @@ mod tests {
         assert_eq!(report.class, ReplayClass::Timeout);
         assert!(report.signal.is_none());
         assert!(report.exit_code.is_none());
+    }
+
+    #[test]
+    fn cjson_seed_is_clean() {
+        let _guard = HARNESS.lock().unwrap_or_else(|e| e.into_inner());
+        let seq = BUILD_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("achlys_asan_cjson_{}_{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create cjson asan dir");
+        let path = SanitizerReplayer::compile_cjson(&dir).expect("compile cjson asan");
+        let report = SanitizerReplayer::new(&path)
+            .with_timeout(FAST)
+            .replay(br#"{"a":1}"#)
+            .expect("replay cjson seed");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(report.class, ReplayClass::Clean);
     }
 
     #[test]

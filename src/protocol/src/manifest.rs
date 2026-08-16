@@ -261,7 +261,12 @@ flags = ["-O1", "-g", "-fsanitize=address,undefined"]
     #[test]
     fn repo_manifests_load() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/manifests");
-        for name in ["cjson-parse.toml", "micro-crash-if-magic.toml"] {
+        for name in [
+            "cjson-parse.toml",
+            "micro-crash-if-magic.toml",
+            "micro-nonzero-exit.toml",
+            "micro-coverage-stable.toml",
+        ] {
             let m = TargetManifest::from_path(root.join(name)).unwrap();
             assert_eq!(m.schema_version, MANIFEST_SCHEMA_VERSION);
             assert!(m.max_input_len > 0);

@@ -105,7 +105,9 @@ fn list_corpus(dir: &Path) -> Vec<PathBuf> {
         .filter_map(|entry| match entry {
             Ok(e) => {
                 let path = e.path();
-                path.is_file().then_some(path)
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let skip = name.starts_with('.') || name.ends_with(".metadata");
+                (path.is_file() && !skip).then_some(path)
             }
             Err(e) => die(&format!("read {}: {e}", dir.display())),
         })

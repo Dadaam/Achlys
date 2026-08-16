@@ -12,7 +12,9 @@ use std::process;
 use std::ptr::addr_of_mut;
 use std::time::Duration;
 
-use achlys_bridge::{CanonicalOracle, CoverageMap, InProcessTarget};
+use achlys_bridge::{
+    CanonicalOracle, CoverageMap, InProcessTarget, ReplayClass, SanitizerReplayer, dedup_key,
+};
 use achlys_core::{CampaignSession, CanonicalReport, FuzzerBuilder};
 use achlys_protocol::{
     BuildId, BuildIdentity, BuildKind, CampaignEvent, MetricsSnapshot, TargetManifest,
@@ -120,6 +122,13 @@ fn die(msg: &str) -> ! {
     process::exit(2);
 }
 
+fn is_sidecar(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name.starts_with('.') || name.ends_with(".metadata")
+}
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -169,7 +178,7 @@ fn ingest_crashes(session: &CampaignSession, dir: &Path, producer_build: BuildId
     let mut n = 0usize;
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_file() {
+        if !path.is_file() || is_sidecar(&path) {
             continue;
         }
         let Ok(bytes) = fs::read(&path) else {
@@ -191,6 +200,64 @@ fn ingest_crashes(session: &CampaignSession, dir: &Path, producer_build: BuildId
         }
     }
     n
+}
+
+fn verify_crashes(session: &CampaignSession, dir: &Path, asan_dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let files: Vec<_> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && !is_sidecar(p))
+        .collect();
+    if files.is_empty() {
+        return 0;
+    }
+    let bin = match SanitizerReplayer::compile_cjson(asan_dir) {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("achlys_t1: sanitizer compile skipped: {err:#}");
+            return 0;
+        }
+    };
+    let replayer = SanitizerReplayer::new(bin).with_timeout(Duration::from_secs(5));
+    let mut verified = 0usize;
+    for path in files {
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let id = achlys_protocol::InputId::from_bytes(&bytes);
+        let (class, signature, reproducible) = match replayer.replay(&bytes) {
+            Ok(report) => {
+                let repro = report.class == ReplayClass::ReproducibleCrash;
+                (
+                    format!("{:?}", report.class),
+                    Some(dedup_key(&report)),
+                    repro,
+                )
+            }
+            Err(err) => (format!("InfraFailure:{err}"), None, false),
+        };
+        if session
+            .store()
+            .append_event(&CampaignEvent::CrashVerified {
+                campaign_id: session.store().campaign_id(),
+                input_id: id,
+                class,
+                stack_signature: signature,
+                reproducible,
+                unix_ms: unix_ms(),
+            })
+            .is_ok()
+        {
+            verified += 1;
+        }
+    }
+    verified
 }
 
 fn main() {
@@ -251,6 +318,7 @@ fn main() {
         .ingest_worker_dir(&persist_dir, "havoc-substrate", build.build_id)
         .unwrap_or_else(|e| die(&format!("ingest corpus: {e:#}")));
     let crash_n = ingest_crashes(&session, &crashes_dir, build.build_id);
+    let verified_n = verify_crashes(&session, &crashes_dir, &args.out.join("asan"));
 
     // Worker target dropped; reuse the same SanCov map for independent replay.
     let mut oracle =
@@ -321,11 +389,12 @@ fn main() {
         .unwrap_or_else(|e| die(&format!("finish: {e:#}")));
 
     println!(
-        "T1_RESULT execs={} corpus={} ingested={} crashes={} replayed={} admitted={} rejected={} edges={} digest={}",
+        "T1_RESULT execs={} corpus={} ingested={} crashes={} verified={} replayed={} admitted={} rejected={} edges={} digest={}",
         report.executions,
         report.corpus_count,
         ingested,
         crash_n,
+        verified_n,
         oracle_report.replayed,
         oracle_report.admitted,
         oracle_report.rejected,

@@ -30,3 +30,6 @@ jobs:
 
       - name: H0 functional smoke
         run: H0_FUNCTIONAL=1 ./scripts/experiments/h0_throughput.sh
+
+      - name: T1 manifest campaign smoke
+        run: T1_FUNCTIONAL=1 ./scripts/experiments/t1_smoke.sh
