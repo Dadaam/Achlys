@@ -52,6 +52,7 @@ dependencies = [
  "libafl_bolts",
  "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]
