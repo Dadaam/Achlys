@@ -1,336 +1,94 @@
-# Achlys — Architecture
+# Achlys — Current Architecture
 
-*The death-mist descends on vulnerable code.*
+This note describes the **implemented** prototype only.
 
----
+The target architecture, hypotheses (H0–H5), non-goals, and build order live in [`MASTER_PLAN.md`](MASTER_PLAN.md). **See the Master Plan for target architecture.** If the two documents conflict, the Master Plan wins.
 
-## Reminder: What is Achlys?
+Achlys is not a 4-stage product that escalates havoc → AI → symbolic execution. That framing is not implemented and is not the research direction.
 
-Achlys is a **universal hybrid fuzzer**. It takes **any binary** — C, C++, Go, Rust, closed-source, whatever — and hunts for crashes. It doesn't care about the language, the format, or whether you have the source code.
+Status: **Level 0** (buildable prototype). Public positioning until evidence exists:
 
-The key insight: traditional fuzzers (AFL++, Honggfuzz) are **fast but blind**. LLMs and symbolic engines are **smart but slow**. Achlys doesn't pick a side — it **escalates** through three strategies, each one smarter and slower than the last, and only activates the heavy artillery when the cheap stuff stops working.
+> Achlys is an experimental cooperative fuzzing system built on LibAFL. It investigates whether typed cross-strategy assistance and cost-aware worker allocation can improve coverage and hard-branch discovery under equal resource budgets.
 
-cJSON is the current **test target** for development and benchmarking. It is not the product.
-
----
-## The Four-Stage Escalation Model
-
-This is the core idea behind Achlys. Instead of running one strategy forever, the fuzzer **adapts**:
-
-```
- ┌─────────────────────────────────────────────────────────────┐
- │                    STAGE 0: SEED CORPUS                     │
- │              Valid samples provided by the user             │
- │              (or auto-generated from format hints).         │
- │                                                             │
- │   Instant bootstrap. Lets the fuzzer skip the "rejected     │
- │   by the parser" phase entirely. Optional but powerful.     │
- └──────────────────────────┬──────────────────────────────────┘
-                            │
-              seeds loaded → havoc takes over
-                            │
-                            ▼
- ┌─────────────────────────────────────────────────────────────┐
- │                    STAGE 1: HAVOC                           │
- │          Random bit-flipping, splicing, arithmetic          │
- │            Fast. Dumb. Covers the easy 0-70%.               │
- │                                                             │
- │      Thousands of execs/sec. No thinking, just speed.       │
- └──────────────────────────┬──────────────────────────────────┘
-                            │
-                coverage plateau detected
-               (no new edges for N seconds)
-                            │
-                            ▼
- ┌─────────────────────────────────────────────────────────────┐
- │                    STAGE 2: AI HYBRID                       │
- │              Neural network predicts next bytes             │
- │              from the corpus patterns so far.               │
- │                                                             │
- │   Smarter mutations. Called ONLY when havoc stalls.         │
- │   If coverage resumes → drop back to Stage 1.               │
- └──────────────────────────┬──────────────────────────────────┘
-                            │
-            coverage plateau detected AGAIN
-        (AI mutations also stopped finding new paths)
-                            │
-                            ▼
- ┌─────────────────────────────────────────────────────────────┐
- │              STAGE 3: SYMBOLIC EXECUTION                    │
- │          Constraint solving for hard branches.              │
- │            The `if (x == 0xDEADBEEF)` killer.               │
- │                                                             │
- │    Slow. Precise. Only activated for the last 5-10%.        │
- │     Overkill before ~90% coverage. Worth it after.          │
- └─────────────────────────────────────────────────────────────┘
-```
-
-**The rules are simple:**
-1. **Start cheap.** Havoc mutations are nearly free — Achlys run them at max speed.
-2. **Escalate on plateau.** If coverage hasn't grown in ~10 minutes, we bring in the AI.
-3. **De-escalate when possible.** If the AI finds new paths, feed them back to havoc and drop down. Stage 1 is always faster.
-4. **Symbolic is the last resort.** Only for the nightmare branches that neither random nor AI can crack (magic bytes, checksums, multi-condition guards). We don't use it before ~90-95% coverage — it's overkill.
-
-This means Achlys spends **most of its time** in the fast lane (havoc), occasionally dips into AI-assisted mode, and only fires up the symbolic engine when everything else has been exhausted. The goal: come to grips with **any** binary, and not in 12 hours.
-
----
-
-## Workspace Structure
-
-```
-                        ┌───────────────┐
-                        │  achlys-cli   │ ← entry point
-                        └───────┬───────┘
-                                │
-              ┌─────────────────┼──────────────────┐
-              │                 │                  │
-      ┌───────▼───────┐  ┌──────▼──────┐  ┌────────▼────────┐
-      │  achlys-core  │  │achlys-cortex│  │  achlys-bridge  │
-      │  (engine)     │  │  (AI brain) │  │  (target I/O)   │
-      └───────────────┘  └─────────────┘  └─────────────────┘
-```
-
-| Crate | Path | Role |
-|-------|------|------|
-| **achlys-core** | `src/core/` | The fuzzing engine. `FuzzerBuilder` reduces setup to a few lines. `PlateauDetector` monitors coverage growth. `PlateauAwareFeedback` wraps `MaxMapFeedback` to track new edges. `EscalationManager` decides when to switch stages. `EscalatingStage` delegates to havoc or `HybridStage`. `AiMutator` calls `CortexInterface` for AI predictions. `CortexInterface` trait (dependency inversion — cortex implements it, core defines it). |
-| **achlys-cortex** | `src/cortex/` | The AI brain. `CortexModel` loads ONNX models via [`ort`](https://github.com/pykeio/ort). `HotSwapCortex` enables runtime model replacement. `AutoTrainer` spawns background training and hot-loads the result. `PassthroughCortex` provides a test double. Training pipeline in `training/train.py` (PyTorch LSTM). |
-| **achlys-bridge** | `src/bridge/` | The target interface. `Target` trait abstracts execution + coverage. `InProcessTarget` for FFI (graybox/blackbox). `ForkExecTarget` for spawning binaries (stdin or `@@` file replacement). `AutoCompiler` compiles C/C++ with SanCov instrumentation (`--source` flag). |
-| **achlys-cli** | `src/cli/` | `achlys fuzz <binary> [@@] --corpus --source --model --no-ai --train-delay`. Three modes: autonomous (default, `HotSwapCortex` + `AutoTrainer`), pre-trained (`--model`), or havoc-only (`--no-ai`). `setup_cortex()` helper wires the appropriate mode. |
-
----
-
-## How the Escalation Maps to the Code
-
-### Stage 0 — Seed Corpus (today: ✅ supported)
-
-Before any mutation happens, the user can (and should, when possible) provide **valid samples**
-of the target's input format. A JSON file for a JSON parser. A PNG for an image decoder. A PCAP
-for a network protocol parser.
-
-**Why it matters:**
-Most parsers reject random bytes immediately. Without seeds, the fuzzer can spend hours
-generating garbage that never gets past the first `if` statement. A single valid sample
-lets havoc start from *inside* the parser's acceptance zone instead of banging on the
-front door.
-
-**When you don't have seeds:**
-This is exactly where Stage 2 (AI) earns its keep. Unknown format, no docs, no samples?
-The AI learns the input structure statistically from coverage feedback alone.
-But if you *do* have seeds — use them. It's free speed.
-
-**Where it lives:** `achlys-core` (corpus initialization before the fuzz loop starts).
-
-### Stage 1 — Havoc (today: ✅ working)
-
-This is what the example fuzzers already do. `HavocScheduledMutator` with `havoc_mutations()` from LibAFL. Random bit flips, byte insertions, arithmetic, splicing — the full AFL++ mutation set. Extremely fast because there's zero inference overhead.
-
-**Where it lives:** `achlys-core` (the `StdMutationalStage` + `HavocScheduledMutator` setup).
-
-**Plateau detection:** Core tracks coverage map growth over time. If `MaxMapFeedback` hasn't reported a new edge in N seconds (configurable, ~10 min default), core declares a plateau and escalates.
-
-### Stage 2 — AI Hybrid (`achlys-cortex`)
-
-**What it actually does:** Implicit grammar inference. The model observes which byte
-patterns in the corpus led to new coverage, and predicts mutations that are likely to
-pass the target's input validation — without ever looking at the binary's code.
-
-**When it matters:**
-- Target with **known format** (JSON, PNG, XML...)? You can skip the AI entirely.
-  Just drop valid samples in the seed corpus and havoc will handle the rest.
-  The AI adds nothing here that good seeds don't already solve.
-- Target with **unknown/custom/proprietary format**, no samples, no docs?
-  This is where the AI earns its keep. It learns the input structure statistically,
-  from the coverage feedback alone, and generates mutations that respect enough of
-  the format to get past the parser's front door.
-
-**What it does NOT do:**
-- It doesn't reverse engineer the binary.
-- It doesn't explain the crash.
-- It doesn't write exploits.
-- A human reverser + AFL++ with hand-crafted seeds will match or beat it on
-  well-known targets. The point is: Achlys doesn't need the human.
-
-**The honest tradeoff:**
-Achlys trades *inference compute time* for *human preparation time*.
-If you have a reverser and a week, you don't need the AI.
-If you have a binary and a few hours, you do.
-
-### Stage 3 — Symbolic Execution (future)
-
-The nuclear option. For branches like `if (input[4..8] == 0xDEADBEEF)` that neither random bits nor a neural network will ever guess. Symbolic execution treats the program as a set of mathematical constraints and solves for inputs that reach specific branches.
-
-**When to activate:** Only after ~90-95% coverage. Before that, havoc + AI will find paths faster. Symbolic execution is expensive (minutes per path vs microseconds for havoc) and should only target the specific hard branches that are blocking progress.
-
-**Integration approach (TBD):**
-- Likely via an external symbolic engine (e.g., [haybale](https://github.com/PLSysSec/haybale) for LLVM bitcode, or hooking into [KLEE](https://klee.github.io/) / [Manticore](https://github.com/trailofbits/manticore) / [angr](https://angr.io/))
-- Core identifies "stuck" branches from the coverage map (edges that are neighbors of covered edges but never hit)
-- Sends those constraints to the symbolic engine
-- Receives concrete inputs that satisfy the constraints
-- Feeds them back into the corpus → havoc takes over again
-
-**Where it lives:** `achlys-cortex` (alongside the AI, since both are "smart" strategies).
-
----
-
-## Target-Agnostic Design
-
-Achlys doesn't care what it's fuzzing. The `achlys-bridge` crate abstracts the target behind a trait:
-
-```
-    ┌─────────────┐
-    │ achlys-core │  "here are bytes, run them"
-    └──────┬──────┘
-           │
-           ▼
-    ┌─────────────────────────────────┐
-    │          achlys-bridge          │
-    │                                 │
-    │  ┌───────────┐ ┌────────────┐   │
-    │  │ InProcess │ │  ForkExec  │   │   ← ✅ InProcess (FFI, graybox/blackbox)
-    │  │   (FFI)   │ │(stdin/@@)  │   │   ← ✅ ForkExec (any binary)
-    │  ├───────────┤ ├────────────┤   │
-    │  │   QEMU    │ │  Network   │   │   ← later: closed-source, services
-    │  │(user-mode)│ │ (TCP/UDP)  │   │
-    │  └───────────┘ └────────────┘   │
-    └─────────────────────────────────┘
-```
-
-The engine just sends bytes and reads coverage. It never knows (or cares) whether the target is a C library loaded in-process, a binary spawned via fork+exec, a QEMU-instrumented closed-source blob, or a service listening on a socket.
-
----
-
-## The Example Fuzzers (Test Bench)
-
-Three example fuzzers live in `examples/fuzzers/`. They wire up LibAFL by hand to test the cJSON target. They exist to validate the plumbing before it gets abstracted into `achlys-core`.
-
-| Example | Target | Mode | Feedback |
-|---------|--------|------|----------|
-| `simple_fuzzer` | Inline Rust (simulated) | Whitebox | `MaxMapFeedback` on hand-written `SIGNALS` map |
-| `cjson_blackbox` | cJSON (via FFI) | Blackbox | `ConstFeedback(true)` — blind, keeps everything |
-| `cjson_graybox` | cJSON (via FFI + SanCov) | Graybox | `MaxMapFeedback` on `EDGES_MAP` from SanCov callbacks |
-
-### Build system for test targets
-
-`build.rs` compiles cJSON twice into two static libraries:
-
-```
-build.rs
-  ├── cc::Build → libcjson_blackbox.a  (gcc, no instrumentation)
-  └── cc::Build → libcjson_graybox.a   (clang + -fsanitize-coverage=trace-pc-guard)
-                   └── includes sancov_callbacks.c (coverage bridge)
-```
-
-This dual build is specific to the cJSON test setup. When Achlys targets arbitrary binaries, it won't need to compile the target.
-
-### The SanCov coverage bridge
-
-`sancov_callbacks.c` implements `__sanitizer_cov_trace_pc_guard_init` and `__sanitizer_cov_trace_pc_guard`. When Clang instruments a target, it calls these at every edge. They write into a global `EDGES_MAP` array that the Rust side reads via FFI. This is what makes the graybox example work.
-
-For closed-source binaries where recompilation isn't possible, other instrumentation strategies (QEMU user-mode, DynamoRIO, hardware tracing via Intel PT) will be explored in later phases.
-
----
-
-## Data Flow: One Fuzzing Iteration
-
-```
-1. Scheduler picks an input from the corpus
-2. Mutator transforms it:
-   - Stage 1: havoc mutations (random, fast)
-   - Stage 2: AI mutations (predicted bytes, when stuck)
-   - Stage 3: symbolic solutions (constraint-solved, when really stuck)
-3. Bridge feeds the bytes to the target (however it's connected)
-4. Observer reads coverage (edge map, or nothing in blackbox mode)
-5. Feedback evaluates: "did this input find something new?"
-6. If interesting → corpus    If crash → ./crashes/
-7. Escalation check: is coverage still growing?
-   - Yes → stay in current stage (or de-escalate)
-   - No  → escalate to next stage
-8. Loop
-```
-
----
-
-## Dependencies
-
-All shared versions in root `Cargo.toml` under `[workspace.dependencies]`:
-
-| Dependency | Version | Used for |
-|-----------|---------|----------|
-| libafl | 0.15.4 | Fuzzing framework |
-| libafl_bolts | 0.15.4 | LibAFL utilities |
-| ort | 2.0.0-rc.11 | ONNX Runtime — powers the AI brain |
-| clap | 4.5 | CLI argument parsing |
-| cc | 1.2 | Compiling test targets at build time |
-| serde | 1.0 | Serialization |
-
----
-
-## Roadmap
-
-### Phase 1 — MVP ✅ (done)
-- Workspace with four crates
-- Three example fuzzers (simple, cjson blackbox, cjson graybox)
-- Dual build system + SanCov coverage bridge
-- Proof that LibAFL can fuzz a real C library and find paths
-
-### Phase 2 — Engine Abstraction ✅ (done)
-- `FuzzerBuilder` reduces LibAFL boilerplate to fluent API
-- `Target` trait in `achlys-bridge` with `InProcessTarget` + `ForkExecTarget` backends
-- `ForkExecTarget` supports stdin and `@@` file placeholder (AFL++ style)
-- `AutoCompiler` compiles C/C++ with SanCov via `--source` flag
-- `PlateauDetector` + `PlateauAwareFeedback` wrapper for coverage monitoring
-- `EscalatingStage` + `EscalationManager` state machine (Havoc ↔ AI Hybrid)
-- CLI: `achlys fuzz <binary> [@@] --corpus --source --model --plateau-timeout`
-- Seed corpus loading from directory
-
-### Phase 3 — AI Hybrid (Cortex) ✅ (done)
-- `CortexInterface` trait in core (dependency inversion)
-- `CortexModel` loads ONNX models via `ort`, validates shapes on load
-- `AiMutator` calls cortex in batches, caches predictions in `VecDeque`
-- `HybridStage` alternates havoc (90%) and AI (10%) mutations
-- `PassthroughCortex` test double for integration testing without trained model
-- Builder wires full pipeline when `--model` provided: `PlateauAwareFeedback` → `EscalatingStage` → `HybridStage`
-- LSTM training script: `src/cortex/training/train.py` (PyTorch → ONNX export)
-- Test model generator: `src/cortex/training/generate_test_model.py`
-
-### Phase 4 — Symbolic Execution
-- Integrate symbolic engine for hard branches
-- Core identifies stuck edges from coverage map
-- Symbolic solver produces concrete inputs → fed back to corpus
-- Only activates at high coverage (~90%+)
-- Benchmark: three-stage vs two-stage vs pure havoc
-
-### Phase 5 — Universal Target Support
-- QEMU user-mode backend (fuzz any binary without source)
-- Network target backend (TCP/UDP services)
-- Distributed fuzzing (multi-node campaigns)
-- Target format auto-detection
-- Grammar inference from corpus patterns
-
----
-
-## Directory Layout
+## Layout
 
 ```
 Achlys/
-├── Cargo.toml                    # workspace root
-├── build.rs                      # compiles test targets
-├── examples/
-│   ├── fuzzers/
-│   │   ├── simple_fuzzer.rs      # test: inline simulated target
-│   │   ├── cjson_blackbox_fuzzer.rs  # test: blind fuzzing cJSON
-│   │   └── cjson_graybox_fuzzer.rs   # test: coverage-guided cJSON
-│   └── targets/
-│       └── cJSON/
-│           ├── cJSON.c           # test target (vendored)
-│           ├── cJSON.h
-│           └── sancov_callbacks.c
+├── Cargo.toml                 # workspace + root package (examples / cJSON build.rs)
+├── build.rs                   # compiles vendored cJSON; fails on a clean clone
 ├── src/
-│   ├── lib.rs
-│   ├── core/                     # achlys-core   (engine + escalation)
-│   ├── cortex/                   # achlys-cortex (AI + future symbolic)
-│   ├── bridge/                   # achlys-bridge (target abstraction)
-│   └── cli/                      # achlys-cli    (command line)
-└── docs/
-    └── ARCHITECTURE.md           # you are here
+│   ├── cli/                   # achlys-cli  — `achlys fuzz`
+│   ├── core/                  # achlys-core — FuzzerBuilder + LibAFL wiring
+│   ├── bridge/                # achlys-bridge — Target, ForkExec, InProcess, AutoCompiler
+│   └── cortex/                # achlys-cortex — experimental ONNX / trainer (not H0)
+├── examples/fuzzers/          # hand-wired LibAFL examples
+└── examples/targets/cJSON     # broken gitlink; not present after a clean clone
 ```
+
+| Crate | What it actually does today |
+|---|---|
+| **achlys-cli** | Parses flags, optionally compiles `--source`, always constructs `ForkExecTarget`, runs `FuzzerBuilder`, optional ratatui TUI. |
+| **achlys-core** | `FuzzerBuilder` wraps LibAFL havoc. `run()` dispatches to `run_blackbox` or `run_graybox`. CLI always hits blackbox. |
+| **achlys-bridge** | `ForkExecTarget` (used): spawn binary, stdin or `@@`, crash/timeout from the child. `InProcessTarget` (unused by CLI). `AutoCompiler` (used only by `--source`). |
+| **achlys-cortex** | ONNX load, `AutoTrainer`, `HotSwapCortex`. Experimental. Not on the H0 path. |
+
+There is no QEMU backend, no network target, no symbolic engine, no orchestrator, and no multi-worker control plane.
+
+## CLI execution path
+
+```
+achlys fuzz <binary> [args]
+        │
+        ├─ --source …  → AutoCompiler::compile_binary (SanCov in the child)
+        │                    └── still ForkExecTarget(instrumented)
+        │
+        └─ otherwise   → ForkExecTarget(user binary)
+                              │
+                              ▼
+                     FuzzerBuilder::run
+                              │
+                     ForkExecTarget::coverage_map() is None
+                              │
+                              ▼
+                     FuzzerBuilder::run_blackbox
+                              │
+              InProcessExecutor around a harness that
+              calls target.execute() → fork+exec the child
+                              │
+              ConstFeedback(true) + CrashFeedback
+              HavocScheduledMutator / havoc_mutations()
+```
+
+`achlys fuzz` never constructs `InProcessTarget`. There is no coverage-guided CLI campaign.
+
+`--source` is **not graybox**. SanCov writes a map inside the child process. The parent fuzzer does not transport or consume that map (Master Plan §24.1). The flag is unsupported and scheduled to be disabled.
+
+## Corpus and results
+
+- Queue: `InMemoryCorpus`. Seeds are read from `--corpus` once. New queue entries are not written back to that directory.
+- Crashes: `OnDiskCorpus` under `--output` (default `./crashes`).
+- Blackbox admission: `ConstFeedback(true)` — every execution is “interesting.” Unbounded. Not a novelty policy.
+- `ForkExecTarget` maps several spawn/I/O errors to `ExitKind::Ok`. Those are infrastructure failures, not successful executions.
+
+## Unused or disconnected pieces
+
+These types exist. They are not a working product surface:
+
+- **`InProcessTarget` + `FuzzerBuilder::run_graybox`.** Used only if a `Target` reports a coverage map. The CLI never does. The working graybox demonstration is `examples/fuzzers/cjson_graybox_fuzzer.rs` (requires cJSON sources).
+- **`EscalatingStage`, `PlateauDetector`, `AiMutator`, `HybridStage`.** Wired when a `CortexInterface` is supplied. In CLI blackbox mode the plateau timer fires on wall time alone (no coverage events).
+- **`AutoTrainer`.** Watches `--corpus` or `./runtime/corpus`. The fuzzer does not write that directory. Autonomous training is disconnected and not functional.
+- **TUI.** Displays LibAFL monitor stats. It does not implement a campaign control plane.
+
+## Examples
+
+| Example | What it is |
+|---|---|
+| `simple_fuzzer` | In-process toy with a hand-written `SIGNALS` map. |
+| `cjson_blackbox_fuzzer` | In-process cJSON via FFI; `ConstFeedback(true)`. |
+| `cjson_graybox_fuzzer` | In-process cJSON + SanCov `EDGES_MAP` + `MaxMapFeedback`. |
+
+Root `build.rs` compiles `cJSON.c` twice (plain and SanCov). `examples/targets/cJSON` is a gitlink with no `.gitmodules` entry, so a clean clone does not build these examples.
+
+## Target architecture
+
+Do not extend this note into the cooperative / cost-aware design. That design is specified only in [`MASTER_PLAN.md`](MASTER_PLAN.md).

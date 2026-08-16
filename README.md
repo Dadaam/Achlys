@@ -1,158 +1,86 @@
 # Achlys
 
-<div>
+> Achlys is an experimental cooperative fuzzing system built on LibAFL. It investigates whether typed cross-strategy assistance and cost-aware worker allocation can improve coverage and hard-branch discovery under equal resource budgets.
 
-**A 4-stage adaptive fuzzer that hunts Zero-Days in any binary. Written in Rust, powered by LibAFL and AI.**
+This repository is a **Level 0** prototype: it builds some crates and can run a bounded havoc campaign. It is not a production fuzzer, not an AI fuzzer, and not a zero-day hunter. There is no evidence yet that Achlys beats a strong LibAFL or AFL++ baseline.
 
-*"The death-mist of Achlys settled upon his sight."*
+The design source of truth is [`docs/MASTER_PLAN.md`](docs/MASTER_PLAN.md). If this README or [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) conflicts with the Master Plan, the Master Plan wins.
 
-</div>
+## What works today
 
----
+- **`achlys fuzz` is blackbox fork+exec.** Every CLI campaign uses `ForkExecTarget`. Each input is delivered over stdin or via an AFL-style `@@` file argument, then the child is spawned. There is no in-process CLI path and no coverage feedback on this path.
+- **Mutations are LibAFL havoc.** `HavocScheduledMutator` / `havoc_mutations()` is the working mutation engine.
+- **Seeds and crashes.** `--corpus` loads seed files into an in-memory queue. Crash-triggering inputs are written to `--output` (default `./crashes`). The working corpus is **not** written back to disk.
+- **TUI.** A ratatui monitor is the default display. Use `--no-tui` for plain text.
+- **In-process graybox is an example only.** `examples/fuzzers/cjson_graybox_fuzzer.rs` links cJSON with SanCov and uses `MaxMapFeedback`. `InProcessTarget` and `FuzzerBuilder::run_graybox` exist in the crates but are unused by `achlys fuzz`. The cJSON examples require the vendored cJSON tree (see limitations).
 
-## The Vision
+## What does not work
 
-Achlys was born from a simple observation: **traditional fuzzers** (AFL++, Honggfuzz) are *fast but blind*, while **LLMs** and **symbolic engines** (KLEE, angr) are *precise but slow*. Everyone picks a side. Achlys doesn't — it **escalates**.
+Treat the following as **unsupported**, even if a flag or type still exists:
 
-In a **Red Teaming** or **Blackbox Audit** scenario, brute force is no longer enough. Complex targets (PDF, XML, custom protocols) enforce strict structures that reject **99% of random mutations**.
+| Claim or flag | Actual behavior |
+|---|---|
+| `--source` “graybox” | Compiles C/C++ with SanCov, then **still fork+execs** the binary. The fuzzer never reads the child coverage map. This is not graybox. Scheduled to be disabled. |
+| Autonomous / default AI training | `AutoTrainer` watches `--corpus` or `./runtime/corpus`. The fuzzer never writes that directory. Training is **disconnected** and **not functional**. |
+| `--model`, ONNX, `achlys-cortex` | Experimental code. Not on the H0 (substrate correctness) path. Do not treat this as a working AI-guided fuzzer. |
+| 4-stage escalation, symbolic execution, QEMU, network, distributed | Not implemented. Not the current product. |
+| Clean-clone examples | `examples/targets/cJSON` is a broken gitlink. A clean clone does **not** currently build the root package or the cJSON examples. |
 
-Achlys bridges this gap with a **4-stage escalation model**: seed corpus for instant bootstrap, havoc mutations for raw speed, AI-guided mutations when brute-force hits a wall, and symbolic execution for the nightmare branches nothing else can crack. Each stage is smarter and slower than the last — and only activates when the cheaper one stops making progress.
+Use `--no-ai` so the CLI does not start the disconnected trainer.
 
----
+## Build
 
-## Why Achlys?
-| Feature | Classic Fuzzers (AFL++) | Symbolic (KLEE/angr) | Achlys |
-|---------|------------------------|----------------------|--------|
-| **Speed** | 🟢 at least 20k+ exec/s | 🔴 Minutes per path | 🟢 Fast by default, slow only when needed |
-| **Hard branches** | 🔴 Blind guessing | 🟢 Constraint solving | 🟢 AI first, symbolic as last resort |
-| **Setup required** | 🟡 Needs seed corpus, otherwise very dumb | 🔴 Needs source / IR | 🟢 Point at a binary and go |
-| **Adaptiveness** | 🔴 Same strategy forever | 🔴 Same strategy forever | 🟢 Escalates on plateau, de-escalates when unstuck |
+Requirements:
 
----
+- **Rust 1.97+** (edition 2024)
+- **clang** only if you compile the cJSON examples (currently broken on a clean clone) or the unsupported `--source` path
+- Python / PyTorch are **not** required. The fuzzer does not train a model.
 
-### The 4-Stage Engine
-
-```
-  Seeds ──▶ Havoc ──▶ AI Hybrid ──▶ Symbolic
-  (free)    (fast)    (smart)       (precise)
-               ◄──────────┘
-                de-escalate when 
-                coverage resumes
-```
-
-1. **Stage 0 — Seeds**: Drop valid samples in the corpus. Instant bootstrap. Optional but powerful.
-2. **Stage 1 — Havoc** (`achlys-core`): Random mutations at max speed. Covers 60-70% of edges. Pure LibAFL.
-3. **Stage 2 — AI** (`achlys-cortex`): Neural network (LSTM/GRU via ONNX) predicts byte patterns that pass the parser. Only called when havoc plateaus. **This is what lets Achlys fuzz unknown formats without hand-crafted seeds.**
-4. **Stage 3 — Symbolic** (`achlys-cortex`): Constraint solving for magic bytes, checksums, multi-condition guards. The `if (x == 0xDEADBEEF)` killer. Only when AI's stuck at ~90%+ coverage.
-
-### The Workspace
-
-| Crate | Role |
-|-------|------|
-| **achlys-core** | Fuzzing engine + escalation logic. Monitors coverage, decides when to escalate/de-escalate. |
-| **achlys-cortex** | AI brain (ONNX inference) + future symbolic integration. The "think" side. |
-| **achlys-bridge** | Target abstraction. In-process FFI, fork+exec, QEMU, network — the engine doesn't care how. |
-| **achlys-cli** | `achlys fuzz <binary>` and it figures out the rest. |
-
----
-
-## The "Search & Destroy" Workflow
-
-Achlys doesn't just look for bugs, **it tries to force them**.
-
-### Initialization
-
-Point Achlys at a binary. Optionally provide seed files and/or an ONNX model.
-No seeds? No problem — the AI will figure out the format. It just takes longer.
-
-### The Escalation Loop
-
-1. **Seeds loaded** → Corpus bootstrapped with valid inputs (if provided).
-2. **Havoc ("Berserk Mode")** → Random mutations at thousands of execs/sec. *Maximum speed.*
-3. **Plateau?** → No new coverage for N minutes → **AI kicks in.** Predicts structural mutations from corpus patterns. Hybrid mode: AI + havoc together.
-4. **Coverage resumes?** → AI found new paths → **drop back to pure havoc.** Always prefer the fast lane.
-5. **Still stuck at ~90%+?** → **Symbolic execution.** Solves the hard constraints (magic bytes, checksums) that nothing else can crack.
-6. **Crash (SIGSEGV)?** → Input saved to `crashes/`. Ready for GDB and exploit development.
-
-**Result**: A crashing input file, found without hand-crafting seeds or reversing the binary first.
-
----
-
-## Installation & Build
-
-### Prerequisites
-
-- Rust (Nightly toolchain recommended)
-- Clang / LLVM (for target instrumentation)
-- Python 3.10+ with PyTorch (for model training, optional)
 ```bash
-# 1. Clone the repo
-git clone https://github.com/dadaam/achlys.git
+git clone https://github.com/Dadaam/achlys.git
 cd achlys
 
-# 2. Build the Fuzzer and Harness
-cargo build --release
-
-# 3. (Optional) Train an AI model on a corpus
-python3 src/cortex/training/train.py \
-    --corpus runtime/corpus/json/ \
-    --output models/brain.onnx \
-    --max-seq-len 256 --epochs 50
-
-# Or generate a test model without training data
-python3 src/cortex/training/generate_test_model.py --output models/test_brain.onnx
+# CLI only — avoids the root build.rs that compiles missing cJSON sources
+cargo build -p achlys-cli --release
 ```
 
----
+A bare `cargo build` or `cargo build --release` at the workspace root will fail on a clean clone because `build.rs` expects `examples/targets/cJSON/cJSON.c`.
+
+If the cJSON tree is present (it is not, on a clean clone):
+
+```bash
+cargo run --example cjson_graybox
+```
 
 ## Usage
+
 ```bash
-# Default: autonomous mode — trains its own AI model during fuzzing
-achlys fuzz ./vulnerable_parser @@ --corpus seeds/
+# Recommended: havoc-only blackbox fork+exec
+./target/release/achlys fuzz ./parser @@ --corpus seeds/ --no-ai
 
-# Pre-trained model: skip auto-training, use an existing ONNX model
-achlys fuzz ./parser @@ --model models/brain.onnx --corpus seeds/
+# Same campaign without the TUI
+./target/release/achlys fuzz ./parser @@ --corpus seeds/ --no-ai --no-tui
 
-# Havoc only: disable AI entirely
-achlys fuzz ./parser @@ --no-ai --corpus seeds/
-
-# Graybox: compile C/C++ sources with SanCov instrumentation
-achlys fuzz ./parser --source src/parser.c --corpus seeds/
+# stdin delivery (no @@)
+./target/release/achlys fuzz ./parser --no-ai
 ```
 
-### Autonomous Training
+From a source checkout:
 
-By default (no `--model` flag), Achlys **trains its own AI model** during fuzzing:
-1. Starts in pure havoc mode (no model needed)
-2. After 5 minutes (configurable via `--train-delay`), spawns background training
-3. LSTM model trained on the corpus collected so far → exported as ONNX
-4. Model hot-loaded → AI-guided mutations activated automatically
-5. Periodically re-trains on the enriched corpus
+```bash
+cargo run -p achlys-cli --release -- fuzz ./parser @@ --corpus seeds/ --no-ai
+```
 
-No Python configuration required — just `python3` with `torch` installed.
+`--source`, `--model`, and `--train-delay` still parse. They do not provide graybox coverage or working autonomous training.
 
----
+## Limitations
 
-## Roadmap
+- Success ladder **Level 0** only. No H0 throughput evidence. No coverage or “hard branch” claims.
+- CLI campaigns have no coverage map. Blackbox admission currently uses `ConstFeedback(true)` (unbounded keep-everything).
+- Spawn, write, and observer failures in `ForkExecTarget` can be reported as successful executions.
+- No forkserver, persistent mode, shared-memory coverage, sanitizer replay, or multi-worker campaign.
+- ML crates (`achlys-cortex`, `AiMutator`, `HybridStage`, `AutoTrainer`) are experimental leftovers, not the research baseline.
 
-- [x] **Phase 1 (MVP)**: Functional fuzzer on cJSON with random mutations (Pure LibAFL)
-- [x] **Phase 2 (Engine)**: `FuzzerBuilder`, `Target` trait, `InProcess`/`ForkExec` backends, plateau detection, `EscalatingStage`, CLI with `--source`/`--model`/`@@`
-- [x] **Phase 3 (AI Hybrid)**: ONNX integration, `AiMutator`, `HybridStage`, autonomous training (`AutoTrainer` + `HotSwapCortex`), LSTM training pipeline
-- [ ] **Phase 4 (Symbolic)**: Constraint solving for hard branches at 90%+ coverage
-- [ ] **Phase 5 (Universal)**: QEMU backend, network targets, distributed fuzzing
+## Design
 
----
-
-## Disclaimer
-
-**Achlys is an offensive security research tool.**
-
-It is designed for code auditing, CTFs (Capture The Flag), and vulnerability research within legal boundaries. The author is not responsible for any misuse of this tool on unauthorized systems.
-
----
-
-<div align="center">
-
-Made with 🦀 and ☕ by [Dadaam](https://github.com/Dadaam)
-
-</div>
+[`docs/MASTER_PLAN.md`](docs/MASTER_PLAN.md) is the architecture and research plan. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) describes only what this tree implements today.
