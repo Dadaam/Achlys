@@ -68,5 +68,8 @@ First development pair used `SimpleMonitor` (≈512 MB / 3.6 M heartbeat lin
 
 Tranche 1 baseline infrastructure is accepted
 ([`2026-08-16-t1-baseline-accepted.md`](2026-08-16-t1-baseline-accepted.md)).
-Tranche 2+ (LLMP, adaptive allocation, ML) stay forbidden until a Linux
-multi-trial ladder is defined and executed.
+Tranche 2 implementation is open
+([`2026-08-16-t2-homogeneous.md`](2026-08-16-t2-homogeneous.md)).
+T2 is not accepted. T3+, adaptive allocation, and ML stay forbidden.
+The Linux multi-trial ladder is defined in the T2 decision and must
+run before any T2 exit-gate claim.

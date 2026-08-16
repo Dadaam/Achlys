@@ -46,4 +46,5 @@ Tranche 2 stays closed until a Linux multi-trial ladder is **defined and execute
 
 ## Later superseding decision
 
-None.
+[`2026-08-16-t2-homogeneous.md`](2026-08-16-t2-homogeneous.md) opens T2
+**implementation**. T2 is not accepted. AFL++ smoke figures stay unpublished.

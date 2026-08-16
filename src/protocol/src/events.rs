@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::identity::BuildIdentity;
-use crate::ids::{BuildId, CampaignId, CoverageDigest, InputId};
+use crate::ids::{BuildId, CampaignId, CoverageDigest, InputId, StrategyId, WorkerId};
 
 /// Provenance stored next to a content-addressed input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,6 +17,12 @@ pub struct InputMetadata {
     #[serde(default)]
     pub canonical_delta: Option<u32>,
     pub stored_unix_ms: u64,
+    #[serde(default)]
+    pub worker_id: Option<WorkerId>,
+    #[serde(default)]
+    pub producer_seq: Option<u64>,
+    #[serde(default)]
+    pub strategy: Option<StrategyId>,
 }
 
 /// Crash-pipeline counters. Raw file count is never a verified-bug metric.
@@ -108,6 +114,59 @@ pub enum CampaignEvent {
         snapshot: MetricsSnapshot,
         unix_ms: u64,
     },
+    WorkerRegistered {
+        schema_version: u32,
+        campaign_id: CampaignId,
+        worker_id: WorkerId,
+        sender_seq: u64,
+        timestamp_monotonic_ns: u64,
+        dedup_key: String,
+        strategy: StrategyId,
+        producer_build: BuildId,
+        protocol_version: u32,
+        slot: u32,
+        unix_ms: u64,
+    },
+    WorkerLeft {
+        campaign_id: CampaignId,
+        worker_id: WorkerId,
+        sender_seq: u64,
+        timestamp_monotonic_ns: u64,
+        dedup_key: String,
+        reason: String,
+        unix_ms: u64,
+    },
+    WorkerRestarted {
+        campaign_id: CampaignId,
+        worker_id: WorkerId,
+        sender_seq: u64,
+        timestamp_monotonic_ns: u64,
+        dedup_key: String,
+        previous_seq: u64,
+        unix_ms: u64,
+    },
+    CandidateDiscovered {
+        campaign_id: CampaignId,
+        worker_id: WorkerId,
+        sender_seq: u64,
+        timestamp_monotonic_ns: u64,
+        dedup_key: String,
+        input_id: InputId,
+        parent_ids: Vec<InputId>,
+        producing_strategy: StrategyId,
+        producer_build: BuildId,
+        local_coverage: Option<CoverageDigest>,
+        local_delta_count: u32,
+        execution_ns: u64,
+        generation_ns: u64,
+        unix_ms: u64,
+    },
+    CorpusDelta {
+        campaign_id: CampaignId,
+        sequence: u64,
+        admitted: Vec<InputId>,
+        unix_ms: u64,
+    },
 }
 
 /// Immutable campaign header written once at `begin`.
@@ -140,6 +199,8 @@ pub struct CampaignRecord {
 
 impl CampaignEvent {
     pub const SCHEMA_VERSION: u32 = 1;
+    /// T2 worker protocol. Independent of campaign artifact schema_version.
+    pub const PROTOCOL_VERSION: u32 = 1;
 
     /// One JSON object, no trailing newline.
     pub fn to_jsonl(&self) -> Result<String, serde_json::Error> {
@@ -148,6 +209,18 @@ impl CampaignEvent {
 
     pub fn from_jsonl(line: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(line)
+    }
+
+    /// Envelope dedup key for a worker-originated control event.
+    #[must_use]
+    pub fn worker_dedup_key(worker_id: WorkerId, sender_seq: u64) -> String {
+        format!("{}:{sender_seq}", worker_id.to_hex())
+    }
+
+    /// Envelope dedup key for a content-addressed candidate.
+    #[must_use]
+    pub fn input_dedup_key(input_id: InputId) -> String {
+        format!("input:{}", input_id.to_hex())
     }
 }
 
@@ -195,5 +268,55 @@ mod tests {
         };
         let parsed = CampaignEvent::from_jsonl(&ev.to_jsonl().unwrap()).unwrap();
         assert!(matches!(parsed, CampaignEvent::CampaignStarted { .. }));
+    }
+
+    #[test]
+    fn t1_started_json_still_parses_without_worker_fields() {
+        let line = ev_started_without_t2_fields();
+        let parsed = CampaignEvent::from_jsonl(&line).unwrap();
+        assert!(matches!(parsed, CampaignEvent::CampaignStarted { .. }));
+    }
+
+    #[test]
+    fn candidate_discovered_jsonl_roundtrip() {
+        let ev = CampaignEvent::CandidateDiscovered {
+            campaign_id: CampaignId::from_label("t2"),
+            worker_id: WorkerId::from_slot(0),
+            sender_seq: 3,
+            timestamp_monotonic_ns: 9,
+            dedup_key: CampaignEvent::input_dedup_key(InputId::from_bytes(b"x")),
+            input_id: InputId::from_bytes(b"x"),
+            parent_ids: vec![],
+            producing_strategy: StrategyId::Havoc,
+            producer_build: BuildId([1; 32]),
+            local_coverage: None,
+            local_delta_count: 1,
+            execution_ns: 2,
+            generation_ns: 3,
+            unix_ms: 4,
+        };
+        let parsed = CampaignEvent::from_jsonl(&ev.to_jsonl().unwrap()).unwrap();
+        assert_eq!(parsed, ev);
+    }
+
+    fn ev_started_without_t2_fields() -> String {
+        let id = BuildIdentity::compute(BuildIdentityParts {
+            target_id: TargetId("t".into()),
+            kind: BuildKind::Fast,
+            compiler: "clang".into(),
+            flags: vec!["-O3".into()],
+            source_hashes: BTreeMap::new(),
+            artifact_hash: None,
+        });
+        let ev = CampaignEvent::CampaignStarted {
+            schema_version: CampaignEvent::SCHEMA_VERSION,
+            campaign_id: CampaignId::from_label("s"),
+            target_id: "t".into(),
+            fast_build: id,
+            canonical_build: None,
+            sanitizer_build: None,
+            unix_ms: 0,
+        };
+        ev.to_jsonl().unwrap()
     }
 }

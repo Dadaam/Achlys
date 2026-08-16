@@ -210,6 +210,27 @@ impl CampaignStore {
         self.campaign_id
     }
 
+    /// Parse every non-empty JSONL line. Malformed lines are errors.
+    pub fn read_events(&self) -> Result<Vec<CampaignEvent>> {
+        let path = self.root.join("events").join("events.jsonl");
+        if !path.is_file() {
+            return Ok(Vec::new());
+        }
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("read events {}", path.display()))?;
+        let mut out = Vec::new();
+        for (idx, line) in text.lines().enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            let ev = CampaignEvent::from_jsonl(line).with_context(|| {
+                format!("parse events.jsonl line {} at {}", idx + 1, path.display())
+            })?;
+            out.push(ev);
+        }
+        Ok(out)
+    }
+
     pub fn write_campaign_record(&self, record: &CampaignRecord) -> Result<()> {
         if record.campaign_id != self.campaign_id {
             bail!(
@@ -408,6 +429,9 @@ mod tests {
             local_coverage: None,
             canonical_delta: None,
             stored_unix_ms: 1,
+            worker_id: None,
+            producer_seq: None,
+            strategy: None,
         }
     }
 

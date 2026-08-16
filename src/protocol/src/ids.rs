@@ -64,6 +64,84 @@ impl fmt::Display for CampaignId {
     }
 }
 
+/// Worker identifier. Stable across a restart of the same slot when the
+/// launcher reuses `WorkerId::from_slot`. A new id is a late join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WorkerId(pub [u8; 16]);
+
+impl Serialize for WorkerId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ser_hex(&self.0, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkerId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self(de_hex(deserializer)?))
+    }
+}
+
+impl WorkerId {
+    /// Deterministic id from a label (tests and reproducible slots).
+    #[must_use]
+    pub fn from_label(label: &str) -> Self {
+        Self(sha256_16(label))
+    }
+
+    /// Slot `i` in a homogeneous campaign (`worker-0`, `worker-1`, …).
+    #[must_use]
+    pub fn from_slot(slot: u32) -> Self {
+        Self::from_label(&format!("worker-{slot}"))
+    }
+
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+}
+
+impl fmt::Display for WorkerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
+
+impl FromStr for WorkerId {
+    type Err = hex::FromHexError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bytes = hex::decode(s)?;
+        if bytes.len() != 16 {
+            return Err(hex::FromHexError::InvalidStringLength);
+        }
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&bytes);
+        Ok(Self(id))
+    }
+}
+
+/// Homogeneous T2 strategy. Other capabilities wait for later tranches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyId {
+    Havoc,
+}
+
+impl StrategyId {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Havoc => "havoc",
+        }
+    }
+}
+
+impl fmt::Display for StrategyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Logical target name, shared by every build variant of that target.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TargetId(pub String);
@@ -82,7 +160,7 @@ impl fmt::Display for TargetId {
 }
 
 /// Content-addressed input identity. Metadata must not alter this.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct InputId(pub [u8; 32]);
 
 impl Serialize for InputId {
@@ -250,6 +328,25 @@ mod tests {
         assert_ne!(
             CampaignId::from_label("t1-demo"),
             CampaignId::from_label("other")
+        );
+    }
+
+    #[test]
+    fn worker_id_slot_is_stable_and_distinct() {
+        assert_eq!(WorkerId::from_slot(0), WorkerId::from_slot(0));
+        assert_ne!(WorkerId::from_slot(0), WorkerId::from_slot(1));
+        let id = WorkerId::from_slot(2);
+        let parsed: WorkerId = id.to_hex().parse().unwrap();
+        assert_eq!(id, parsed);
+    }
+
+    #[test]
+    fn strategy_id_json_is_havoc() {
+        let json = serde_json::to_string(&StrategyId::Havoc).unwrap();
+        assert_eq!(json, "\"havoc\"");
+        assert_eq!(
+            serde_json::from_str::<StrategyId>(&json).unwrap(),
+            StrategyId::Havoc
         );
     }
 

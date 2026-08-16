@@ -69,6 +69,9 @@ impl CampaignSession {
                 local_coverage: None,
                 canonical_delta: None,
                 stored_unix_ms: now_unix_ms(),
+                worker_id: None,
+                producer_seq: None,
+                strategy: None,
             };
             let id = self.store.put_input(&bytes, meta)?;
             unique.insert(id);
