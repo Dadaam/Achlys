@@ -9,5 +9,8 @@ authors.workspace = true
 libafl.workspace = true
 libafl_bolts.workspace = true
 achlys-bridge = { path = "../bridge" }
+achlys-protocol = { path = "../protocol" }
 anyhow.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true

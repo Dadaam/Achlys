@@ -1,0 +1,13 @@
+[package]
+name = "achlys-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Pure identifier, manifest, and campaign-event types. No LibAFL."
+
+[dependencies]
+hex.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true

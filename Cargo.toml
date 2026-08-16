@@ -8,11 +8,13 @@ publish = false
 libafl = { workspace = true }
 libafl_bolts = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]
 achlys-core = { path = "src/core" }
 achlys-bridge = { path = "src/bridge" }
+achlys-protocol = { path = "src/protocol" }
 
 [build-dependencies]
 cc = { workspace = true }
@@ -33,8 +35,17 @@ path = "examples/fuzzers/libafl_baseline.rs"
 name = "achlys_h0"
 path = "examples/fuzzers/achlys_h0.rs"
 
+[[example]]
+name = "achlys_oracle"
+path = "examples/fuzzers/achlys_oracle.rs"
+
+[[example]]
+name = "achlys_t1"
+path = "examples/fuzzers/achlys_t1.rs"
+
 [workspace]
 members = [
+    "src/protocol",
     "src/core",
     "src/cortex",
     "src/bridge",
@@ -62,6 +73,10 @@ clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+toml = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+libc = "0.2"
 mimalloc = { version = "0.1", features = [] }
 
 # Build 

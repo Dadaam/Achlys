@@ -1,0 +1,256 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::ids::{BuildId, TargetId};
+use crate::manifest::{BuildKind, TargetManifest};
+
+/// Inputs that uniquely identify a compiled target variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildIdentityParts {
+    pub target_id: TargetId,
+    pub kind: BuildKind,
+    pub compiler: String,
+    pub flags: Vec<String>,
+    pub source_hashes: BTreeMap<String, [u8; 32]>,
+    pub artifact_hash: Option<[u8; 32]>,
+}
+
+/// Recorded identity of one build variant. `build_id` is the hash of the parts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildIdentity {
+    pub target_id: TargetId,
+    pub kind: BuildKind,
+    pub compiler: String,
+    pub flags: Vec<String>,
+    pub source_hashes: BTreeMap<String, String>,
+    pub artifact_hash: Option<String>,
+    pub build_id: BuildId,
+}
+
+impl BuildIdentity {
+    #[must_use]
+    pub fn compute(parts: BuildIdentityParts) -> Self {
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        chunks.push(parts.target_id.0.as_bytes().to_vec());
+        chunks.push(parts.kind.as_str().as_bytes().to_vec());
+        chunks.push(parts.compiler.as_bytes().to_vec());
+        for flag in &parts.flags {
+            chunks.push(flag.as_bytes().to_vec());
+        }
+        for (path, hash) in &parts.source_hashes {
+            chunks.push(path.as_bytes().to_vec());
+            chunks.push(hash.to_vec());
+        }
+        if let Some(art) = parts.artifact_hash {
+            chunks.push(art.to_vec());
+        }
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let build_id = BuildId::from_parts(&refs);
+
+        Self {
+            target_id: parts.target_id,
+            kind: parts.kind,
+            compiler: parts.compiler,
+            flags: parts.flags,
+            source_hashes: parts
+                .source_hashes
+                .into_iter()
+                .map(|(k, v)| (k, hex::encode(v)))
+                .collect(),
+            artifact_hash: parts.artifact_hash.map(hex::encode),
+            build_id,
+        }
+    }
+
+    /// Build identity for `kind` using on-disk source hashes and `clang -v`.
+    pub fn from_manifest(
+        manifest: &TargetManifest,
+        kind: BuildKind,
+        workspace_root: &Path,
+    ) -> Result<Self, String> {
+        let spec = manifest
+            .spec(kind)
+            .ok_or_else(|| format!("manifest has no {kind:?} build"))?;
+
+        let mut source_hashes = BTreeMap::new();
+        for source in &manifest.sources {
+            let path = if source.path.is_absolute() {
+                source.path.clone()
+            } else {
+                workspace_root.join(&source.path)
+            };
+            let bytes = fs::read(&path)
+                .map_err(|err| format!("failed to hash source {}: {err}", path.display()))?;
+            let hash: [u8; 32] = Sha256::digest(&bytes).into();
+            source_hashes.insert(source.path.display().to_string(), hash);
+        }
+
+        let artifact_hash = match &spec.artifact {
+            Some(art) => {
+                let path = if art.is_absolute() {
+                    art.clone()
+                } else {
+                    workspace_root.join(art)
+                };
+                if path.is_file() {
+                    let bytes = fs::read(&path).map_err(|err| {
+                        format!("failed to hash artifact {}: {err}", path.display())
+                    })?;
+                    Some(Sha256::digest(&bytes).into())
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+
+        let compiler = detect_clang_version().unwrap_or_else(|| "clang".to_string());
+
+        Ok(Self::compute(BuildIdentityParts {
+            target_id: manifest.target_id(),
+            kind,
+            compiler,
+            flags: spec.flags.clone(),
+            source_hashes,
+            artifact_hash,
+        }))
+    }
+
+    /// Like [`from_manifest`], plus extra hashed files and an executed artifact.
+    pub fn from_executed(
+        manifest: &TargetManifest,
+        kind: BuildKind,
+        workspace_root: &Path,
+        extra_files: &[&str],
+        executed_artifact: Option<&Path>,
+    ) -> Result<Self, String> {
+        let spec = manifest
+            .spec(kind)
+            .ok_or_else(|| format!("manifest has no {kind:?} build"))?;
+
+        let mut source_hashes = BTreeMap::new();
+        let mut paths: Vec<std::path::PathBuf> =
+            manifest.sources.iter().map(|s| s.path.clone()).collect();
+        for extra in extra_files {
+            paths.push(std::path::PathBuf::from(extra));
+        }
+        for rel in paths {
+            let path = if rel.is_absolute() {
+                rel.clone()
+            } else {
+                workspace_root.join(&rel)
+            };
+            if !path.is_file() {
+                continue;
+            }
+            let bytes = fs::read(&path)
+                .map_err(|err| format!("failed to hash source {}: {err}", path.display()))?;
+            let hash: [u8; 32] = Sha256::digest(&bytes).into();
+            source_hashes.insert(rel.display().to_string(), hash);
+        }
+
+        let artifact_hash = match executed_artifact {
+            Some(path) => {
+                let bytes = fs::read(path).map_err(|err| {
+                    format!("failed to hash executed artifact {}: {err}", path.display())
+                })?;
+                Some(Sha256::digest(&bytes).into())
+            }
+            None => match &spec.artifact {
+                Some(art) => {
+                    let path = if art.is_absolute() {
+                        art.clone()
+                    } else {
+                        workspace_root.join(art)
+                    };
+                    if path.is_file() {
+                        let bytes = fs::read(&path).map_err(|err| {
+                            format!("failed to hash artifact {}: {err}", path.display())
+                        })?;
+                        Some(Sha256::digest(&bytes).into())
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            },
+        };
+
+        let compiler = detect_clang_version().unwrap_or_else(|| "clang".to_string());
+        Ok(Self::compute(BuildIdentityParts {
+            target_id: manifest.target_id(),
+            kind,
+            compiler,
+            flags: spec.flags.clone(),
+            source_hashes,
+            artifact_hash,
+        }))
+    }
+}
+
+fn detect_clang_version() -> Option<String> {
+    let output = Command::new("clang").arg("-v").output().ok()?;
+    let text = if output.stderr.is_empty() {
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    } else {
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+    text.lines().next().map(ToOwned::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_manifest_hashes_repo_sources() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = crate::manifest::TargetManifest::from_path(
+            root.join("benchmarks/manifests/cjson-parse.toml"),
+        )
+        .unwrap();
+        let fast = BuildIdentity::from_manifest(&manifest, BuildKind::Fast, &root).unwrap();
+        let canon = BuildIdentity::from_manifest(&manifest, BuildKind::Canonical, &root).unwrap();
+        assert_eq!(fast.target_id.0, "cjson-parse");
+        assert!(fast.source_hashes.len() >= 2);
+        assert_ne!(fast.build_id, canon.build_id);
+    }
+
+    #[test]
+    fn build_id_is_stable_and_sensitive() {
+        let mut sources = BTreeMap::new();
+        sources.insert("a.c".into(), [1u8; 32]);
+        let a = BuildIdentity::compute(BuildIdentityParts {
+            target_id: TargetId("t".into()),
+            kind: BuildKind::Fast,
+            compiler: "clang 1".into(),
+            flags: vec!["-O3".into()],
+            source_hashes: sources.clone(),
+            artifact_hash: None,
+        });
+        let b = BuildIdentity::compute(BuildIdentityParts {
+            target_id: TargetId("t".into()),
+            kind: BuildKind::Fast,
+            compiler: "clang 1".into(),
+            flags: vec!["-O3".into()],
+            source_hashes: sources.clone(),
+            artifact_hash: None,
+        });
+        assert_eq!(a.build_id, b.build_id);
+
+        let c = BuildIdentity::compute(BuildIdentityParts {
+            target_id: TargetId("t".into()),
+            kind: BuildKind::Canonical,
+            compiler: "clang 1".into(),
+            flags: vec!["-O1".into()],
+            source_hashes: sources,
+            artifact_hash: None,
+        });
+        assert_ne!(a.build_id, c.build_id);
+    }
+}

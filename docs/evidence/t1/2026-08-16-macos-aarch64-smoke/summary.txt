@@ -1,0 +1,9 @@
+source=campaigns/t1-smoke/run1/artifacts/reports/canonical.json (copied exactly)
+canonical_json_sha256=dde663f8c4827b15dfe1a4d97dca4a347c119a9e1b5d5840cdfa7c9c1abf9a60
+T1_RESULT target=cjson-parse ingested=59 replayed=59 admitted=25 rejected=34 edges=115
+digest=54c50582237b0bfb17582d09b4ccb40ebfb7b8238f0155985efde287d5609a22
+micro-nonzero-exit T1_RESULT target=micro-nonzero-exit edges=4 (not cJSON)
+unsupported micro-timeout-hang: hard error
+reuse --out: hard error not empty
+H0_FUNCTIONAL_PASS 150 hashes
+note=exact JSON exports; digest is a hex string

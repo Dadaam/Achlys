@@ -1,0 +1,9 @@
+{
+  "digest": "54c50582237b0bfb17582d09b4ccb40ebfb7b8238f0155985efde287d5609a22",
+  "edge_count": 115,
+  "admitted": 25,
+  "rejected": 34,
+  "replayed": 59,
+  "canonical_build": "6869413010e03841c04f1a36a3aa889ea81cb91f2a13f5f923f00bdbbc355573",
+  "artifact_hash": "4cdba7fbfe48cb1afc770b338961e3d382547de1c472e1f36cc437cde27abefb"
+}

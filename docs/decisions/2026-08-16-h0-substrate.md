@@ -66,4 +66,7 @@ First development pair used `SimpleMonitor` (≈512 MB / 3.6 M heartbeat lin
 
 ## Expected consequence
 
-Tranche 1 may continue (manifests, canonical replay, sanitizer pipeline, AFL++ column). Tranche 2+ (LLMP, adaptive allocation, ML) stay forbidden until those gates land.
+Tranche 1 baseline infrastructure is accepted
+([`2026-08-16-t1-baseline-accepted.md`](2026-08-16-t1-baseline-accepted.md)).
+Tranche 2+ (LLMP, adaptive allocation, ML) stay forbidden until a Linux
+multi-trial ladder is defined and executed.

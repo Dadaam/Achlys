@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "campaign_id": "613b237953278fd7e85cff478b3bc769",
+  "target_id": "cjson-parse",
+  "label": "t1-smoke",
+  "seed": 4242,
+  "max_iters": 50,
+  "max_seconds": null,
+  "max_input_len": 64,
+  "timeout_ms": 1000,
+  "tool": "achlys_t1",
+  "host": "macos aarch64",
+  "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "git": "0baf32fc08a6f8a4e6457aea03762f241ed57bbc",
+  "git_dirty": 17,
+  "fast_build": {
+    "target_id": "cjson-parse",
+    "kind": "fast",
+    "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
+    "flags": [
+      "-O3",
+      "-fsanitize-coverage=trace-pc-guard"
+    ],
+    "source_hashes": {
+      "Cargo.lock": "007a4246c56df90e0c36b9ede02b73757f5d4a51e652b1260f57fe7fb244458f",
+      "build.rs": "712a8f377ce4d40283f7184a822f107ebc91455c5f75c61ec7a16ac431995522",
+      "examples/fuzzers/achlys_t1.rs": "c1cd4828b4a57a99912d328b4fadebe59c907c7a845db8e272188426b8757c68",
+      "examples/targets/cJSON/cJSON.c": "75c51de8fa40ac9d7a99319c6330719bd692eb81c0a869265f3d4c682533f9b9",
+      "examples/targets/cJSON/cJSON.h": "0578cc29132912edbc88f83207a8fc76e5db3db0605497e909a9384ef3cc474b",
+      "examples/targets/cJSON/harness_afl.c": "3a3766c5c098b4d4806f5deb93b81744cf60d6f2f13bfbb8462945db7f509b7a",
+      "examples/targets/cJSON/sancov_callbacks.c": "fa6065bdbb37f0acf25fc6a8ac320c95d82d82f518608f3dbc3dc558a2c85648",
+      "rust-toolchain.toml": "e7155b5437585c3c3acc3053b08c6936020e9e93cc343e47e7e25f0033418e84"
+    },
+    "artifact_hash": "4c23dfda411c9b63ca6f08fdb24dd4f8a21145f1a1d6f57d384150acb069516a",
+    "build_id": "a428f0ac5bfe93f08275560199b4c4238be9ca366b50df994f9b972e9b039458"
+  },
+  "canonical_build": {
+    "target_id": "cjson-parse",
+    "kind": "canonical",
+    "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
+    "flags": [
+      "-O1",
+      "-g",
+      "-fsanitize-coverage=trace-pc-guard"
+    ],
+    "source_hashes": {
+      "Cargo.lock": "007a4246c56df90e0c36b9ede02b73757f5d4a51e652b1260f57fe7fb244458f",
+      "build.rs": "712a8f377ce4d40283f7184a822f107ebc91455c5f75c61ec7a16ac431995522",
+      "examples/fuzzers/achlys_t1.rs": "c1cd4828b4a57a99912d328b4fadebe59c907c7a845db8e272188426b8757c68",
+      "examples/targets/cJSON/cJSON.c": "75c51de8fa40ac9d7a99319c6330719bd692eb81c0a869265f3d4c682533f9b9",
+      "examples/targets/cJSON/cJSON.h": "0578cc29132912edbc88f83207a8fc76e5db3db0605497e909a9384ef3cc474b",
+      "examples/targets/cJSON/harness_afl.c": "3a3766c5c098b4d4806f5deb93b81744cf60d6f2f13bfbb8462945db7f509b7a",
+      "examples/targets/cJSON/sancov_callbacks.c": "fa6065bdbb37f0acf25fc6a8ac320c95d82d82f518608f3dbc3dc558a2c85648",
+      "rust-toolchain.toml": "e7155b5437585c3c3acc3053b08c6936020e9e93cc343e47e7e25f0033418e84"
+    },
+    "artifact_hash": "4cdba7fbfe48cb1afc770b338961e3d382547de1c472e1f36cc437cde27abefb",
+    "build_id": "6869413010e03841c04f1a36a3aa889ea81cb91f2a13f5f923f00bdbbc355573"
+  },
+  "sanitizer_build": {
+    "target_id": "cjson-parse",
+    "kind": "sanitizer",
+    "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
+    "flags": [
+      "-O1",
+      "-g",
+      "-fsanitize=address,undefined"
+    ],
+    "source_hashes": {
+      "Cargo.lock": "007a4246c56df90e0c36b9ede02b73757f5d4a51e652b1260f57fe7fb244458f",
+      "build.rs": "712a8f377ce4d40283f7184a822f107ebc91455c5f75c61ec7a16ac431995522",
+      "examples/fuzzers/achlys_t1.rs": "c1cd4828b4a57a99912d328b4fadebe59c907c7a845db8e272188426b8757c68",
+      "examples/targets/cJSON/cJSON.c": "75c51de8fa40ac9d7a99319c6330719bd692eb81c0a869265f3d4c682533f9b9",
+      "examples/targets/cJSON/cJSON.h": "0578cc29132912edbc88f83207a8fc76e5db3db0605497e909a9384ef3cc474b",
+      "examples/targets/cJSON/harness_afl.c": "3a3766c5c098b4d4806f5deb93b81744cf60d6f2f13bfbb8462945db7f509b7a",
+      "examples/targets/cJSON/sancov_callbacks.c": "fa6065bdbb37f0acf25fc6a8ac320c95d82d82f518608f3dbc3dc558a2c85648",
+      "rust-toolchain.toml": "e7155b5437585c3c3acc3053b08c6936020e9e93cc343e47e7e25f0033418e84"
+    },
+    "artifact_hash": "45679d5f143280ed7c687d1394141c76bff92a15616e8cc2b7335a5b9eac6358",
+    "build_id": "092df0c2bfef486358f56faac4a74daeb7848f4e10409bf0f372d24f7d32ab11"
+  },
+  "started_unix_ms": 1786901944045
+}

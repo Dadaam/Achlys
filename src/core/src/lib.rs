@@ -6,15 +6,18 @@
 pub mod ai_mutator;
 pub mod ai_stage;
 pub mod builder;
+pub mod campaign;
 pub mod config;
 pub mod cortex_interface;
 pub mod escalation;
 pub mod feedback;
 pub mod plateau;
+pub mod store;
 
 pub use ai_mutator::AiMutator;
 pub use ai_stage::HybridStage;
 pub use builder::FuzzerBuilder;
+pub use campaign::CampaignSession;
 pub use config::{FuzzerConfig, SubstrateReport};
 pub use cortex_interface::CortexInterface;
 pub use escalation::{
@@ -22,3 +25,4 @@ pub use escalation::{
 };
 pub use feedback::PlateauAwareFeedback;
 pub use plateau::{PlateauDetector, SharedPlateauDetector, shared_detector};
+pub use store::{CampaignStore, CanonicalReport};
