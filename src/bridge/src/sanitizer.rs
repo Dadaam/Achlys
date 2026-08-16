@@ -312,7 +312,7 @@ pub fn normalize_stack_signature(stderr: &str) -> Option<String> {
     let mut frames = Vec::new();
     for line in stderr.lines() {
         if is_frame_line(line) {
-            let normalized = strip_hex_addresses(line.trim());
+            let normalized = collapse_paths(&strip_build_ids(&strip_hex_addresses(line.trim())));
             if !normalized.is_empty() {
                 frames.push(normalized);
             }
@@ -458,6 +458,40 @@ fn strip_hex_addresses(s: &str) -> String {
     collapse_ws(&out)
 }
 
+fn strip_build_ids(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'('
+            && s[i..].starts_with("(BuildId:")
+            && let Some(end) = s[i..].find(')')
+        {
+            i += end + 1;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    collapse_ws(&out)
+}
+
+/// Keep `file:line` / basename, drop `/tmp/...` rebuild paths.
+fn collapse_paths(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (i, token) in s.split_whitespace().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        if let Some((_, tail)) = token.rsplit_once('/') {
+            out.push_str(tail);
+        } else {
+            out.push_str(token);
+        }
+    }
+    out
+}
+
 fn collapse_ws(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_space = false;
@@ -590,16 +624,22 @@ mod tests {
 
     #[test]
     fn crash_if_magic_bug_is_reproducible_crash() {
-        let report = replay_micro("crash_if_magic", b"BUG!", FAST);
+        let _guard = HARNESS.lock().unwrap_or_else(|e| e.into_inner());
+        let built = compile_locked("crash_if_magic");
+        let replayer = SanitizerReplayer::new(&built.path).with_timeout(FAST);
+        let report = replayer.replay(b"BUG!").expect("BUG!");
         assert_eq!(report.class, ReplayClass::ReproducibleCrash);
         assert!(
             report.stack_signature.is_some(),
             "expected stack signature, stderr was:\n{}",
             report.stderr
         );
-        let key = dedup_key(&report);
-        let again = replay_micro("crash_if_magic", b"BUG!", FAST);
-        assert_eq!(key, dedup_key(&again), "dedup_key must be stable");
+        let again = replayer.replay(b"BUG!").expect("BUG! again");
+        assert_eq!(
+            dedup_key(&report),
+            dedup_key(&again),
+            "dedup_key must be stable on one binary"
+        );
     }
 
     #[test]
@@ -607,6 +647,30 @@ mod tests {
         let report = replay_micro("crash_if_magic", b"safe", FAST);
         assert_eq!(report.class, ReplayClass::Clean);
         assert!(report.signal.is_none());
+    }
+
+    #[test]
+    fn rebuild_same_source_shares_normalized_key() {
+        let _guard = HARNESS.lock().unwrap_or_else(|e| e.into_inner());
+        let first = compile_locked("crash_if_magic");
+        let a = SanitizerReplayer::new(&first.path)
+            .with_timeout(FAST)
+            .replay(b"BUG!")
+            .expect("first rebuild");
+        let second = compile_locked("crash_if_magic");
+        let b = SanitizerReplayer::new(&second.path)
+            .with_timeout(FAST)
+            .replay(b"BUG!")
+            .expect("second rebuild");
+        assert_eq!(a.class, ReplayClass::ReproducibleCrash);
+        assert_eq!(b.class, ReplayClass::ReproducibleCrash);
+        assert_eq!(
+            dedup_key(&a),
+            dedup_key(&b),
+            "rebuild paths/BuildId must not change the key\n--- a ---\n{}\n--- b ---\n{}",
+            a.stack_signature.as_deref().unwrap_or(""),
+            b.stack_signature.as_deref().unwrap_or("")
+        );
     }
 
     #[test]
@@ -682,6 +746,13 @@ mod tests {
         assert!(!na.contains("0x") && !na.contains("0X"));
         assert!(na.contains("achlys_micro_crash_if_magic"));
         assert!(na.contains("crash_if_magic.c:10"));
+
+        let rebuilt_a = "    #4 0x1 in main /tmp/achlys_asan_crash_if_magic_1/crash_if_magic_driver.c:57:12 (BuildId: aaaa)";
+        let rebuilt_b = "    #4 0x2 in main /tmp/achlys_asan_crash_if_magic_2/crash_if_magic_driver.c:57:12 (BuildId: bbbb)";
+        assert_eq!(
+            normalize_stack_signature(rebuilt_a),
+            normalize_stack_signature(rebuilt_b)
+        );
         assert!(normalize_stack_signature("no frames, just noise 0xdead").is_none());
     }
 }
