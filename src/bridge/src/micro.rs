@@ -203,3 +203,31 @@ fn crash_if_magic_other_ok() {
     let kind = exec_micro("crash_if_magic", "safe", FAST);
     assert!(matches!(kind, ExitKind::Ok), "expected Ok, got {kind:?}");
 }
+
+#[test]
+fn nonzero_exit_nok_is_ok() {
+    // Return code 1 is not a crash signal. Mechanism only (§20.1 / §24.6).
+    let kind = exec_micro("nonzero_exit", "NOK!", FAST);
+    assert!(
+        matches!(kind, ExitKind::Ok),
+        "nonzero exit must be Ok, not Crash; got {kind:?}"
+    );
+}
+
+#[test]
+fn nonzero_exit_ok_is_ok() {
+    let kind = exec_micro("nonzero_exit", "ok", FAST);
+    assert!(matches!(kind, ExitKind::Ok), "expected Ok, got {kind:?}");
+}
+
+#[test]
+fn coverage_stable_abc_ok() {
+    let kind = exec_micro("coverage_stable", "ABC", FAST);
+    assert!(matches!(kind, ExitKind::Ok), "expected Ok, got {kind:?}");
+}
+
+#[test]
+fn coverage_stable_xxx_ok() {
+    let kind = exec_micro("coverage_stable", "xxx", FAST);
+    assert!(matches!(kind, ExitKind::Ok), "expected Ok, got {kind:?}");
+}
