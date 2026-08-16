@@ -14,6 +14,7 @@ anyhow = { workspace = true }
 [dev-dependencies]
 achlys-core = { path = "src/core" }
 achlys-bridge = { path = "src/bridge" }
+achlys-protocol = { path = "src/protocol" }
 
 [build-dependencies]
 cc = { workspace = true }
@@ -37,6 +38,10 @@ path = "examples/fuzzers/achlys_h0.rs"
 [[example]]
 name = "achlys_oracle"
 path = "examples/fuzzers/achlys_oracle.rs"
+
+[[example]]
+name = "achlys_t1"
+path = "examples/fuzzers/achlys_t1.rs"
 
 [workspace]
 members = [

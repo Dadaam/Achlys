@@ -187,6 +187,9 @@ fn main() {
             "edges": report.edge_count,
             "digest": report.digest.to_hex(),
         });
+        if let Some(parent) = out.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
         fs::write(&out, format!("{body}\n"))
             .unwrap_or_else(|e| die(&format!("write {}: {e}", out.display())));
     }
