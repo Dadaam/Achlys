@@ -1,0 +1,15 @@
+T2 homogeneous ladder / smoke
+this is a ladder definition / smoke
+do not publish
+T2_LADDER=RAN
+uname=Linux
+nproc=8
+seconds=300
+trials=5
+workers=1 2 4 8
+out=campaigns/t2-scale-linux
+target=benchmarks/manifests/cjson-parse.toml
+dump=one compile per trial, reused via --canonical-bin
+note=not a T2 accept; not a scaling claim; not an AFL++ comparison
+tsv=campaigns/t2-scale-linux/results.tsv
+commit=fcb725c288720d815749ba2e7e5eb224456711d8

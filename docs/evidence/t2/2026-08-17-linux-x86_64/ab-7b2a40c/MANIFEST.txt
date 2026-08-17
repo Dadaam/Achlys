@@ -1,0 +1,14 @@
+kind=A/B 3 trials x 120s x 7 variants (21 cells)
+commit=7b2a40c285dc4b26dc5266197ad044c1275eac13
+script=/root/achlys-t2-ab-7b2a40c/run_ab.sh
+start_utc=2026-08-17T20:03:06Z
+end_utc=2026-08-17T20:45:11Z
+exit=0
+cells=21/21 rc=0
+seconds=120
+variants=A:1w/256 B:4w/256 C:8w/256 D:7w/256/cores=0-6 E:8w/sync=1 F:8w/256/rescan G:8w/sync=1/rescan
+order_t1=A,B,C,D,E,F,G
+order_t2=D,G,B,F,A,E,C
+order_t3=E,C,A,G,D,B,F
+env_cleared=ACHLYS_T2_SYNC_EVERY ACHLYS_T2_RESCAN unless variant overrides
+host_tree=/root/achlys-t2-ab-7b2a40c

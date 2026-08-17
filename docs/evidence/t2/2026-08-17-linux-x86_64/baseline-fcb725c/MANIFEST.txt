@@ -1,0 +1,13 @@
+kind=T2_LADDER=1 five-trial 300s cells
+commit=fcb725c288720d815749ba2e7e5eb224456711d8
+command=T2_LADDER=1 T2_OUT=campaigns/t2-scale-linux ./scripts/experiments/t2_scale.sh
+seconds=300
+trials=5
+workers=1 2 4 8
+cells=20
+validation=VALIDATION_PASS rows=20 queue_full=all_zero
+first_ladder_exit=1
+retry_ladder_exit=0
+raw_archive=/root/achlys-t2-linux-fcb725c.tar.gz
+raw_archive_sha256=fe08142433a215de25265303899a503ab1814ae9c141ad92d079b3ef6ac49ccc
+host_tree=/root/achlys-t2-linux-fcb725c

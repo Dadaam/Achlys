@@ -1,0 +1,13 @@
+host=achlys-t2-linux
+ip=51.15.217.99
+uname=Linux achlys-t2-linux 6.8.0-106-generic #106-Ubuntu SMP PREEMPT_DYNAMIC Fri Mar 6 07:58:08 UTC 2026 x86_64
+cpu=AMD EPYC 9555P 64-Core Processor
+lscpu_threads_per_core=1
+lscpu_cores=8
+nproc=8
+virt=pc-i440fx-jammy (KVM)
+mem=15Gi
+rustc=1.97.1 (8bab26f4f 2026-07-14) x86_64-unknown-linux-gnu
+clang=Ubuntu clang version 18.1.3 (1ubuntu1)
+target=benchmarks/manifests/cjson-parse.toml
+note=not a T2 accept; not a scaling claim; not an AFL++ comparison
