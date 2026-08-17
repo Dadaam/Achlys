@@ -3,6 +3,9 @@ use std::time::Duration;
 
 use libafl_bolts::current_nanos;
 
+/// Default `fuzz_loop_for(1)` steps between control-plane syncs.
+pub const DEFAULT_SYNC_EVERY: u64 = 256;
+
 /// Configuration for the Achlys fuzzer.
 #[derive(Debug, Clone)]
 pub struct FuzzerConfig {
@@ -28,6 +31,8 @@ pub struct FuzzerConfig {
     pub exec_timeout: Duration,
     /// If set, queue is `InMemoryOnDiskCorpus`. `None` is for unit tests only.
     pub persist_corpus_dir: Option<PathBuf>,
+    /// `fuzz_loop_for(1)` steps between control-plane syncs. Always >= 1.
+    pub sync_every: u64,
 }
 
 impl Default for FuzzerConfig {
@@ -44,6 +49,7 @@ impl Default for FuzzerConfig {
             max_time: None,
             exec_timeout: Duration::from_millis(1000),
             persist_corpus_dir: None,
+            sync_every: DEFAULT_SYNC_EVERY,
         }
     }
 }

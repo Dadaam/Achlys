@@ -25,7 +25,7 @@ pub use ai_mutator::AiMutator;
 pub use ai_stage::HybridStage;
 pub use builder::FuzzerBuilder;
 pub use campaign::CampaignSession;
-pub use config::{FuzzerConfig, SubstrateReport};
+pub use config::{DEFAULT_SYNC_EVERY, FuzzerConfig, SubstrateReport};
 pub use cortex_interface::CortexInterface;
 pub use escalation::{
     EscalatingStage, EscalationManager, FuzzStage, SharedLogSink, shared_log_sink,
@@ -34,4 +34,7 @@ pub use feedback::PlateauAwareFeedback;
 pub use plateau::{PlateauDetector, SharedPlateauDetector, shared_detector};
 pub use spool::{CandidateSpool, WorkerExit, WorkerRegistration, WorkerResume};
 pub use store::{CampaignStore, CanonicalReport};
-pub use worker::{list_corpus_files, run_homogeneous_simple, scan_new_inputs};
+pub use worker::{
+    CorpusScanCursor, CorpusScanResult, CorpusScanStats, ScanMode, SyncMetrics, list_corpus_files,
+    run_homogeneous_simple, scan_new_inputs,
+};

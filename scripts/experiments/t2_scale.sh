@@ -10,6 +10,8 @@
 # count via --canonical-bin. Campaign roots stay empty of logs.
 #
 # Never prints a T2 accept / pass token. Do not publish these rows.
+# A/B knobs (do not change a running ladder): --sync-every / ACHLYS_T2_SYNC_EVERY
+# (default 256) and --rescan / ACHLYS_T2_RESCAN=1 (old full-corpus reread).
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"

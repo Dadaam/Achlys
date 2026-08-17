@@ -3,7 +3,6 @@
 //! Control plane (admit + DumpOracle + CampaignStore) is a separate process.
 //! Workers do not call the oracle on the hot path.
 
-use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::num::NonZero;
@@ -19,8 +18,8 @@ use achlys_bridge::{
     CoverageMap, DumpOracle, InProcessTarget, Target, WorkerTarget, compile_canonical,
 };
 use achlys_core::{
-    CampaignSession, CandidateSpool, CorpusAuthority, FuzzerConfig, WorkerExit, WorkerRegistration,
-    WorkerResume, scan_new_inputs,
+    CampaignSession, CandidateSpool, CorpusAuthority, CorpusScanCursor, FuzzerConfig, ScanMode,
+    SyncMetrics, WorkerExit, WorkerRegistration, WorkerResume, scan_new_inputs,
 };
 use achlys_protocol::{
     BuildIdentity, BuildKind, CampaignEvent, CampaignId, CampaignRecord, InputId, InputMetadata,
@@ -109,6 +108,8 @@ struct Args {
     canonical_bin: Option<PathBuf>,
     canonical_dir: Option<PathBuf>,
     pending_bound: usize,
+    sync_every: u64,
+    rescan: bool,
 }
 
 fn parse_args() -> Args {
@@ -127,6 +128,8 @@ fn parse_args() -> Args {
     let mut canonical_bin = None;
     let mut canonical_dir = None;
     let mut pending_bound = achlys_core::DEFAULT_PENDING_BOUND;
+    let mut sync_every = None;
+    let mut rescan = env::var("ACHLYS_T2_RESCAN").ok().is_some_and(|v| v != "0");
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -180,6 +183,14 @@ fn parse_args() -> Args {
                     die("--pending-bound must be >= 1");
                 }
             }
+            "--sync-every" => {
+                sync_every = Some(
+                    need("--sync-every")
+                        .parse()
+                        .unwrap_or_else(|_| die("--sync-every must be u64")),
+                );
+            }
+            "--rescan" => rescan = true,
             "--role" => {
                 role = match need("--role").as_str() {
                     "launcher" => Role::Launcher,
@@ -207,6 +218,16 @@ fn parse_args() -> Args {
     if canonical_bin.is_some() && canonical_dir.is_some() {
         die("--canonical-bin and --canonical-dir are mutually exclusive");
     }
+    let sync_every = sync_every
+        .or_else(|| {
+            env::var("ACHLYS_T2_SYNC_EVERY")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(achlys_core::DEFAULT_SYNC_EVERY);
+    if sync_every == 0 {
+        die("--sync-every must be >= 1");
+    }
 
     Args {
         seed,
@@ -224,6 +245,8 @@ fn parse_args() -> Args {
         canonical_bin,
         canonical_dir,
         pending_bound,
+        sync_every,
+        rescan,
     }
 }
 
@@ -232,9 +255,12 @@ fn print_help() {
         "achlys_t2 --manifest PATH --out DIR --workers N [--seed N] \
          [--iters N | --seconds N] [--cores LIST] [--broker-port P] \
          [--corpus DIR] [--label NAME] [--canonical-dir DIR] \
-         [--canonical-bin PATH] [--pending-bound N] [--join] [--role launcher|admit]\n\
+         [--canonical-bin PATH] [--pending-bound N] [--sync-every N] [--rescan]\n\
+         [--join] [--role launcher|admit]\n\
          --canonical-dir must contain canonical + identity.json compiled for this target.\n\
-         --join is offline continuation of a stopped campaign, not a live late join."
+         --join is offline continuation of a stopped campaign, not a live late join.\n\
+         --sync-every is the fuzz_loop_for(1) batch between spool syncs (default 256).\n\
+         --rescan re-reads every corpus file at each sync (A/B against incremental scan)."
     );
 }
 
@@ -1014,6 +1040,8 @@ fn run_launcher(args: Args) {
     let worker_max_len = manifest.max_input_len;
     let worker_fast = fast.build_id;
     let worker_kind = kind;
+    let worker_sync_every = args.sync_every;
+    let worker_rescan = args.rescan;
     let snapshot_dir = spool_dir(&args.out).join("snapshot");
     let campaign = campaign_id;
 
@@ -1076,6 +1104,7 @@ fn run_launcher(args: Args) {
                 max_input_len: worker_max_len,
                 exec_timeout: worker_timeout,
                 initial_inputs: 8,
+                sync_every: worker_sync_every,
                 ..FuzzerConfig::default()
             };
             // keep rustc happy if Default overwrites
@@ -1084,9 +1113,17 @@ fn run_launcher(args: Args) {
 
             let target = worker_target(worker_kind);
             let mut seq = resume.next_producer_seq;
-            let mut seen = HashSet::new();
+            let mut cursor = CorpusScanCursor::new();
+            let mut sync = SyncMetrics::default();
+            let scan_mode = if worker_rescan {
+                ScanMode::Rescan
+            } else {
+                ScanMode::Incremental
+            };
             let report = run_llmp_worker(target, &config, &mut mgr, &extra, |corpus_dir| {
-                let new = scan_new_inputs(corpus_dir, &mut seen)?;
+                let started_sync = Instant::now();
+                let (new, stats) = scan_new_inputs(corpus_dir, &mut cursor, scan_mode)?;
+                let mut spooled = 0usize;
                 for (_id, bytes) in new {
                     let meta = InputMetadata {
                         input_id: InputId::from_bytes(&bytes),
@@ -1103,7 +1140,10 @@ fn run_launcher(args: Args) {
                     };
                     seq = seq.saturating_add(1);
                     spool.push(&bytes, &meta)?;
+                    spooled = spooled.saturating_add(1);
                 }
+                let ns = u64::try_from(started_sync.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                sync.record(ns, &stats, spooled);
                 Ok(())
             })
             .map_err(|e| libafl::Error::unknown(e.to_string()))?;
@@ -1115,6 +1155,14 @@ fn run_launcher(args: Args) {
                 "corpus_count": report.corpus_count,
                 "objectives": report.objectives,
                 "elapsed_ms": report.elapsed.as_millis() as u64,
+                "sync_calls": sync.calls,
+                "sync_ns_total": sync.ns_total,
+                "sync_ns_p95": sync.p95_ns(),
+                "sync_ns_max": sync.ns_max,
+                "paths_listed": sync.paths_listed,
+                "paths_read": sync.paths_read,
+                "bytes_read": sync.bytes_read,
+                "inputs_spooled": sync.inputs_spooled,
             });
             fs::write(
                 dir.join("report.json"),
@@ -1203,6 +1251,14 @@ fn run_launcher(args: Args) {
     let mut execs = 0u64;
     let mut objectives = 0u64;
     let mut reports = 0usize;
+    let mut sync_calls = 0u64;
+    let mut sync_ns = 0u64;
+    let mut sync_ns_p95 = 0u64;
+    let mut sync_ns_max = 0u64;
+    let mut paths_listed = 0u64;
+    let mut paths_read = 0u64;
+    let mut bytes_read = 0u64;
+    let mut inputs_spooled = 0u64;
     for slot in 0..args.workers {
         let path = args
             .out
@@ -1220,6 +1276,23 @@ fn run_launcher(args: Args) {
         execs = execs.saturating_add(v.get("executions").and_then(|x| x.as_u64()).unwrap_or(0));
         objectives =
             objectives.saturating_add(v.get("objectives").and_then(|x| x.as_u64()).unwrap_or(0));
+        sync_calls =
+            sync_calls.saturating_add(v.get("sync_calls").and_then(|x| x.as_u64()).unwrap_or(0));
+        sync_ns =
+            sync_ns.saturating_add(v.get("sync_ns_total").and_then(|x| x.as_u64()).unwrap_or(0));
+        sync_ns_p95 = sync_ns_p95.max(v.get("sync_ns_p95").and_then(|x| x.as_u64()).unwrap_or(0));
+        sync_ns_max = sync_ns_max.max(v.get("sync_ns_max").and_then(|x| x.as_u64()).unwrap_or(0));
+        paths_listed = paths_listed
+            .saturating_add(v.get("paths_listed").and_then(|x| x.as_u64()).unwrap_or(0));
+        paths_read =
+            paths_read.saturating_add(v.get("paths_read").and_then(|x| x.as_u64()).unwrap_or(0));
+        bytes_read =
+            bytes_read.saturating_add(v.get("bytes_read").and_then(|x| x.as_u64()).unwrap_or(0));
+        inputs_spooled = inputs_spooled.saturating_add(
+            v.get("inputs_spooled")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0),
+        );
     }
     if reports != args.workers {
         die(&format!(
@@ -1295,7 +1368,7 @@ fn run_launcher(args: Args) {
         .unwrap_or_else(|e| die(&format!("CampaignFinished: {e:#}")));
 
     println!(
-        "T2_RESULT workers={} ingested={} admitted={} rejected={} replayed={} edges={} objects={} queue_full={} execs={} registered={} reports={} objectives={} wall_ms={}",
+        "T2_RESULT workers={} ingested={} admitted={} rejected={} replayed={} edges={} objects={} queue_full={} execs={} registered={} reports={} objectives={} wall_ms={} sync_every={} rescan={} sync_calls={} sync_ns={} sync_ns_p95={} sync_ns_max={} paths_listed={} paths_read={} bytes_read={} spooled={}",
         args.workers,
         objects,
         admitted,
@@ -1308,7 +1381,17 @@ fn run_launcher(args: Args) {
         folded.workers.len(),
         reports,
         objectives,
-        wall_ms
+        wall_ms,
+        args.sync_every,
+        u8::from(args.rescan),
+        sync_calls,
+        sync_ns,
+        sync_ns_p95,
+        sync_ns_max,
+        paths_listed,
+        paths_read,
+        bytes_read,
+        inputs_spooled
     );
 }
 
@@ -1405,21 +1488,28 @@ where
     let mutator = HavocScheduledMutator::new(havoc_mutations());
     let mut stages = tuple_list!(StdMutationalStage::new(mutator));
     let start = Instant::now();
-    match (config.max_iters, config.max_time) {
-        (Some(iters), None) => {
-            fuzzer.fuzz_loop_for(&mut stages, &mut executor, &mut state, mgr, iters)?;
-            on_sync(&persist)?;
-        }
-        (iters, Some(max_time)) => {
-            let mut remaining = iters.unwrap_or(u64::MAX);
-            while remaining > 0 && start.elapsed() < max_time {
-                fuzzer.fuzz_loop_for(&mut stages, &mut executor, &mut state, mgr, 1)?;
-                on_sync(&persist)?;
-                remaining -= 1;
-            }
-        }
-        (None, None) => anyhow::bail!("worker needs a bound"),
+    if config.max_iters.is_none() && config.max_time.is_none() {
+        anyhow::bail!("worker needs a bound");
     }
+    let sync_every = config.sync_every.max(1);
+    let mut remaining = config.max_iters.unwrap_or(u64::MAX);
+    let mut since_sync = 0u64;
+    while remaining > 0 {
+        if config
+            .max_time
+            .is_some_and(|max_time| start.elapsed() >= max_time)
+        {
+            break;
+        }
+        fuzzer.fuzz_loop_for(&mut stages, &mut executor, &mut state, mgr, 1)?;
+        remaining = remaining.saturating_sub(1);
+        since_sync = since_sync.saturating_add(1);
+        if since_sync >= sync_every {
+            on_sync(&persist)?;
+            since_sync = 0;
+        }
+    }
+    on_sync(&persist)?;
     if let Some(err) = infra.lock().expect("infra").take() {
         return Err(anyhow!(err));
     }

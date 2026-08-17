@@ -35,6 +35,89 @@ use libafl_bolts::{AsSlice, rands::StdRand, tuples::tuple_list};
 
 use crate::config::{FuzzerConfig, SubstrateReport};
 
+/// How a corpus directory is walked at a sync point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanMode {
+    /// Skip paths already inspected. Corpus files are treated as immutable.
+    Incremental,
+    /// Re-read every file. A/B control against the old seconds-mode tax.
+    Rescan,
+}
+
+/// Paths already inspected by [`scan_new_inputs`].
+#[derive(Debug, Default)]
+pub struct CorpusScanCursor {
+    seen_paths: HashSet<PathBuf>,
+    seen_ids: HashSet<InputId>,
+}
+
+impl CorpusScanCursor {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn path_count(&self) -> usize {
+        self.seen_paths.len()
+    }
+}
+
+/// One walk of a persist corpus directory.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CorpusScanStats {
+    pub paths_listed: usize,
+    pub paths_read: usize,
+    pub bytes_read: u64,
+    pub new_inputs: usize,
+}
+
+/// Newly seen corpus objects plus the walk counters for one sync.
+pub type CorpusScanResult = (Vec<(InputId, Vec<u8>)>, CorpusScanStats);
+
+/// Accumulated control-plane sync cost for one worker.
+#[derive(Debug, Default, Clone)]
+pub struct SyncMetrics {
+    pub calls: u64,
+    pub ns_total: u64,
+    pub ns_max: u64,
+    samples_ns: Vec<u64>,
+    pub paths_listed: u64,
+    pub paths_read: u64,
+    pub bytes_read: u64,
+    pub inputs_spooled: u64,
+}
+
+impl SyncMetrics {
+    pub fn record(&mut self, ns: u64, stats: &CorpusScanStats, spooled: usize) {
+        self.calls = self.calls.saturating_add(1);
+        self.ns_total = self.ns_total.saturating_add(ns);
+        if ns > self.ns_max {
+            self.ns_max = ns;
+        }
+        self.samples_ns.push(ns);
+        self.paths_listed = self.paths_listed.saturating_add(stats.paths_listed as u64);
+        self.paths_read = self.paths_read.saturating_add(stats.paths_read as u64);
+        self.bytes_read = self.bytes_read.saturating_add(stats.bytes_read);
+        self.inputs_spooled = self.inputs_spooled.saturating_add(spooled as u64);
+    }
+
+    #[must_use]
+    pub fn p95_ns(&self) -> u64 {
+        if self.samples_ns.is_empty() {
+            return 0;
+        }
+        let mut xs = self.samples_ns.clone();
+        xs.sort_unstable();
+        let idx = xs
+            .len()
+            .saturating_mul(95)
+            .saturating_div(100)
+            .min(xs.len() - 1);
+        xs[idx]
+    }
+}
+
 /// Regular files in a LibAFL on-disk corpus, skipping sidecars.
 pub fn list_corpus_files(dir: &Path) -> Result<Vec<PathBuf>> {
     if !dir.exists() {
@@ -53,20 +136,37 @@ pub fn list_corpus_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// New content-addressed inputs since `seen` was last updated.
-pub fn scan_new_inputs(dir: &Path, seen: &mut HashSet<InputId>) -> Result<Vec<(InputId, Vec<u8>)>> {
+/// New content-addressed inputs since `cursor` was last updated.
+pub fn scan_new_inputs(
+    dir: &Path,
+    cursor: &mut CorpusScanCursor,
+    mode: ScanMode,
+) -> Result<CorpusScanResult> {
+    let files = list_corpus_files(dir)?;
+    let mut stats = CorpusScanStats {
+        paths_listed: files.len(),
+        ..CorpusScanStats::default()
+    };
     let mut out = Vec::new();
-    for path in list_corpus_files(dir)? {
+    for path in files {
+        if mode == ScanMode::Incremental && cursor.seen_paths.contains(&path) {
+            continue;
+        }
         let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        stats.paths_read = stats.paths_read.saturating_add(1);
+        stats.bytes_read = stats.bytes_read.saturating_add(bytes.len() as u64);
         if bytes.is_empty() {
+            cursor.seen_paths.insert(path);
             continue;
         }
         let id = InputId::from_bytes(&bytes);
-        if seen.insert(id) {
+        cursor.seen_paths.insert(path);
+        if cursor.seen_ids.insert(id) {
+            stats.new_inputs = stats.new_inputs.saturating_add(1);
             out.push((id, bytes));
         }
     }
-    Ok(out)
+    Ok((out, stats))
 }
 
 fn is_libafl_sidecar(path: &Path) -> bool {
@@ -196,27 +296,27 @@ where
     let mutator = HavocScheduledMutator::new(havoc_mutations());
     let mut stages = tuple_list!(StdMutationalStage::new(mutator));
     let start = Instant::now();
-    match (config.max_iters, config.max_time) {
-        (Some(iters), None) => {
-            let step_res =
-                fuzzer.fuzz_loop_for(&mut stages, &mut executor, &mut state, &mut mgr, iters);
-            take_infra(&infra)?;
-            step_res.context("fatal error in homogeneous fuzz loop")?;
+    let sync_every = config.sync_every.max(1);
+    let mut remaining = config.max_iters.unwrap_or(u64::MAX);
+    let mut since_sync = 0u64;
+    while remaining > 0 {
+        if config
+            .max_time
+            .is_some_and(|max_time| start.elapsed() >= max_time)
+        {
+            break;
+        }
+        let step_res = fuzzer.fuzz_loop_for(&mut stages, &mut executor, &mut state, &mut mgr, 1);
+        take_infra(&infra)?;
+        step_res.context("fatal error in homogeneous fuzz loop")?;
+        remaining = remaining.saturating_sub(1);
+        since_sync = since_sync.saturating_add(1);
+        if since_sync >= sync_every {
             on_sync(&persist)?;
+            since_sync = 0;
         }
-        (iters, Some(max_time)) => {
-            let mut remaining = iters.unwrap_or(u64::MAX);
-            while remaining > 0 && start.elapsed() < max_time {
-                let step_res =
-                    fuzzer.fuzz_loop_for(&mut stages, &mut executor, &mut state, &mut mgr, 1);
-                take_infra(&infra)?;
-                step_res.context("fatal error in homogeneous fuzz loop")?;
-                on_sync(&persist)?;
-                remaining -= 1;
-            }
-        }
-        (None, None) => unreachable!("bounds checked above"),
     }
+    on_sync(&persist)?;
 
     Ok(SubstrateReport {
         executions: *state.executions(),
@@ -299,11 +399,41 @@ mod tests {
         fs::write(tmp.join("a"), b"alpha").unwrap();
         fs::write(tmp.join("b"), b"alpha").unwrap();
         fs::write(tmp.join(".id.metadata"), b"nope").unwrap();
-        let mut seen = HashSet::new();
-        let first = scan_new_inputs(&tmp, &mut seen).unwrap();
-        let second = scan_new_inputs(&tmp, &mut seen).unwrap();
+        let mut cursor = CorpusScanCursor::new();
+        let (first, first_stats) =
+            scan_new_inputs(&tmp, &mut cursor, ScanMode::Incremental).unwrap();
+        let (second, second_stats) =
+            scan_new_inputs(&tmp, &mut cursor, ScanMode::Incremental).unwrap();
+        let (rescan, rescan_stats) = scan_new_inputs(&tmp, &mut cursor, ScanMode::Rescan).unwrap();
         let _ = fs::remove_dir_all(&tmp);
         assert_eq!(first.len(), 1);
+        assert_eq!(first_stats.paths_read, 2);
         assert!(second.is_empty());
+        assert_eq!(second_stats.paths_read, 0);
+        assert_eq!(second_stats.bytes_read, 0);
+        assert!(rescan.is_empty());
+        assert_eq!(rescan_stats.paths_read, 2);
+        assert_eq!(rescan_stats.bytes_read, 10);
+    }
+
+    #[test]
+    fn sync_metrics_p95_is_ordered() {
+        let mut m = SyncMetrics::default();
+        for ns in [10, 20, 30, 40, 100] {
+            m.record(
+                ns,
+                &CorpusScanStats {
+                    paths_listed: 1,
+                    paths_read: 1,
+                    bytes_read: 4,
+                    new_inputs: 0,
+                },
+                0,
+            );
+        }
+        assert_eq!(m.calls, 5);
+        assert_eq!(m.ns_max, 100);
+        assert_eq!(m.p95_ns(), 100);
+        assert_eq!(m.bytes_read, 20);
     }
 }
