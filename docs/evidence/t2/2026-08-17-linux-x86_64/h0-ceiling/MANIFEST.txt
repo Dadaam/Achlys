@@ -1,0 +1,13 @@
+kind=independent H0 processes, no LLMP, no spool, no oracle
+binary=/root/achlys-t2-ab-7b2a40c/repo/target/release/examples/achlys_h0
+commit_of_binary=7b2a40c
+seconds=120
+trials=3
+groups=1 4 8
+pin=taskset -c i for process i
+corpus=single seed.json {"a":1}
+script=/root/achlys-t2-ceiling-h0/run_ceiling.sh
+start_utc=2026-08-17T20:55:00Z
+end_utc=2026-08-17T21:13:56Z
+cells=9/9 rc=0
+note=not a T2 accept

@@ -64,10 +64,23 @@ are no longer re-read. The remaining directory walk is recorded as
 bounded debt in
 [`docs/decisions/2026-08-17-t2-sync-scan-debt.md`](../../../decisions/2026-08-17-t2-sync-scan-debt.md).
 
+## Independent H0 ceiling (no spool, no LLMP)
+
+Nine cells, 120 s, `taskset -c i` per process. Binary from `7b2a40c`.
+See `h0-ceiling/results.tsv`.
+
+| Workers | Median sum exec/s | Median vs 1w |
+|---|---|---|
+| 1 | 768 079 | 1.00× |
+| 4 | 3 060 095 | 3.98× |
+| 8 | 4 593 914 | 5.98× |
+
+T2 A/B 8w optimized is 5.85×. The independent ceiling is ≈6× on this
+host. Achlys is within a few percent of uncoordinated H0. The leftover
+4→8 knee is mostly the machine / LibAFL, not the T2 control plane.
+
 ## Still required before any T2 accept
 
-- Independent H0/LibAFL ceiling (1/4/8 processes, no spool).
-- Hardened `7b2a40c` contracts (sync_every, join, stamp on replace,
-  bounded p95).
-- Final `T2_LADDER=1` on the hardened commit.
+- Final `T2_LADDER=1` on the hardened commit `e2431ab` (running on
+  the host under `/root/achlys-t2-final/`).
 - Human review. This file does not close the tranche.
