@@ -5,12 +5,13 @@
 //! generics are not object-safe. This module is the SimpleEventManager
 //! reference plus corpus-scan helpers used at sync points.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use std::time::UNIX_EPOCH;
 
 use achlys_bridge::{InfraError, Target};
 use achlys_protocol::InputId;
@@ -44,10 +45,32 @@ pub enum ScanMode {
     Rescan,
 }
 
+/// Identity of an on-disk corpus file. A same path with a new stamp is re-read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    mtime_secs: Option<u64>,
+    mtime_nanos: Option<u32>,
+}
+
+impl FileStamp {
+    fn from_meta(meta: &fs::Metadata) -> Self {
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok());
+        Self {
+            len: meta.len(),
+            mtime_secs: mtime.map(|d| d.as_secs()),
+            mtime_nanos: mtime.map(|d| d.subsec_nanos()),
+        }
+    }
+}
+
 /// Paths already inspected by [`scan_new_inputs`].
 #[derive(Debug, Default)]
 pub struct CorpusScanCursor {
-    seen_paths: HashSet<PathBuf>,
+    seen_paths: HashMap<PathBuf, FileStamp>,
     seen_ids: HashSet<InputId>,
 }
 
@@ -75,6 +98,9 @@ pub struct CorpusScanStats {
 /// Newly seen corpus objects plus the walk counters for one sync.
 pub type CorpusScanResult = (Vec<(InputId, Vec<u8>)>, CorpusScanStats);
 
+/// Cap on stored sync samples used for p95. Max is tracked separately.
+const SYNC_SAMPLE_CAP: usize = 512;
+
 /// Accumulated control-plane sync cost for one worker.
 #[derive(Debug, Default, Clone)]
 pub struct SyncMetrics {
@@ -95,7 +121,12 @@ impl SyncMetrics {
         if ns > self.ns_max {
             self.ns_max = ns;
         }
-        self.samples_ns.push(ns);
+        if self.samples_ns.len() < SYNC_SAMPLE_CAP {
+            self.samples_ns.push(ns);
+        } else {
+            let idx = (self.calls as usize - 1) % SYNC_SAMPLE_CAP;
+            self.samples_ns[idx] = ns;
+        }
         self.paths_listed = self.paths_listed.saturating_add(stats.paths_listed as u64);
         self.paths_read = self.paths_read.saturating_add(stats.paths_read as u64);
         self.bytes_read = self.bytes_read.saturating_add(stats.bytes_read);
@@ -115,6 +146,11 @@ impl SyncMetrics {
             .saturating_div(100)
             .min(xs.len() - 1);
         xs[idx]
+    }
+
+    #[must_use]
+    pub fn sample_len(&self) -> usize {
+        self.samples_ns.len()
     }
 }
 
@@ -137,6 +173,10 @@ pub fn list_corpus_files(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// New content-addressed inputs since `cursor` was last updated.
+///
+/// Incremental mode skips a path only when its size and mtime are unchanged.
+/// Listing the directory is still O(corpus); publishing via a LibAFL hook
+/// is the T3 follow-up (do not rescan to learn what this worker just wrote).
 pub fn scan_new_inputs(
     dir: &Path,
     cursor: &mut CorpusScanCursor,
@@ -149,18 +189,22 @@ pub fn scan_new_inputs(
     };
     let mut out = Vec::new();
     for path in files {
-        if mode == ScanMode::Incremental && cursor.seen_paths.contains(&path) {
+        let meta = fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+        let stamp = FileStamp::from_meta(&meta);
+        if mode == ScanMode::Incremental
+            && cursor.seen_paths.get(&path).is_some_and(|prev| *prev == stamp)
+        {
             continue;
         }
         let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
         stats.paths_read = stats.paths_read.saturating_add(1);
         stats.bytes_read = stats.bytes_read.saturating_add(bytes.len() as u64);
         if bytes.is_empty() {
-            cursor.seen_paths.insert(path);
+            cursor.seen_paths.insert(path, stamp);
             continue;
         }
         let id = InputId::from_bytes(&bytes);
-        cursor.seen_paths.insert(path);
+        cursor.seen_paths.insert(path, stamp);
         if cursor.seen_ids.insert(id) {
             stats.new_inputs = stats.new_inputs.saturating_add(1);
             out.push((id, bytes));
@@ -405,6 +449,14 @@ mod tests {
         let (second, second_stats) =
             scan_new_inputs(&tmp, &mut cursor, ScanMode::Incremental).unwrap();
         let (rescan, rescan_stats) = scan_new_inputs(&tmp, &mut cursor, ScanMode::Rescan).unwrap();
+        fs::write(tmp.join("a"), b"zzzzzz").unwrap();
+        let (replaced, replaced_stats) =
+            scan_new_inputs(&tmp, &mut cursor, ScanMode::Incremental).unwrap();
+        let mut reread = 0u64;
+        for _ in 0..32 {
+            let (_, s) = scan_new_inputs(&tmp, &mut cursor, ScanMode::Incremental).unwrap();
+            reread = reread.saturating_add(s.bytes_read);
+        }
         let _ = fs::remove_dir_all(&tmp);
         assert_eq!(first.len(), 1);
         assert_eq!(first_stats.paths_read, 2);
@@ -414,6 +466,9 @@ mod tests {
         assert!(rescan.is_empty());
         assert_eq!(rescan_stats.paths_read, 2);
         assert_eq!(rescan_stats.bytes_read, 10);
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced_stats.paths_read, 1);
+        assert_eq!(reread, 0, "immutable files must not be re-read");
     }
 
     #[test]
@@ -435,5 +490,10 @@ mod tests {
         assert_eq!(m.ns_max, 100);
         assert_eq!(m.p95_ns(), 100);
         assert_eq!(m.bytes_read, 20);
+        for ns in 0..600 {
+            m.record(ns, &CorpusScanStats::default(), 0);
+        }
+        assert_eq!(m.sample_len(), 512);
+        assert_eq!(m.calls, 605);
     }
 }

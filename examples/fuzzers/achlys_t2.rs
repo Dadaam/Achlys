@@ -109,6 +109,7 @@ struct Args {
     canonical_dir: Option<PathBuf>,
     pending_bound: usize,
     sync_every: u64,
+    sync_every_source: String,
     rescan: bool,
 }
 
@@ -218,15 +219,18 @@ fn parse_args() -> Args {
     if canonical_bin.is_some() && canonical_dir.is_some() {
         die("--canonical-bin and --canonical-dir are mutually exclusive");
     }
-    let sync_every = sync_every
-        .or_else(|| {
-            env::var("ACHLYS_T2_SYNC_EVERY")
-                .ok()
-                .and_then(|s| s.parse().ok())
-        })
-        .unwrap_or(achlys_core::DEFAULT_SYNC_EVERY);
+    let (sync_every, sync_every_source) = if let Some(value) = sync_every {
+        (value, "cli".to_string())
+    } else if let Ok(raw) = env::var("ACHLYS_T2_SYNC_EVERY") {
+        let value = raw
+            .parse()
+            .unwrap_or_else(|_| die("ACHLYS_T2_SYNC_EVERY must be u64"));
+        (value, "env".to_string())
+    } else {
+        (achlys_core::DEFAULT_SYNC_EVERY, "default".to_string())
+    };
     if sync_every == 0 {
-        die("--sync-every must be >= 1");
+        die("sync_every must be >= 1 (CLI --sync-every / ACHLYS_T2_SYNC_EVERY)");
     }
 
     Args {
@@ -246,6 +250,7 @@ fn parse_args() -> Args {
         canonical_dir,
         pending_bound,
         sync_every,
+        sync_every_source,
         rescan,
     }
 }
@@ -259,8 +264,9 @@ fn print_help() {
          [--join] [--role launcher|admit]\n\
          --canonical-dir must contain canonical + identity.json compiled for this target.\n\
          --join is offline continuation of a stopped campaign, not a live late join.\n\
-         --sync-every is the fuzz_loop_for(1) batch between spool syncs (default 256).\n\
-         --rescan re-reads every corpus file at each sync (A/B against incremental scan)."
+         --sync-every is the fuzz_loop_for(1) batch between spool syncs.\n\
+         Priority: --sync-every, then ACHLYS_T2_SYNC_EVERY, then 256. Zero is refused.\n\
+         --rescan or ACHLYS_T2_RESCAN=1 re-reads every corpus file (A/B only)."
     );
 }
 
@@ -927,6 +933,9 @@ fn run_launcher(args: Args) {
             canonical_build: Some(canonical.identity.clone()),
             sanitizer_build: None,
             started_unix_ms: unix_ms(),
+            sync_every: Some(args.sync_every),
+            sync_rescan: args.rescan,
+            sync_every_source: args.sync_every_source.clone(),
         };
         CampaignSession::begin(artifacts_dir(&args.out), &manifest, &record)
             .unwrap_or_else(|e| die(&format!("campaign begin: {e:#}")));

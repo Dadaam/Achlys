@@ -471,6 +471,9 @@ fn main() {
         canonical_build: Some(canonical.identity.clone()),
         sanitizer_build: Some(sanitizer.identity.clone()),
         started_unix_ms: unix_ms(),
+        sync_every: None,
+        sync_rescan: false,
+        sync_every_source: String::new(),
     };
 
     let session = CampaignSession::begin(&artifacts, &manifest, &record)

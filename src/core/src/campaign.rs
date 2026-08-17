@@ -161,6 +161,9 @@ mod tests {
             canonical_build: None,
             sanitizer_build: None,
             started_unix_ms: 0,
+            sync_every: None,
+            sync_rescan: false,
+            sync_every_source: String::new(),
         };
         let session = CampaignSession::begin(&out.0, &sample_target_manifest(), &record).unwrap();
 

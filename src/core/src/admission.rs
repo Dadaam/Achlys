@@ -699,6 +699,9 @@ mod tests {
             canonical_build: None,
             sanitizer_build: None,
             started_unix_ms: 0,
+            sync_every: None,
+            sync_rescan: false,
+            sync_every_source: String::new(),
         };
         store.write_campaign_record(&record).unwrap();
         (tmp, CorpusAuthority::new(store, bound))

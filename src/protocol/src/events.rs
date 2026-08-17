@@ -253,6 +253,15 @@ pub struct CampaignRecord {
     pub canonical_build: Option<BuildIdentity>,
     pub sanitizer_build: Option<BuildIdentity>,
     pub started_unix_ms: u64,
+    /// T2 spool sync batch (`fuzz_loop_for(1)` steps). Absent on T1 records.
+    #[serde(default)]
+    pub sync_every: Option<u64>,
+    /// T2 full-corpus reread at each sync. Absent/false on T1 records.
+    #[serde(default)]
+    pub sync_rescan: bool,
+    /// How `sync_every` was chosen: `cli`, `env`, or `default`.
+    #[serde(default)]
+    pub sync_every_source: String,
 }
 
 impl CampaignEvent {
@@ -326,6 +335,51 @@ mod tests {
         };
         let parsed = CampaignEvent::from_jsonl(&ev.to_jsonl().unwrap()).unwrap();
         assert!(matches!(parsed, CampaignEvent::CampaignStarted { .. }));
+    }
+
+    #[test]
+    fn t1_campaign_record_still_parses_without_sync_fields() {
+        let id = BuildIdentity::compute(BuildIdentityParts {
+            target_id: TargetId("t".into()),
+            kind: BuildKind::Fast,
+            compiler: "clang".into(),
+            flags: vec![],
+            source_hashes: BTreeMap::new(),
+            artifact_hash: None,
+        });
+        let record = CampaignRecord {
+            schema_version: CampaignEvent::SCHEMA_VERSION,
+            campaign_id: CampaignId::from_label("s"),
+            target_id: "t".into(),
+            label: "l".into(),
+            seed: 1,
+            max_iters: Some(1),
+            max_seconds: None,
+            max_input_len: 64,
+            timeout_ms: 1,
+            tool: "t".into(),
+            host: "h".into(),
+            rustc: "r".into(),
+            git: "g".into(),
+            git_dirty_tracked: 0,
+            git_untracked: 0,
+            fast_build: id,
+            canonical_build: None,
+            sanitizer_build: None,
+            started_unix_ms: 0,
+            sync_every: Some(256),
+            sync_rescan: true,
+            sync_every_source: "cli".into(),
+        };
+        let mut value = serde_json::to_value(&record).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("sync_every");
+        obj.remove("sync_rescan");
+        obj.remove("sync_every_source");
+        let parsed: CampaignRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.sync_every, None);
+        assert!(!parsed.sync_rescan);
+        assert!(parsed.sync_every_source.is_empty());
     }
 
     #[test]
