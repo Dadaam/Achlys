@@ -948,6 +948,9 @@ fn run_launcher(args: Args) {
     }
     .unwrap_or_else(|e| die(&format!("spool: {e:#}")));
     spool
+        .migrate_legacy()
+        .unwrap_or_else(|e| die(&format!("legacy spool recovery: {e:#}")));
+    spool
         .clear_stop()
         .unwrap_or_else(|e| die(&format!("clear STOP: {e:#}")));
 

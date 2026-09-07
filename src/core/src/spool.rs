@@ -10,10 +10,33 @@ use std::path::{Path, PathBuf};
 use achlys_protocol::{InputId, InputMetadata, WorkerId};
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::store::write_atomic;
+use crate::store::{write_atomic, write_once};
 
 /// Default bound on how many inbox records `take_inbox` returns per call.
 pub const DEFAULT_TAKE: usize = 64;
+
+/// One indivisible publication. The filename is the hash of `bytes`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CandidateRecord {
+    bytes: Vec<u8>,
+    meta: InputMetadata,
+}
+
+fn record_path(dir: &Path, id: &InputId) -> PathBuf {
+    dir.join(format!("{}.candidate", id.to_hex()))
+}
+
+fn publish_record(dir: &Path, bytes: &[u8], meta: &InputMetadata) -> Result<InputId> {
+    let id = InputId::from_bytes(bytes);
+    let mut meta = meta.clone();
+    meta.input_id = id;
+    let record = CandidateRecord {
+        bytes: bytes.to_vec(),
+        meta,
+    };
+    write_once(&record_path(dir, &id), &serde_json::to_vec(&record)?)?;
+    Ok(id)
+}
 
 /// On-disk worker registration written by a worker at start.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -90,20 +113,7 @@ impl CandidateSpool {
         if bytes.is_empty() {
             bail!("refusing to spool empty input");
         }
-        let id = InputId::from_bytes(bytes);
-        let mut meta = meta.clone();
-        meta.input_id = id;
-        let json = serde_json::to_vec_pretty(&meta).context("serialize spool metadata")?;
-        // Metadata first so a visible object file is never unpaired.
-        write_atomic(
-            &self.inbox_dir().join(format!("{}.json", id.to_hex())),
-            &json,
-        )?;
-        let bin = self.inbox_dir().join(id.to_hex());
-        if !bin.is_file() {
-            write_atomic(&bin, bytes)?;
-        }
-        Ok(id)
+        publish_record(&self.inbox_dir(), bytes, meta)
     }
 
     /// Move up to `max` inbox objects into `processing/` and return them.
@@ -118,10 +128,12 @@ impl CandidateSpool {
     }
 
     pub fn ack_processed(&self, id: &InputId) -> Result<()> {
-        let hex = id.to_hex();
-        let _ = fs::remove_file(self.processing_dir().join(&hex));
-        let _ = fs::remove_file(self.processing_dir().join(format!("{hex}.json")));
-        Ok(())
+        let path = record_path(&self.processing_dir(), id);
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).context("ack candidate"),
+        }
     }
 
     #[must_use]
@@ -140,19 +152,7 @@ impl CandidateSpool {
     }
 
     pub fn write_overflow(&self, bytes: &[u8], meta: &InputMetadata) -> Result<InputId> {
-        let id = InputId::from_bytes(bytes);
-        let bin = self.overflow_dir().join(id.to_hex());
-        if !bin.is_file() {
-            write_atomic(&bin, bytes)?;
-        }
-        let mut meta = meta.clone();
-        meta.input_id = id;
-        let json = serde_json::to_vec_pretty(&meta).context("serialize overflow metadata")?;
-        write_atomic(
-            &self.overflow_dir().join(format!("{}.json", id.to_hex())),
-            &json,
-        )?;
-        Ok(id)
+        publish_record(&self.overflow_dir(), bytes, meta)
     }
 
     pub fn take_overflow(&self, max: usize) -> Result<Vec<(InputId, Vec<u8>, InputMetadata)>> {
@@ -222,6 +222,39 @@ impl CandidateSpool {
         }
         out.sort_unstable_by_key(|(seq, _)| *seq);
         Ok(out)
+    }
+
+    /// Upgrade pre-closure pairs while no worker or authority is running.
+    /// Recovers a kill between the old object's and sidecar's separate moves.
+    pub fn migrate_legacy(&self) -> Result<usize> {
+        let dirs = [self.inbox_dir(), self.processing_dir(), self.overflow_dir()];
+        let mut migrated = 0;
+        for dir in &dirs {
+            for entry in fs::read_dir(dir)? {
+                let path = entry?.path();
+                let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let Ok(id) = name.parse::<InputId>() else {
+                    continue;
+                };
+                let sidecar = dirs
+                    .iter()
+                    .map(|d| d.join(format!("{name}.json")))
+                    .find(|p| p.is_file())
+                    .context("legacy candidate has no metadata")?;
+                let bytes = fs::read(&path)?;
+                let meta: InputMetadata = serde_json::from_slice(&fs::read(&sidecar)?)?;
+                if InputId::from_bytes(&bytes) != id {
+                    bail!("legacy candidate hash mismatch");
+                }
+                publish_record(&self.processing_dir(), &bytes, &meta)?;
+                fs::remove_file(&path)?;
+                fs::remove_file(&sidecar)?;
+                migrated += 1;
+            }
+        }
+        Ok(migrated)
     }
 
     pub fn write_stop(&self) -> Result<()> {
@@ -361,22 +394,32 @@ impl CandidateSpool {
     }
 }
 
-fn dir_has_worker(dir: &Path, worker: WorkerId) -> Result<bool> {
-    if !dir.is_dir() {
-        return Ok(false);
-    }
+fn candidate_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
     for entry in fs::read_dir(dir).with_context(|| format!("list {}", dir.display()))? {
-        let entry = entry.with_context(|| format!("read {}", dir.display()))?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
+        let path = entry?.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("candidate") {
+            out.push(path);
         }
-        let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let meta: InputMetadata = match serde_json::from_str(&text) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if meta.worker_id == Some(worker) {
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn read_record(path: &Path) -> Result<CandidateRecord> {
+    let record: CandidateRecord = serde_json::from_slice(&fs::read(path)?)
+        .with_context(|| format!("decode candidate {}", path.display()))?;
+    let id = InputId::from_bytes(&record.bytes);
+    if record.meta.input_id != id || path.file_stem().and_then(|s| s.to_str()) != Some(&id.to_hex())
+    {
+        bail!("candidate content hash mismatch: {}", path.display());
+    }
+    Ok(record)
+}
+
+fn dir_has_worker(dir: &Path, worker: WorkerId) -> Result<bool> {
+    for path in candidate_files(dir)? {
+        if read_record(&path)?.meta.worker_id == Some(worker) {
             return Ok(true);
         }
     }
@@ -384,26 +427,8 @@ fn dir_has_worker(dir: &Path, worker: WorkerId) -> Result<bool> {
 }
 
 fn count_pairs(dir: &Path) -> usize {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return 0;
-    };
-    let mut n = 0usize;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("json") {
-            continue;
-        }
-        if !path.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if name.parse::<InputId>().is_ok() && dir.join(format!("{name}.json")).is_file() {
-            n += 1;
-        }
-    }
-    n
+    // An unreadable spool must never look drained.
+    candidate_files(dir).map(|v| v.len()).unwrap_or(usize::MAX)
 }
 
 fn take_from_dir(
@@ -411,57 +436,20 @@ fn take_from_dir(
     dest: &Path,
     max: usize,
 ) -> Result<Vec<(InputId, Vec<u8>, InputMetadata)>> {
-    fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
-    if !src.is_dir() {
-        return Ok(Vec::new());
-    }
-    let mut ids = Vec::new();
-    for entry in fs::read_dir(src).with_context(|| format!("list {}", src.display()))? {
-        let entry = entry.with_context(|| format!("read {}", src.display()))?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("json") {
-            continue;
-        }
-        if !path.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if let Ok(id) = name.parse::<InputId>() {
-            ids.push(id);
-        }
-        if ids.len() >= max {
-            break;
-        }
-    }
-    ids.sort_unstable();
+    fs::create_dir_all(dest)?;
     let mut out = Vec::new();
-    for id in ids {
-        let hex = id.to_hex();
-        let src_bin = src.join(&hex);
-        let src_meta = src.join(format!("{hex}.json"));
-        if !src_bin.is_file() {
-            continue;
-        }
-        if !src_meta.is_file() {
-            // Writer has not finished the pair yet.
-            continue;
-        }
-        let bytes = fs::read(&src_bin).with_context(|| format!("read {}", src_bin.display()))?;
-        let text = fs::read_to_string(&src_meta)
-            .with_context(|| format!("read {}", src_meta.display()))?;
-        let meta =
-            serde_json::from_str(&text).with_context(|| format!("parse {}", src_meta.display()))?;
+    for path in candidate_files(src)?.into_iter().take(max) {
+        let record = read_record(&path)?;
         if src != dest {
-            let dest_bin = dest.join(&hex);
-            let dest_meta = dest.join(format!("{hex}.json"));
-            move_or_copy(&src_bin, &dest_bin)?;
-            if src_meta.is_file() {
-                move_or_copy(&src_meta, &dest_meta)?;
+            let target = record_path(dest, &record.meta.input_id);
+            // If a duplicate is already in processing, retain its first provenance.
+            if target.is_file() {
+                fs::remove_file(&path)?;
+                continue;
             }
+            fs::rename(&path, &target).context("claim indivisible candidate")?;
         }
-        out.push((id, bytes, meta));
+        out.push((record.meta.input_id, record.bytes, record.meta));
     }
     Ok(out)
 }
@@ -649,6 +637,48 @@ mod tests {
         assert_eq!(spool.inbox_len(), 0);
         spool.ack_processed(&id).unwrap();
         assert_eq!(spool.processing_len(), 0);
+    }
+
+    #[test]
+    fn duplicate_publication_preserves_first_origin() {
+        let tmp = TempDir::new("spool_origin");
+        let spool = CandidateSpool::create(tmp.0.join("spool")).unwrap();
+        let first = meta(b"seed");
+        let mut second = first.clone();
+        second.worker_id = Some(WorkerId::from_slot(1));
+        spool.push(b"seed", &first).unwrap();
+        spool.push(b"seed", &second).unwrap();
+        assert_eq!(spool.take_inbox(1).unwrap()[0].2, first);
+    }
+
+    #[test]
+    fn legacy_split_pair_recovers_after_interrupted_claim() {
+        let tmp = TempDir::new("spool_split");
+        let spool = CandidateSpool::create(tmp.0.join("spool")).unwrap();
+        let m = meta(b"seed");
+        fs::write(spool.processing_dir().join(m.input_id.to_hex()), b"seed").unwrap();
+        fs::write(
+            spool.inbox_dir().join(format!("{}.json", m.input_id)),
+            serde_json::to_vec(&m).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(spool.migrate_legacy().unwrap(), 1);
+        let got = spool.take_processing(1).unwrap();
+        assert_eq!(got[0].1, b"seed");
+        spool.ack_processed(&m.input_id).unwrap();
+        assert!(!spool.has_pending_for(m.worker_id.unwrap()).unwrap());
+    }
+
+    #[test]
+    fn corrupted_candidate_fails_before_admission() {
+        let tmp = TempDir::new("spool_corrupt");
+        let spool = CandidateSpool::create(tmp.0.join("spool")).unwrap();
+        let id = spool.push(b"seed", &meta(b"seed")).unwrap();
+        let path = record_path(&spool.inbox_dir(), &id);
+        let mut record = read_record(&path).unwrap();
+        record.bytes.push(1);
+        fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(spool.take_inbox(1).is_err());
     }
 
     #[test]
