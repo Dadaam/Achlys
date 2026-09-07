@@ -192,7 +192,10 @@ pub fn scan_new_inputs(
         let meta = fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
         let stamp = FileStamp::from_meta(&meta);
         if mode == ScanMode::Incremental
-            && cursor.seen_paths.get(&path).is_some_and(|prev| *prev == stamp)
+            && cursor
+                .seen_paths
+                .get(&path)
+                .is_some_and(|prev| *prev == stamp)
         {
             continue;
         }
