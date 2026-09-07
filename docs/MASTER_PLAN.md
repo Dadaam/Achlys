@@ -2,8 +2,18 @@
 
 Status: authoritative design document  
 Audience: future implementation and review agents  
-Last architecture review: 2026-08-16  
+Last architecture and sequencing review: 2026-09-04
+
 Scope: research vision, target architecture, build order, evaluation protocol, and acceptance gates
+
+Current execution status: **T2 open, not accepted; implementation paused at the owner’s request.**
+
+The detailed [4 September plan](plans/2026-09-04-t2-and-research-roadmap.md)
+records observed behavior, local changes, confidence, unresolved questions,
+T2 work packages and the proposed research sequence. It is part of this plan.
+Its current-status and T2 acceptance clarifications supersede older ambiguous
+wording; historical decision and evidence files remain historical records.
+This revision updates planning only. Describing future work does not start it.
 
 ## 1. Purpose of this document
 
@@ -21,6 +31,11 @@ Future agents must follow these rules:
 6. Do not add AI, symbolic execution, network targets, distributed execution, or UI work merely because they appear in the long-term design.
 7. Prefer deleting or disabling a strategy that fails its evaluation gate over protecting the original vision.
 8. Treat a negative experimental result as a valid research result.
+
+An experimental usable release can precede adaptation, concolic execution and ML.
+The distribution milestone and the scientific success ladder are distinct; see
+the detailed plan §8. No new capability is a prerequisite merely because it is
+listed in the long-term portfolio.
 
 The project succeeds only if it produces defensible evidence that Achlys is competitive with strong baselines under equal resources. A large feature list is not success.
 
@@ -65,7 +80,7 @@ Initial gate:
 
 - no more than 5% orchestration overhead relative to the same LibAFL worker loop without orchestration;
 - no central lock or message on the per-execution hot path;
-- no unbounded corpus or event growth;
+- explicit disk and memory budgets, including corpus, events and pending transport;
 - persistent or in-process execution where the target permits it.
 
 ### 3.2 Search efficiency
@@ -526,14 +541,19 @@ struct CandidateDiscovered {
     parent_ids: Vec<InputId>,
     producing_strategy: StrategyId,
     producer_build: BuildId,
-    local_coverage_digest: CoverageDigest,
-    local_delta_count: u32,
-    execution_ns: u64,
-    generation_ns: u64,
+    local_coverage_digest: Option<CoverageDigest>,
+    local_delta_count: Option<u32>,
+    execution_ns: Option<u64>,
+    generation_ns: Option<u64>,
     provenance: MutationProvenance,
     attachments: Vec<AttachmentRef>,
 }
 ```
+
+This is a proposed schema, not a claim about the current Rust types. Missing
+measurements must be explicit; zero is a measured value, not a substitute for
+unknown. A canonical delta is not a local delta. Any wire-format change needs
+compatibility tests and an explicit migration policy.
 
 The orchestrator responds with an admission result after canonical replay.
 
@@ -654,6 +674,12 @@ Local corpora may temporarily contain candidates rejected by the canonical autho
 5. Metadata and provenance are committed.
 6. A corpus delta is broadcast selectively.
 7. Crash-like behavior is queued for sanitizer replay.
+
+T2 implements a narrower transport contract: live homogeneous novelty sharing
+uses LLMP, while canonical admission produces durable measurement and offline
+snapshots. `--join` continues a stopped campaign; it does not attach to a running
+broker. Selective canonical delivery across heterogeneous roles is future T3/T4
+work and must not be inferred from the presence of delta files.
 
 ### 13.4 Corpus minimization
 
@@ -1092,25 +1118,57 @@ Exit gate:
 
 ### Tranche 2: homogeneous multi-worker substrate
 
-Goal: scale the proven worker across cores without changing strategy.
+Goal: run the proven havoc worker across local cores with trustworthy sharing,
+measurement, persistence and bounded failure behavior. **Open, not accepted.**
 
-Tasks:
+The owner requested a planning-only update on 2026-09-04. Corrections already
+made are recorded separately from missing validation in the
+[detailed T2 plan](plans/2026-09-04-t2-and-research-roadmap.md#6-ordre-de-travail-jusquà-la-clôture).
+The latest local implementation under review is `0688c60`; compile success is
+not evidence of successful process recovery or of performance parity.
 
-1. Add LLMP broker and launcher integration.
-2. Define `achlys-protocol` identifiers and versioning.
-3. Run multiple havoc workers with local corpora.
-4. Implement authoritative candidate admission and corpus deltas.
-5. Add content-addressed storage and provenance.
-6. Add bounded queues, idempotency, restart, and late worker join.
-7. Measure scaling from 1 to 2, 4, 8, and available higher core counts.
+Required work packages, in dependency order:
+
+| Package | Contract |
+|---|---|
+| T2-A | Reproducible checkout, toolchain, environment and baseline gates. |
+| T2-B | Indivisible candidate publication, idempotent persistence and recovery, explicit corruption handling. |
+| T2-C | Real worker restart, original budget, bounded supervision and exclusive campaign ownership. |
+| T2-D | Local discovery provenance, honest missing measurements and bounded transport under load. |
+| T2-E | Exact replay input contract, bounded delivery/output, target and infrastructure outcome classification. |
+| T2-F | T2 crash verification with preserved artifacts and reconstructible counts. |
+| T2-G | Workspace and H0/T1/T2 integration gates; reliable metrics and retired-flag semantics. |
+| T2-H | Frozen Linux ladder plus equal-budget independent H0 controls and raw evidence. |
+| T2-I | Explicit acceptance, correction, inconclusive result or rejection decision. |
 
 Exit gate:
 
-- near-linear useful scaling until target or host saturation;
-- no corpus corruption or duplicate explosion;
-- worker crash and restart do not lose accepted corpus entries;
-- coordinator overhead is measured and within the H0 budget;
-- global results can be reconstructed from event logs.
+- no accepted-object loss, corruption or duplicate decision explosion under the
+  declared process-failure model;
+- actual worker crash/restart and offline continuation tests, including a new
+  worker loading the accepted snapshot;
+- pending transport, process lifetimes and campaign storage governed by explicit
+  bounds, with recoverable failure instead of silent candidate drops;
+- exact input bytes and truthful canonical/crash classification;
+- complete reconstruction of published results from persisted evidence;
+- final format, Clippy, workspace and H0/T1/T2 functional gates;
+- Linux 1/2/4/8 workers up to supported resources, five 300-second trials per
+  cell, with failures, source SHA, artifacts and environment retained;
+- H0 overhead within 5%, with the same 5% budget applied to the T2 overhead
+  comparison against independent H0 under equal total resources, including the
+  control plane; inconclusive measurements require a decision, not a waiver;
+- scaling assessed against the independent host ceiling, with throughput and
+  search progress reported separately. A result near the threshold with
+  insufficient precision is inconclusive, not automatically accepted.
+
+The old phrase “near-linear useful scaling” is not a separate unspecified
+numeric gate. The detailed protocol defines denominators, pairing, timing and
+host limits. A shared Linux VM provides development evidence; it does not by
+itself support a controlled public scaling claim.
+
+`--join` is offline continuation, not live attachment. Process-crash durability
+does not imply power-loss or network-filesystem durability. T2 does not include
+heterogeneous strategies, assistance leases, adaptive allocation or ML.
 
 ### Tranche 3: static heterogeneous portfolio
 
@@ -1243,22 +1301,27 @@ Exit gate:
 
 ## 23. Immediate pull-request sequence
 
-Future agents should prefer small reviewable changes in this order:
+The former bootstrap list described the path to H0/T1 and the initial T2
+implementation. Do not restart that work from scratch. The active sequence is
+the T2-A through T2-I plan above, with exact observations, risks, alternatives,
+test cases and exit criteria in the
+[detailed roadmap](plans/2026-09-04-t2-and-research-roadmap.md).
 
-1. `build: restore clean-clone workspace and CI`
-2. `docs: align public claims with implemented behavior`
-3. `core: introduce explicit execution and infrastructure outcomes`
-4. `bridge: add real in-process persistent target contract`
-5. `corpus: replace unbounded blackbox corpus behavior`
-6. `eval: add deterministic micro-target suite`
-7. `campaign: add manifest and artifact identities`
-8. `coverage: add canonical replay authority`
-9. `crash: add sanitizer verification pipeline`
-10. `worker: establish measured single-worker baseline`
-11. `protocol: add versioned IDs and discovery events`
-12. `multi: add LLMP homogeneous workers`
+Before resuming code, inspect local commits `bbc3222`, `8d7f4d4`, `1e229c1`
+and `0688c60`; their changes are not yet a validated T2 release. The replay-input
+draft was set aside rather than adopted as a finished design. The roadmap
+records how it was preserved and why its fixed size limit needs reconsideration.
 
-Do not combine repository restructuring, execution redesign, ML changes, and scheduler changes in one pull request.
+Prefer atomic changes to persistence, lifecycle, publication/provenance, replay
+contracts, crash verification, validation tooling, evidence and the acceptance
+record. Do not mix these with ML, general repository restructuring or a new
+scheduler. Do not run the final benchmark while its implementation changes.
+
+After T2 acceptance, a separate scoped decision may open a thin usable CLI and
+reproduction milestone. T3 research still starts by testing a static portfolio;
+T4 tests minimal typed assistance before richer capsules; T5 evaluates allocation
+against a static policy selected on development data, not a hindsight oracle.
+The extended portfolio is conditional, not the immediate PR backlog.
 
 ## 24. Anti-patterns and forbidden shortcuts
 
@@ -1439,23 +1502,32 @@ The intended research identity is:
 
 > Achlys organizes temporary teams around concrete exploration frontiers. Workers exchange typed challenge capsules and reusable knowledge artifacts, not only seeds. The orchestrator learns from both successful and failed assistance, controls when discoveries diffuse between worker islands, and can synthesize validated low-cost mutation skills from runtime evidence.
 
-The ideas below are research bets, not established claims. “Novelty confidence” means that the initial review did not find an exact equivalent combining the same mechanism and scope. It is not a substitute for a systematic literature review or patent review before publication.
+The ideas below are research bets, not established claims. Novelty is
+**unestablished** for every bet until a current mechanism-level literature and
+artifact review is recorded. The older qualitative confidence ratings must not
+be treated as evidence that prior art is absent. Expected value and engineering
+risk are subjective planning judgments, not experimental results.
+
+The [September prioritization](plans/2026-09-04-t2-and-research-roadmap.md#10-portefeuille-des-paris--priorités-et-doutes)
+favors a minimal capsule, one reusable artifact type and narrowly scoped failure
+memory. Teams, adaptive diffusion, scouts, synthesis and cross-campaign priors
+remain conditional follow-up experiments.
 
 ### 30.1 Ranked portfolio
 
-| Bet | Expected value | Engineering risk | Novelty confidence | Earliest tranche |
+| Bet | Expected value | Engineering risk | Novelty evidence | Earliest tranche |
 |---|---:|---:|---:|---:|
-| Frontier Capsules | Very high | Medium | Medium-high | 4 |
-| Knowledge Artifacts | Very high | Medium-high | High | 4 |
-| Failure Memory | High | Low-medium | Medium-high | 4 |
-| Frontier Teams | High | Medium-high | Medium-high | 5 |
-| Adaptive Diffusion | High | Medium | Medium | 5 |
-| Constraint Contracts | High | High | High | 6 |
-| Active Probing Worker | Medium-high | High | Medium | 6 |
-| Scout Tournaments | Medium-high | Medium | Medium | 5 |
-| Sandboxed Mutation Skill Synthesis | Very high if successful | Very high | Medium-high | 7 |
-| Cross-campaign Capability Prior | Medium-high | High | Medium | 7 or later |
-| Shadow Policy Laboratory | Medium | High | Medium-high | 5 or later |
+| Frontier Capsules | Very high | Medium | Unestablished | 4 |
+| Knowledge Artifacts | Very high | Medium-high | Unestablished | 4 |
+| Failure Memory | High | Low-medium | Unestablished | 4 |
+| Frontier Teams | High | Medium-high | Unestablished | 5 |
+| Adaptive Diffusion | High | Medium | Unestablished | 5 |
+| Constraint Contracts | High | High | Unestablished | 6 |
+| Active Probing Worker | Medium-high | High | Unestablished | 6 |
+| Scout Tournaments | Medium-high | Medium | Unestablished | 5 |
+| Sandboxed Mutation Skill Synthesis | Very high if successful | Very high | Unestablished | 7 |
+| Cross-campaign Capability Prior | Medium-high | High | Unestablished | 7 or later |
+| Shadow Policy Laboratory | Medium | High | Unestablished | 5 or later |
 
 The first three should influence protocol design even before they are fully implemented. The ML-related bets must not delay the non-ML system.
 
@@ -1975,7 +2047,9 @@ This can reduce the number of obviously bad policies promoted to expensive exper
 
 ### 30.13 The flagship composition
 
-The most coherent long-term Achlys contribution is not any single bet. It is the following loop:
+This is a possible long-term composition, not a prerequisite for the first
+release and not one experiment to implement all at once. Each component must
+first survive its own baseline and ablation. The possible loop is:
 
 ```text
 1. Independent workers explore locally.

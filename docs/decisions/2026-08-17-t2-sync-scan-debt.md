@@ -19,3 +19,14 @@ Required follow-up, not a T2 close:
 
 Until that lands, `--sync-every` (default 256) is the load-bearing
 mitigation. `--rescan` remains an A/B control only.
+
+## 2026-09-04 planning update
+
+Local commit `0688c60` replaces the periodic worker-corpus scan with publication
+on local admission. This supersedes the implementation choice above on the
+current local branch, but it has not passed live-restart, integration or final
+performance validation. The spool quota implementation still scans pending
+records; zero worker-corpus scans must not be described as zero filesystem work.
+The [detailed T2-D plan](../plans/2026-09-04-t2-and-research-roadmap.md)
+records provenance, metrics and load tests required before acceptance.
+Implementation is paused at the owner's request.

@@ -1,6 +1,14 @@
 # T2 closure protocol
 
-Status: implementation in progress; not an acceptance record.
+Status: implementation paused by the owner; planning revision only; not an
+acceptance record.
+
+The later 2026-09-04 instruction requests only a detailed plan. The
+[updated roadmap](../plans/2026-09-04-t2-and-research-roadmap.md) is the operational
+specification: it records completed local changes, unvalidated drafts,
+observations, hypotheses, alternatives and remaining evidence. It supersedes
+ambiguous or underspecified points in this initial closure protocol. No final
+ladder or live-restart acceptance is claimed.
 
 The owner authorized autonomous completion of T2 on 2026-09-04, including
 plan adjustments and atomic commits. T3 remains outside this change.
