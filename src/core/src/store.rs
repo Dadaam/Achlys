@@ -146,15 +146,17 @@ impl CampaignStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         }
-        let line = ev.to_jsonl().context("serialize campaign event")?;
+        let mut line = ev.to_jsonl().context("serialize campaign event")?;
+        line.push('\n');
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?;
-        writeln!(file, "{line}").with_context(|| format!("append {}", path.display()))?;
-        file.flush()
-            .with_context(|| format!("flush {}", path.display()))?;
+        file.write_all(line.as_bytes())
+            .with_context(|| format!("append {}", path.display()))?;
+        file.sync_data()
+            .with_context(|| format!("sync {}", path.display()))?;
         Ok(())
     }
 
@@ -210,14 +212,25 @@ impl CampaignStore {
         self.campaign_id
     }
 
-    /// Parse every non-empty JSONL line. Malformed lines are errors.
+    /// Recover only an interrupted final append. Committed malformed lines
+    /// remain errors. Called only while the campaign has a single writer.
     pub fn read_events(&self) -> Result<Vec<CampaignEvent>> {
         let path = self.root.join("events").join("events.jsonl");
         if !path.is_file() {
             return Ok(Vec::new());
         }
-        let text =
-            fs::read_to_string(&path).with_context(|| format!("read events {}", path.display()))?;
+        let mut bytes =
+            fs::read(&path).with_context(|| format!("read events {}", path.display()))?;
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+            let committed = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            // Keep the interrupted tail for diagnosis before truncating it.
+            write_atomic(&path.with_extension("interrupted"), &bytes[committed..])?;
+            let file = OpenOptions::new().write(true).open(&path)?;
+            file.set_len(committed as u64)?;
+            file.sync_data()?;
+            bytes.truncate(committed);
+        }
+        let text = std::str::from_utf8(&bytes).context("committed event log is not UTF-8")?;
         let mut out = Vec::new();
         for (idx, line) in text.lines().enumerate() {
             if line.is_empty() {
@@ -288,12 +301,36 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
         std::process::id(),
         TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::write(&tmp, data).with_context(|| format!("write {}", tmp.display()))?;
+    let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    file.write_all(data)
+        .with_context(|| format!("write {}", tmp.display()))?;
+    file.sync_data()?;
     if let Err(err) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(err).with_context(|| format!("rename {} -> {}", tmp.display(), path.display()));
     }
     Ok(())
+}
+
+/// Publish an immutable object without replacing the first producer's record.
+pub(crate) fn write_once(path: &Path, data: &[u8]) -> Result<()> {
+    let parent = path.parent().context("object has no parent")?;
+    fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(
+        ".publish-{}-{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    file.write_all(data)?;
+    file.sync_data()?;
+    let result = fs::hard_link(&tmp, path);
+    fs::remove_file(&tmp)?;
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e).context("publish immutable object"),
+    }
 }
 
 fn read_dirs(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -509,6 +546,23 @@ mod tests {
             }
         }
         assert_eq!(stored, 2, "InputStored only on first insert");
+    }
+
+    #[test]
+    fn interrupted_tail_is_recovered_without_hiding_committed_corruption() {
+        let (_tmp, store) = open_store("journal_tail");
+        store
+            .put_input(b"seed", test_meta(store.campaign_id()))
+            .unwrap();
+        let path = store.root().join("events/events.jsonl");
+        let original = fs::read(&path).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"type\":\"can\xff").unwrap();
+        assert_eq!(store.read_events().unwrap().len(), 1);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(path.with_extension("interrupted").is_file());
+        file.write_all(b"not-json\n").unwrap();
+        assert!(store.read_events().is_err());
     }
 
     #[test]
