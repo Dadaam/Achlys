@@ -91,7 +91,7 @@ impl CampaignStore {
     }
 
     /// Store `bytes` under [`InputId::from_bytes`]. Idempotent: the object file
-    /// is written only when missing. Metadata JSON is always rewritten.
+    /// and first-producer metadata are written only when missing.
     /// [`CampaignEvent::InputStored`] is appended only on first insert.
     pub fn put_input(&self, bytes: &[u8], mut meta: InputMetadata) -> Result<InputId> {
         let id = InputId::from_bytes(bytes);
@@ -108,7 +108,7 @@ impl CampaignStore {
             .join("metadata")
             .join(format!("{}.json", id.to_hex()));
         let meta_json = serde_json::to_vec_pretty(&meta).context("serialize input metadata")?;
-        write_atomic(&meta_path, &meta_json)?;
+        write_once(&meta_path, &meta_json)?;
 
         if first {
             self.append_event(&CampaignEvent::InputStored {
@@ -123,7 +123,12 @@ impl CampaignStore {
 
     pub fn get_input(&self, id: &InputId) -> Result<Vec<u8>> {
         let path = self.input_object_path(id);
-        fs::read(&path).with_context(|| format!("read input {id} from {}", path.display()))
+        let bytes =
+            fs::read(&path).with_context(|| format!("read input {id} from {}", path.display()))?;
+        if InputId::from_bytes(&bytes) != *id {
+            bail!("stored input hash mismatch: {id}");
+        }
+        Ok(bytes)
     }
 
     pub fn put_crash(&self, bytes: &[u8]) -> Result<InputId> {
@@ -508,6 +513,35 @@ mod tests {
         assert_eq!(id1, id2);
         assert_eq!(id1, InputId::from_bytes(b"seed"));
         assert_eq!(count_corpus_objects(store.root()), 1);
+    }
+
+    #[test]
+    fn duplicate_preserves_origin_and_corrupt_object_fails() {
+        let (_tmp, store) = open_store("immutable_origin");
+        let first = test_meta(store.campaign_id());
+        let id = store.put_input(b"seed", first.clone()).unwrap();
+        let mut second = first;
+        second.producer = "different".into();
+        store.put_input(b"seed", second).unwrap();
+        let meta: InputMetadata = serde_json::from_slice(
+            &fs::read(
+                store
+                    .root()
+                    .join("corpus/metadata")
+                    .join(format!("{}.json", id.to_hex())),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta.producer, "test");
+        fs::write(store.input_object_path(&id), b"corrupt").unwrap();
+        assert!(
+            store
+                .get_input(&id)
+                .unwrap_err()
+                .to_string()
+                .contains("hash mismatch")
+        );
     }
 
     #[test]

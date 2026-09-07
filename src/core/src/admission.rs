@@ -86,6 +86,7 @@ pub struct CorpusAuthority {
     admitted: HashSet<InputId>,
     rejected: HashSet<InputId>,
     pending_bound: usize,
+    recovery_scan_needed: bool,
     next_delta_seq: u64,
     /// Next authority-assigned event_seq per worker (journal order).
     next_event_seq: HashMap<WorkerId, u64>,
@@ -106,6 +107,7 @@ impl CorpusAuthority {
             admitted: HashSet::new(),
             rejected: HashSet::new(),
             pending_bound: pending_bound.max(1),
+            recovery_scan_needed: false,
             next_delta_seq: 1,
             next_event_seq: HashMap::new(),
             seen_notices: HashMap::new(),
@@ -130,14 +132,31 @@ impl CorpusAuthority {
             auth.next_event_seq
                 .insert(worker_id, rec.last_seq.saturating_add(1));
         }
-        for id in auth.store.list_inputs()? {
-            auth.seen.insert(id);
-            if auth.admitted.contains(&id) || auth.rejected.contains(&id) {
+        auth.recovery_scan_needed = true;
+        auth.refill_recovery()?;
+        Ok(auth)
+    }
+
+    // Only used after recovery. Keep the replay queue bounded; excess
+    // persisted objects remain on disk until a later drain has room.
+    fn refill_recovery(&mut self) -> Result<()> {
+        if !self.recovery_scan_needed {
+            return Ok(());
+        }
+        for id in self.store.list_inputs()? {
+            self.seen.insert(id);
+            if self.admitted.contains(&id)
+                || self.rejected.contains(&id)
+                || self.pending_set.contains(&id)
+            {
                 continue;
             }
-            auth.enqueue(id);
+            if !self.enqueue(id) {
+                return Ok(());
+            }
         }
-        Ok(auth)
+        self.recovery_scan_needed = false;
+        Ok(())
     }
 
     #[must_use]
@@ -221,6 +240,7 @@ impl CorpusAuthority {
     /// Replay at most `max` pending inputs. Writes one `CorpusDelta` per
     /// non-empty admit batch.
     pub fn drain<O: AdmitOracle>(&mut self, oracle: &mut O, max: usize) -> Result<DrainStats> {
+        self.refill_recovery()?;
         let mut stats = DrainStats {
             queue_full: self.queue_full as usize,
             ..DrainStats::default()
@@ -757,6 +777,26 @@ mod tests {
 
         let stats2 = auth.drain(&mut oracle, 16).unwrap();
         assert_eq!(stats2.replayed, 0);
+    }
+
+    #[test]
+    fn recovery_replays_every_object_beyond_queue_bound() {
+        let (tmp, auth) = open_auth("bounded_recovery", 1);
+        for n in 1..=9u8 {
+            let c = cand(&[n], 0, u64::from(n));
+            auth.store().put_input(&c.bytes, c.meta).unwrap();
+        }
+        let campaign = auth.store().campaign_id();
+        drop(auth);
+        let store = CampaignStore::open(&tmp.0, campaign).unwrap();
+        let mut restored = CorpusAuthority::reconstruct(store, 1).unwrap();
+        let mut oracle = FakeOracle::new();
+        let mut count = 0;
+        for _ in 0..12 {
+            assert!(restored.pending_len() <= 1);
+            count += restored.drain(&mut oracle, 1).unwrap().replayed;
+        }
+        assert_eq!(count, 9);
     }
 
     #[test]

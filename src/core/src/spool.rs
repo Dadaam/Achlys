@@ -113,7 +113,48 @@ impl CandidateSpool {
         if bytes.is_empty() {
             bail!("refusing to spool empty input");
         }
-        publish_record(&self.inbox_dir(), bytes, meta)
+        // Serialize producers only on discoveries, never on executions.
+        // File locks are released by the kernel if a producer dies.
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.root.join("publication.lock"))?;
+        lock.lock().context("lock candidate publication")?;
+        let id = InputId::from_bytes(bytes);
+        if record_path(&self.inbox_dir(), &id).is_file() {
+            return Ok(id);
+        }
+        const MAX_RECORDS: usize = 16_384;
+        const MAX_BYTES: u64 = 128 * 1024 * 1024;
+        let mut count = 0;
+        let mut size = 0u64;
+        for dir in [self.inbox_dir(), self.processing_dir(), self.overflow_dir()] {
+            for path in candidate_files(&dir)? {
+                match fs::metadata(path) {
+                    Ok(m) => {
+                        count += 1;
+                        size = size.saturating_add(m.len());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e).context("measure pending spool"),
+                }
+            }
+        }
+        let mut published_meta = meta.clone();
+        published_meta.input_id = id;
+        let encoded = serde_json::to_vec(&CandidateRecord {
+            bytes: bytes.to_vec(),
+            meta: published_meta,
+        })?;
+        let reservation = encoded.len() as u64;
+        if count >= MAX_RECORDS || size.saturating_add(reservation) > MAX_BYTES {
+            bail!(
+                "candidate spool quota exceeded (16384 records / 128 MiB); authority is not keeping up"
+            );
+        }
+        write_once(&record_path(&self.inbox_dir(), &id), &encoded)?;
+        Ok(id)
     }
 
     /// Move up to `max` inbox objects into `processing/` and return them.
