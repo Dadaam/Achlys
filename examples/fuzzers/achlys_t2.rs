@@ -3,6 +3,7 @@
 //! Control plane (admit + DumpOracle + CampaignStore) is a separate process.
 //! Workers do not call the oracle on the hot path.
 
+use std::borrow::Cow;
 use std::env;
 use std::fs;
 use std::num::NonZero;
@@ -18,8 +19,8 @@ use achlys_bridge::{
     CoverageMap, DumpOracle, InProcessTarget, Target, WorkerTarget, compile_canonical,
 };
 use achlys_core::{
-    CampaignSession, CandidateSpool, CorpusAuthority, CorpusScanCursor, FuzzerConfig, ScanMode,
-    SyncMetrics, WorkerExit, WorkerRegistration, WorkerResume, scan_new_inputs,
+    CampaignSession, CandidateSpool, CorpusAuthority, FuzzerConfig, WorkerExit, WorkerRegistration,
+    WorkerResume,
 };
 use achlys_protocol::{
     BuildIdentity, BuildKind, CampaignEvent, CampaignId, CampaignRecord, InputId, InputMetadata,
@@ -27,7 +28,8 @@ use achlys_protocol::{
 };
 use anyhow::{Context, Result, anyhow};
 use libafl::{
-    corpus::{Corpus, InMemoryOnDiskCorpus, OnDiskCorpus},
+    HasMetadata,
+    corpus::{Corpus, CorpusId, InMemoryOnDiskCorpus, OnDiskCorpus},
     events::{EventConfig, Launcher, LlmpRestartingEventManager, SendExiting},
     executors::{ExitKind, inprocess::InProcessExecutor},
     feedback_or_fast,
@@ -36,14 +38,16 @@ use libafl::{
     generators::RandBytesGenerator,
     inputs::{BytesInput, HasTargetBytes},
     monitors::NopMonitor,
-    mutators::{havoc_mutations::havoc_mutations, scheduled::HavocScheduledMutator},
+    mutators::{
+        MutationResult, Mutator, havoc_mutations::havoc_mutations, scheduled::HavocScheduledMutator,
+    },
     observers::{HitcountsMapObserver, StdMapObserver},
     schedulers::QueueScheduler,
     stages::mutational::StdMutationalStage,
     state::{HasCorpus, HasExecutions, HasMaxSize, HasSolutions, StdState},
 };
 use libafl_bolts::{
-    AsSlice,
+    AsSlice, Named,
     core_affinity::{Cores, get_core_ids},
     rands::StdRand,
     shmem::{ShMemProvider, StdShMem, StdShMemProvider},
@@ -807,7 +811,8 @@ fn run_launcher(args: Args) {
         require_fresh(&args.out);
     }
 
-    let ncores = get_core_ids().map(|c| c.len()).unwrap_or(1);
+    let visible_cores = get_core_ids().unwrap_or_else(|e| die(&format!("CPU affinity: {e}")));
+    let ncores = visible_cores.len();
     if args.workers > ncores {
         die(&format!(
             "--workers {} exceeds {} visible cores",
@@ -816,11 +821,12 @@ fn run_launcher(args: Args) {
     }
 
     let cores_spec = args.cores.clone().unwrap_or_else(|| {
-        if args.workers == 1 {
-            "0".into()
-        } else {
-            format!("0-{}", args.workers - 1)
-        }
+        visible_cores
+            .iter()
+            .take(args.workers)
+            .map(|c| c.0.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
     });
     let cores = Cores::from_cmdline(&cores_spec)
         .unwrap_or_else(|e| die(&format!("--cores {cores_spec}: {e}")));
@@ -1053,147 +1059,189 @@ fn run_launcher(args: Args) {
     let worker_fast = fast.build_id;
     let worker_kind = kind;
     let worker_sync_every = args.sync_every;
-    let worker_rescan = args.rescan;
+    if args.rescan {
+        die("--rescan is retired: T2 publishes discoveries directly");
+    }
     let snapshot_dir = spool_dir(&args.out).join("snapshot");
     let campaign = campaign_id;
 
-    let run_client =
-        move |state: Option<WorkerState>, mut mgr, desc: libafl::events::ClientDescription| {
-            let _ = state;
-            let slot = u32::try_from(desc.id().saturating_sub(1)).unwrap_or(u32::MAX);
-            let worker_id = WorkerId::from_slot(slot);
-            let dir = worker_out.join("workers").join(slot.to_string());
-            let persist = dir.join("corpus");
-            let crashes = dir.join("crashes");
-            fs::create_dir_all(&persist).map_err(|e| libafl::Error::unknown(e.to_string()))?;
-            fs::create_dir_all(&crashes).map_err(|e| libafl::Error::unknown(e.to_string()))?;
+    let worker_started = Instant::now();
+    let run_client = move |state: Option<WorkerState>,
+                           mut mgr,
+                           desc: libafl::events::ClientDescription| {
+        let live_restart = state.is_some();
+        let restart_count = state
+            .as_ref()
+            .and_then(|s| s.metadata::<WorkerProgress>().ok())
+            .map_or(0, |p| p.restarts + 1);
+        let slot = u32::try_from(desc.id().saturating_sub(1)).unwrap_or(u32::MAX);
+        let worker_id = WorkerId::from_slot(slot);
+        let dir = worker_out.join("workers").join(slot.to_string());
+        let persist = dir.join("corpus");
+        let crashes = dir.join("crashes");
+        fs::create_dir_all(&persist).map_err(|e| libafl::Error::unknown(e.to_string()))?;
+        fs::create_dir_all(&crashes).map_err(|e| libafl::Error::unknown(e.to_string()))?;
 
-            let spool = CandidateSpool::open(spool_dir(&worker_out))
-                .map_err(|e| libafl::Error::unknown(e.to_string()))?;
-            let resume = spool
-                .read_resume(slot)
-                .map_err(|e| libafl::Error::unknown(e.to_string()))?
-                .unwrap_or(WorkerResume {
-                    worker_id,
-                    slot,
-                    restart: false,
-                    previous_event_seq: None,
-                    next_producer_seq: 0,
-                });
-            if resume.worker_id != worker_id {
-                return Err(libafl::Error::unknown(format!(
-                    "resume worker_id {} != slot worker {worker_id}",
-                    resume.worker_id
-                )));
-            }
-            spool
-                .write_worker(&WorkerRegistration {
-                    notice_id: control_notice_id(
-                        if resume.restart { "rst" } else { "reg" },
+        let spool = CandidateSpool::open(spool_dir(&worker_out))
+            .map_err(|e| libafl::Error::unknown(e.to_string()))?;
+        let resume = spool
+            .read_resume(slot)
+            .map_err(|e| libafl::Error::unknown(e.to_string()))?
+            .unwrap_or(WorkerResume {
+                worker_id,
+                slot,
+                restart: false,
+                previous_event_seq: None,
+                next_producer_seq: 0,
+            });
+        if resume.worker_id != worker_id {
+            return Err(libafl::Error::unknown(format!(
+                "resume worker_id {} != slot worker {worker_id}",
+                resume.worker_id
+            )));
+        }
+        spool
+            .write_worker(&WorkerRegistration {
+                notice_id: format!(
+                    "{}-live{restart_count}",
+                    control_notice_id(
+                        if live_restart || resume.restart {
+                            "rst"
+                        } else {
+                            "reg"
+                        },
                         worker_id,
                         resume.next_producer_seq,
                         resume.previous_event_seq,
-                    ),
-                    worker_id,
-                    slot,
-                    restart: resume.restart,
-                    previous_event_seq: resume.previous_event_seq,
-                    next_producer_seq: resume.next_producer_seq,
-                })
-                .map_err(|e| libafl::Error::unknown(e.to_string()))?;
-
-            let mut extra = Vec::new();
-            if snapshot_dir.is_dir() {
-                extra.push(snapshot_dir.clone());
-            }
-            let mut config = FuzzerConfig {
-                corpus_dir: worker_corpus.clone(),
-                crashes_dir: crashes,
-                persist_corpus_dir: Some(persist.clone()),
-                rng_seed: worker_seed.wrapping_add(u64::from(slot)),
-                max_iters: worker_iters,
-                max_time: worker_seconds.map(Duration::from_secs),
-                max_input_len: worker_max_len,
-                exec_timeout: worker_timeout,
-                initial_inputs: 8,
-                sync_every: worker_sync_every,
-                ..FuzzerConfig::default()
-            };
-            // keep rustc happy if Default overwrites
-            config.corpus_dir = worker_corpus.clone();
-            config.persist_corpus_dir = Some(persist.clone());
-
-            let target = worker_target(worker_kind);
-            let mut seq = resume.next_producer_seq;
-            let mut cursor = CorpusScanCursor::new();
-            let mut sync = SyncMetrics::default();
-            let scan_mode = if worker_rescan {
-                ScanMode::Rescan
-            } else {
-                ScanMode::Incremental
-            };
-            let report = run_llmp_worker(target, &config, &mut mgr, &extra, |corpus_dir| {
-                let started_sync = Instant::now();
-                let (new, stats) = scan_new_inputs(corpus_dir, &mut cursor, scan_mode)?;
-                let mut spooled = 0usize;
-                for (_id, bytes) in new {
-                    let meta = InputMetadata {
-                        input_id: InputId::from_bytes(&bytes),
-                        parent_ids: vec![],
-                        producer: "havoc".into(),
-                        producer_build: worker_fast,
-                        campaign_id: campaign,
-                        local_coverage: None,
-                        canonical_delta: None,
-                        stored_unix_ms: unix_ms(),
-                        worker_id: Some(worker_id),
-                        producer_seq: Some(seq),
-                        strategy: Some(StrategyId::Havoc),
-                    };
-                    seq = seq.saturating_add(1);
-                    spool.push(&bytes, &meta)?;
-                    spooled = spooled.saturating_add(1);
-                }
-                let ns = u64::try_from(started_sync.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                sync.record(ns, &stats, spooled);
-                Ok(())
+                    )
+                ),
+                worker_id,
+                slot,
+                restart: live_restart || resume.restart,
+                previous_event_seq: resume.previous_event_seq,
+                next_producer_seq: state
+                    .as_ref()
+                    .and_then(|s| s.metadata::<WorkerProgress>().ok())
+                    .map_or(resume.next_producer_seq, |p| p.next_producer_seq),
             })
             .map_err(|e| libafl::Error::unknown(e.to_string()))?;
 
-            let summary = serde_json::json!({
-                "slot": slot,
-                "worker_id": worker_id.to_hex(),
-                "executions": report.executions,
-                "corpus_count": report.corpus_count,
-                "objectives": report.objectives,
-                "elapsed_ms": report.elapsed.as_millis() as u64,
-                "sync_calls": sync.calls,
-                "sync_ns_total": sync.ns_total,
-                "sync_ns_p95": sync.p95_ns(),
-                "sync_ns_max": sync.ns_max,
-                "paths_listed": sync.paths_listed,
-                "paths_read": sync.paths_read,
-                "bytes_read": sync.bytes_read,
-                "inputs_spooled": sync.inputs_spooled,
-            });
-            fs::write(
-                dir.join("report.json"),
-                serde_json::to_vec_pretty(&summary)
-                    .map_err(|e| libafl::Error::unknown(e.to_string()))?,
-            )
-            .map_err(|e| libafl::Error::unknown(e.to_string()))?;
-            spool
-                .write_left(&WorkerExit {
-                    notice_id: control_notice_id("left", worker_id, seq, resume.previous_event_seq),
-                    worker_id,
-                    slot,
-                    next_producer_seq: seq,
-                    reason: "budget".into(),
-                })
-                .map_err(|e| libafl::Error::unknown(e.to_string()))?;
-            mgr.send_exiting()?;
-            Ok(())
+        let mut extra = Vec::new();
+        if snapshot_dir.is_dir() {
+            extra.push(snapshot_dir.clone());
+        }
+        let mut config = FuzzerConfig {
+            corpus_dir: worker_corpus.clone(),
+            crashes_dir: crashes,
+            persist_corpus_dir: Some(persist.clone()),
+            rng_seed: worker_seed.wrapping_add(u64::from(slot)),
+            max_iters: worker_iters,
+            max_time: worker_seconds.map(Duration::from_secs),
+            max_input_len: worker_max_len,
+            exec_timeout: worker_timeout,
+            initial_inputs: 8,
+            sync_every: worker_sync_every,
+            ..FuzzerConfig::default()
         };
+        // keep rustc happy if Default overwrites
+        config.corpus_dir = worker_corpus.clone();
+        config.persist_corpus_dir = Some(persist.clone());
+
+        let target = worker_target(worker_kind);
+        let mut spooled = 0u64;
+        let mut publication_ns = 0u64;
+        let mut seq = state
+            .as_ref()
+            .and_then(|s| s.metadata::<WorkerProgress>().ok())
+            .map_or(resume.next_producer_seq, |p| p.next_producer_seq);
+        let report = run_llmp_worker(
+            target,
+            &config,
+            &mut mgr,
+            &extra,
+            WorkerContinuation {
+                state,
+                started: worker_started,
+                restarts: restart_count,
+                next_producer_seq: seq,
+            },
+            |state, id| {
+                let started = Instant::now();
+                let tc = state.corpus().get(id)?.borrow();
+                let bytes = tc
+                    .input()
+                    .as_ref()
+                    .context("new testcase has no bytes")?
+                    .target_bytes();
+                let mut parents = Vec::new();
+                if let Some(parent) = tc.parent_id() {
+                    let parent = state.corpus().get(parent)?.borrow();
+                    if let Some(input) = parent.input() {
+                        parents.push(InputId::from_bytes(input.target_bytes().as_slice()));
+                    }
+                }
+                let bytes = bytes.as_slice().to_vec();
+                drop(tc);
+                let progress = state.metadata_mut::<WorkerProgress>()?;
+                let producer_seq = progress.next_producer_seq;
+                progress.next_producer_seq = producer_seq.saturating_add(1);
+                seq = progress.next_producer_seq;
+                let meta = InputMetadata {
+                    input_id: InputId::from_bytes(&bytes),
+                    parent_ids: parents,
+                    producer: "havoc".into(),
+                    producer_build: worker_fast,
+                    campaign_id: campaign,
+                    local_coverage: None,
+                    canonical_delta: None,
+                    stored_unix_ms: unix_ms(),
+                    worker_id: Some(worker_id),
+                    producer_seq: Some(producer_seq),
+                    strategy: Some(StrategyId::Havoc),
+                };
+                spool.push(&bytes, &meta)?;
+                spooled += 1;
+                publication_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                Ok(())
+            },
+        )
+        .map_err(|e| libafl::Error::unknown(e.to_string()))?;
+
+        let summary = serde_json::json!({
+            "slot": slot,
+            "worker_id": worker_id.to_hex(),
+            "executions": report.executions,
+            "corpus_count": report.corpus_count,
+            "objectives": report.objectives,
+            "elapsed_ms": report.elapsed.as_millis() as u64,
+            "live_restarts": restart_count,
+            "sync_calls": spooled,
+            "sync_ns_total": publication_ns,
+            "sync_ns_p95": 0,
+            "sync_ns_max": 0,
+            "paths_listed": 0,
+            "paths_read": 0,
+            "bytes_read": 0,
+            "inputs_spooled": spooled,
+        });
+        fs::write(
+            dir.join("report.json"),
+            serde_json::to_vec_pretty(&summary)
+                .map_err(|e| libafl::Error::unknown(e.to_string()))?,
+        )
+        .map_err(|e| libafl::Error::unknown(e.to_string()))?;
+        spool
+            .write_left(&WorkerExit {
+                notice_id: control_notice_id("left", worker_id, seq, resume.previous_event_seq),
+                worker_id,
+                slot,
+                next_producer_seq: seq,
+                reason: "budget".into(),
+            })
+            .map_err(|e| libafl::Error::unknown(e.to_string()))?;
+        mgr.send_exiting()?;
+        Ok(())
+    };
 
     let mut launcher = Launcher::builder()
         .shmem_provider(shmem)
@@ -1413,16 +1461,30 @@ type WorkerState =
 type WorkerMgr =
     LlmpRestartingEventManager<(), BytesInput, WorkerState, StdShMem, StdShMemProvider>;
 
+struct WorkerContinuation {
+    state: Option<WorkerState>,
+    started: Instant,
+    restarts: u64,
+    next_producer_seq: u64,
+}
+
 fn run_llmp_worker<F>(
     mut target: InProcessTarget,
     config: &FuzzerConfig,
     mgr: &mut WorkerMgr,
     extra_seed_dirs: &[PathBuf],
-    mut on_sync: F,
+    continuation: WorkerContinuation,
+    mut on_discovery: F,
 ) -> Result<achlys_core::SubstrateReport>
 where
-    F: FnMut(&Path) -> Result<()>,
+    F: FnMut(&mut WorkerState, CorpusId) -> Result<()>,
 {
+    let WorkerContinuation {
+        state: restored,
+        started,
+        restarts,
+        next_producer_seq,
+    } = continuation;
     let persist = config
         .persist_corpus_dir
         .clone()
@@ -1439,14 +1501,26 @@ where
     });
     let mut feedback = MaxMapFeedback::new(&observer);
     let mut objective = feedback_or_fast!(CrashFeedback::new(), TimeoutFeedback::new());
-    let corpus = InMemoryOnDiskCorpus::<BytesInput>::new(&persist)?;
-    let mut state = StdState::new(
-        StdRand::with_seed(config.rng_seed),
-        corpus,
-        OnDiskCorpus::new(&config.crashes_dir)?,
-        &mut feedback,
-        &mut objective,
-    )?;
+    let resumed = restored.is_some();
+    let mut state = if let Some(state) = restored {
+        state
+    } else {
+        StdState::new(
+            StdRand::with_seed(config.rng_seed),
+            InMemoryOnDiskCorpus::<BytesInput>::new(&persist)?,
+            OnDiskCorpus::new(&config.crashes_dir)?,
+            &mut feedback,
+            &mut objective,
+        )?
+    };
+    if !state.has_metadata::<WorkerProgress>() {
+        state.add_metadata(WorkerProgress {
+            cycles: 0,
+            next_producer_seq,
+            restarts,
+        });
+    }
+    state.metadata_mut::<WorkerProgress>()?.restarts = restarts;
     state.set_max_size(config.max_input_len.max(1));
     let mut fuzzer = StdFuzzer::new(QueueScheduler::new(), feedback, objective);
     let infra = Arc::new(Mutex::new(None::<achlys_bridge::InfraError>));
@@ -1478,7 +1552,7 @@ where
         seed_dirs.push(dir.clone());
     }
     seed_dirs.extend(extra_seed_dirs.iter().cloned());
-    if seed_dirs.is_empty() {
+    if !resumed && seed_dirs.is_empty() {
         let mut generator = RandBytesGenerator::new(
             NonZero::new(config.max_input_len)
                 .unwrap_or(NonZero::new(4096).expect("4096 is non-zero")),
@@ -1490,38 +1564,47 @@ where
             mgr,
             config.initial_inputs,
         )?;
-    } else {
+    } else if !resumed {
         state.load_initial_inputs(&mut fuzzer, &mut executor, mgr, &seed_dirs)?;
     }
     if state.corpus().count() == 0 {
         anyhow::bail!("no initial inputs were admitted");
     }
 
-    let mutator = HavocScheduledMutator::new(havoc_mutations());
+    // Initial seeds are locally executed once. Imported LLMP testcases are
+    // never reported as discoveries of the receiving worker.
+    if !resumed && extra_seed_dirs.is_empty() {
+        let ids: Vec<_> = state.corpus().ids().collect();
+        for id in ids {
+            on_discovery(&mut state, id)?;
+        }
+    }
+    let mutator = DiscoveryMutator {
+        inner: HavocScheduledMutator::new(havoc_mutations()),
+        publish: &mut on_discovery,
+    };
     let mut stages = tuple_list!(StdMutationalStage::new(mutator));
-    let start = Instant::now();
     if config.max_iters.is_none() && config.max_time.is_none() {
         anyhow::bail!("worker needs a bound");
     }
-    let sync_every = config.sync_every.max(1);
-    let mut remaining = config.max_iters.unwrap_or(u64::MAX);
-    let mut since_sync = 0u64;
-    while remaining > 0 {
+    loop {
         if config
             .max_time
-            .is_some_and(|max_time| start.elapsed() >= max_time)
+            .is_some_and(|limit| started.elapsed() >= limit)
+            || config.max_iters.is_some_and(|limit| {
+                state
+                    .metadata::<WorkerProgress>()
+                    .is_ok_and(|p| p.cycles >= limit)
+            })
         {
             break;
         }
         fuzzer.fuzz_loop_for(&mut stages, &mut executor, &mut state, mgr, 1)?;
-        remaining = remaining.saturating_sub(1);
-        since_sync = since_sync.saturating_add(1);
-        if since_sync >= sync_every {
-            on_sync(&persist)?;
-            since_sync = 0;
+        state.metadata_mut::<WorkerProgress>()?.cycles += 1;
+        if let Some(err) = infra.lock().expect("infra").take() {
+            return Err(anyhow!(err));
         }
     }
-    on_sync(&persist)?;
     if let Some(err) = infra.lock().expect("infra").take() {
         return Err(anyhow!(err));
     }
@@ -1529,6 +1612,49 @@ where
         executions: *state.executions(),
         corpus_count: state.corpus().count(),
         objectives: state.solutions().count(),
-        elapsed: start.elapsed(),
+        elapsed: started.elapsed(),
     })
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct WorkerProgress {
+    cycles: u64,
+    next_producer_seq: u64,
+    restarts: u64,
+}
+libafl_bolts::impl_serdeany!(WorkerProgress);
+
+/// The only per-execution addition is a branch on local admission.
+struct DiscoveryMutator<M, F> {
+    inner: M,
+    publish: F,
+}
+impl<M: Named, F> Named for DiscoveryMutator<M, F> {
+    fn name(&self) -> &Cow<'static, str> {
+        self.inner.name()
+    }
+}
+impl<M, F> Mutator<BytesInput, WorkerState> for DiscoveryMutator<M, F>
+where
+    M: Mutator<BytesInput, WorkerState>,
+    F: FnMut(&mut WorkerState, CorpusId) -> Result<()>,
+{
+    fn mutate(
+        &mut self,
+        state: &mut WorkerState,
+        input: &mut BytesInput,
+    ) -> Result<MutationResult, libafl::Error> {
+        self.inner.mutate(state, input)
+    }
+    fn post_exec(
+        &mut self,
+        state: &mut WorkerState,
+        id: Option<CorpusId>,
+    ) -> Result<(), libafl::Error> {
+        self.inner.post_exec(state, id)?;
+        if let Some(id) = id {
+            (self.publish)(state, id).map_err(|e| libafl::Error::unknown(e.to_string()))?;
+        }
+        Ok(())
+    }
 }
